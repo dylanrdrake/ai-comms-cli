@@ -31,6 +31,8 @@ pub struct ChatRequest {
     pub temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +78,7 @@ impl Client {
         messages: Vec<ChatMessage>,
         temperature: f32,
         tools: Option<Vec<serde_json::Value>>,
+        effort_level: Option<String>,
     ) -> Result<ChatResponse> {
         let request = ChatRequest {
             model,
@@ -87,6 +90,7 @@ impl Client {
             } else {
                 None
             },
+            reasoning_effort: effort_level,
         };
 
         let response = self

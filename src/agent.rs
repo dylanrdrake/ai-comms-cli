@@ -73,6 +73,7 @@ pub async fn run_agent(
     max_iterations: usize,
     verbose: bool,
     approval: &ApprovalSettings,
+    effort_level: Option<String>,
 ) -> Result<Option<String>> {
     let mut messages = vec![ChatMessage {
         role: "user".to_string(),
@@ -98,6 +99,7 @@ pub async fn run_agent(
                 messages.clone(),
                 0.7,
                 Some(tool_definitions.clone()),
+                effort_level.clone(),
             )
             .await?;
 
@@ -105,7 +107,11 @@ pub async fn run_agent(
 
         // If the LLM generated text, show it
         if let Some(content) = &choice.message.content {
-            println!("{} {}", "Assistant:".cyan(), content);
+            let label = match &effort_level {
+                Some(effort) => format!("{} ({}):", model, effort),
+                None => format!("{}:", model),
+            };
+            println!("{} {}", label.cyan(), content);
             final_response = Some(content.clone());
         }
 
@@ -165,4 +171,62 @@ pub async fn run_agent(
     }
 
     Err(anyhow::anyhow!("Agent exceeded max iterations"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn categorizes_known_tools() {
+        assert_eq!(get_tool_category("read_file"), "read");
+        assert_eq!(get_tool_category("list_files"), "read");
+        assert_eq!(get_tool_category("write_file"), "write");
+        assert_eq!(get_tool_category("replace_in_file"), "write");
+        assert_eq!(get_tool_category("run_terminal_command"), "terminal");
+        assert_eq!(get_tool_category("something_else"), "unknown");
+    }
+
+    fn settings(read: bool, write: bool, terminal: bool) -> ApprovalSettings {
+        ApprovalSettings {
+            read_disk: read,
+            write_disk: write,
+            terminal,
+        }
+    }
+
+    #[test]
+    fn requires_approval_respects_per_category_flags() {
+        let all_on = settings(true, true, true);
+        assert!(requires_approval("read_file", &all_on));
+        assert!(requires_approval("list_files", &all_on));
+        assert!(requires_approval("write_file", &all_on));
+        assert!(requires_approval("replace_in_file", &all_on));
+        assert!(requires_approval("run_terminal_command", &all_on));
+
+        let all_off = settings(false, false, false);
+        assert!(!requires_approval("read_file", &all_off));
+        assert!(!requires_approval("list_files", &all_off));
+        assert!(!requires_approval("write_file", &all_off));
+        assert!(!requires_approval("replace_in_file", &all_off));
+        assert!(!requires_approval("run_terminal_command", &all_off));
+    }
+
+    #[test]
+    fn requires_approval_is_independent_per_category() {
+        // Only write approval enabled: read and terminal should be auto-approved,
+        // write should still prompt.
+        let write_only = settings(false, true, false);
+        assert!(!requires_approval("read_file", &write_only));
+        assert!(requires_approval("write_file", &write_only));
+        assert!(!requires_approval("run_terminal_command", &write_only));
+    }
+
+    #[test]
+    fn unknown_tools_always_require_approval() {
+        // Fail-safe: an unrecognized tool name must default to requiring approval,
+        // even when every known category is set to auto-approve.
+        let all_off = settings(false, false, false);
+        assert!(requires_approval("some_future_tool", &all_off));
+    }
 }

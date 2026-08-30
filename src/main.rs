@@ -10,7 +10,7 @@ use rustyline::DefaultEditor;
 use std::io::{self, Write};
 
 use client::{ChatMessage, Client};
-use config::{load_config, save_config, get_config_path, ApprovalSettings};
+use config::{get_config_path, load_config, save_config, ApprovalSettings, VALID_EFFORT_LEVELS};
 
 #[derive(Parser)]
 #[command(name = "orca")]
@@ -51,6 +51,22 @@ enum Commands {
         action: Option<ApprovalCommands>,
     },
 
+    /// View or set the persistent default max agent iterations
+    MaxIterations {
+        /// Value to set as the default (omit to show the current default)
+        value: Option<usize>,
+    },
+
+    /// View or set the persistent default reasoning effort level (low, medium, high)
+    EffortLevel {
+        /// Effort level to set as the default (omit to show the current default)
+        value: Option<String>,
+
+        /// Clear the stored effort level (falls back to provider default)
+        #[arg(long)]
+        clear: bool,
+    },
+
     /// Send a prompt to OrcaRouter
     Ask {
         /// Your prompt/question
@@ -85,9 +101,9 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
 
-        /// Maximum number of iterations
-        #[arg(long, default_value_t = 10)]
-        max_iterations: usize,
+        /// Maximum number of iterations (overrides the persistent default for this call)
+        #[arg(long)]
+        max_iterations: Option<usize>,
     },
 }
 
@@ -98,26 +114,22 @@ enum ApprovalCommands {
     /// Set approval for reading from disk (read_file, list_files)
     Read {
         /// Enable or disable approval prompts
-        #[arg(value_parser = parse_bool)]
-        enabled: bool,
+        enabled: String,
     },
     /// Set approval for writing to disk (write_file, replace_in_file)
     Write {
         /// Enable or disable approval prompts
-        #[arg(value_parser = parse_bool)]
-        enabled: bool,
+        enabled: String,
     },
     /// Set approval for terminal commands (run_terminal_command)
     Terminal {
         /// Enable or disable approval prompts
-        #[arg(value_parser = parse_bool)]
-        enabled: bool,
+        enabled: String,
     },
     /// Set all approval settings at once
     All {
         /// Enable or disable all approval prompts
-        #[arg(value_parser = parse_bool)]
-        enabled: bool,
+        enabled: String,
     },
 }
 
@@ -125,7 +137,10 @@ fn parse_bool(s: &str) -> Result<bool, String> {
     match s.to_lowercase().as_str() {
         "true" | "on" | "yes" | "1" => Ok(true),
         "false" | "off" | "no" | "0" => Ok(false),
-        _ => Err(format!("Invalid boolean value: '{}'. Use true/false, on/off, yes/no, or 1/0", s)),
+        _ => Err(format!(
+            "Invalid boolean value: '{}'. Use true/false, on/off, yes/no, or 1/0",
+            s
+        )),
     }
 }
 
@@ -135,6 +150,17 @@ fn resolve_model(config: &config::Config, cli_model: Option<String>) -> String {
     cli_model
         .or_else(|| config.default_model.clone())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
+
+fn resolve_max_iterations(config: &config::Config, cli_value: Option<usize>) -> usize {
+    cli_value.unwrap_or(config.max_iterations)
+}
+
+fn response_label(model: &str, effort_level: &Option<String>) -> String {
+    match effort_level {
+        Some(effort) => format!("{} ({})", model, effort),
+        None => model.to_string(),
+    }
 }
 
 #[tokio::main]
@@ -148,6 +174,8 @@ async fn main() -> Result<()> {
         Commands::Models => cmd_models().await?,
         Commands::Model { name, clear } => cmd_model(name, clear).await?,
         Commands::Approval { action } => cmd_approval(action).await?,
+        Commands::MaxIterations { value } => cmd_max_iterations(value).await?,
+        Commands::EffortLevel { value, clear } => cmd_effort_level(value, clear).await?,
         Commands::Ask {
             prompt,
             model,
@@ -216,6 +244,14 @@ async fn cmd_status() -> Result<()> {
         "  Default model: {}",
         config.default_model.as_deref().unwrap_or(DEFAULT_MODEL)
     );
+    println!("  Max iterations: {}", config.max_iterations);
+    println!(
+        "  Effort level: {}",
+        config
+            .effort_level
+            .as_deref()
+            .unwrap_or("(not set, provider default)")
+    );
     println!("  Config file: {}", get_config_path()?.display());
     println!("\n{}", "Approval Settings:".blue());
     print_approval_status(&config.approval);
@@ -231,9 +267,18 @@ fn format_approval(enabled: bool) -> String {
 }
 
 fn print_approval_status(approval: &ApprovalSettings) {
-    println!("  Read from disk:    {}", format_approval(approval.read_disk));
-    println!("  Write to disk:     {}", format_approval(approval.write_disk));
-    println!("  Terminal commands: {}", format_approval(approval.terminal));
+    println!(
+        "  Read from disk:    {}",
+        format_approval(approval.read_disk)
+    );
+    println!(
+        "  Write to disk:     {}",
+        format_approval(approval.write_disk)
+    );
+    println!(
+        "  Terminal commands: {}",
+        format_approval(approval.terminal)
+    );
 }
 
 async fn cmd_approval(action: Option<ApprovalCommands>) -> Result<()> {
@@ -250,26 +295,46 @@ async fn cmd_approval(action: Option<ApprovalCommands>) -> Result<()> {
             println!("  orca approval all <on|off>      Set all approvals");
         }
         Some(ApprovalCommands::Read { enabled }) => {
-            config.approval.read_disk = enabled;
+            let value = parse_bool(&enabled).map_err(|e| anyhow::anyhow!(e))?;
+            config.approval.read_disk = value;
             save_config(&config)?;
-            println!("{} Read approval set to {}", "✓".green(), format_approval(enabled));
+            println!(
+                "{} Read approval set to {}",
+                "✓".green(),
+                format_approval(value)
+            );
         }
         Some(ApprovalCommands::Write { enabled }) => {
-            config.approval.write_disk = enabled;
+            let value = parse_bool(&enabled).map_err(|e| anyhow::anyhow!(e))?;
+            config.approval.write_disk = value;
             save_config(&config)?;
-            println!("{} Write approval set to {}", "✓".green(), format_approval(enabled));
+            println!(
+                "{} Write approval set to {}",
+                "✓".green(),
+                format_approval(value)
+            );
         }
         Some(ApprovalCommands::Terminal { enabled }) => {
-            config.approval.terminal = enabled;
+            let value = parse_bool(&enabled).map_err(|e| anyhow::anyhow!(e))?;
+            config.approval.terminal = value;
             save_config(&config)?;
-            println!("{} Terminal approval set to {}", "✓".green(), format_approval(enabled));
+            println!(
+                "{} Terminal approval set to {}",
+                "✓".green(),
+                format_approval(value)
+            );
         }
         Some(ApprovalCommands::All { enabled }) => {
-            config.approval.read_disk = enabled;
-            config.approval.write_disk = enabled;
-            config.approval.terminal = enabled;
+            let value = parse_bool(&enabled).map_err(|e| anyhow::anyhow!(e))?;
+            config.approval.read_disk = value;
+            config.approval.write_disk = value;
+            config.approval.terminal = value;
             save_config(&config)?;
-            println!("{} All approvals set to {}", "✓".green(), format_approval(enabled));
+            println!(
+                "{} All approvals set to {}",
+                "✓".green(),
+                format_approval(value)
+            );
         }
     }
 
@@ -307,6 +372,70 @@ async fn cmd_model(name: Option<String>, clear: bool) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_max_iterations(value: Option<usize>) -> Result<()> {
+    let mut config = load_config()?;
+
+    match value {
+        Some(0) => {
+            eprintln!("{} max-iterations must be greater than 0", "✗".red());
+            std::process::exit(1);
+        }
+        Some(value) => {
+            config.max_iterations = value;
+            save_config(&config)?;
+            println!("{} Default max iterations set to {}", "✓".green(), value);
+        }
+        None => {
+            println!("Current default max iterations: {}", config.max_iterations);
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_effort_level(value: Option<String>, clear: bool) -> Result<()> {
+    let mut config = load_config()?;
+
+    if clear {
+        config.effort_level = None;
+        save_config(&config)?;
+        println!(
+            "{} Effort level cleared, falling back to provider default",
+            "✓".green()
+        );
+        return Ok(());
+    }
+
+    match value {
+        Some(value) => {
+            let normalized = value.to_lowercase();
+            if !VALID_EFFORT_LEVELS.contains(&normalized.as_str()) {
+                eprintln!(
+                    "{} Invalid effort level '{}'. Valid values: {}",
+                    "✗".red(),
+                    value,
+                    VALID_EFFORT_LEVELS.join(", ")
+                );
+                std::process::exit(1);
+            }
+            config.effort_level = Some(normalized.clone());
+            save_config(&config)?;
+            println!("{} Effort level set to {}", "✓".green(), normalized);
+        }
+        None => {
+            println!(
+                "Current effort level: {}",
+                config
+                    .effort_level
+                    .as_deref()
+                    .unwrap_or("(not set, provider default)")
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn cmd_models() -> Result<()> {
     let config = load_config()?;
     let client = Client::new(config)?;
@@ -318,7 +447,10 @@ async fn cmd_models() -> Result<()> {
     let models = client.list_models().await?;
 
     println!("\r{} ", "✓".green());
-    println!("\n{}\n", format!("Available models ({}):", models.len()).blue());
+    println!(
+        "\n{}\n",
+        format!("Available models ({}):", models.len()).blue()
+    );
 
     for (i, model) in models.iter().take(20).enumerate() {
         println!("  {}. {}", i + 1, model);
@@ -334,6 +466,7 @@ async fn cmd_models() -> Result<()> {
 async fn cmd_ask(prompt: &str, model: Option<String>, temperature: f32) -> Result<()> {
     let config = load_config()?;
     let model = resolve_model(&config, model);
+    let effort_level = config.effort_level.clone();
     let client = Client::new(config)?;
 
     let spinner = "Thinking...".yellow();
@@ -346,10 +479,18 @@ async fn cmd_ask(prompt: &str, model: Option<String>, temperature: f32) -> Resul
         tool_calls: None,
     }];
 
-    let response = client.chat(model, messages, temperature, None).await?;
+    let response = client
+        .chat(
+            model.clone(),
+            messages,
+            temperature,
+            None,
+            effort_level.clone(),
+        )
+        .await?;
 
     println!("\r{} ", "✓".green());
-    println!("\n{}:", "Assistant".cyan());
+    println!("\n{}:", response_label(&model, &effort_level).cyan());
     if let Some(content) = &response.choices[0].message.content {
         println!("{}", content);
     }
@@ -360,6 +501,7 @@ async fn cmd_ask(prompt: &str, model: Option<String>, temperature: f32) -> Resul
 async fn cmd_chat(model: Option<String>) -> Result<()> {
     let config = load_config()?;
     let model = resolve_model(&config, model);
+    let effort_level = config.effort_level.clone();
     let client = Client::new(config)?;
 
     println!("{}\n", "Starting chat session (type 'exit' to quit)".blue());
@@ -388,13 +530,23 @@ async fn cmd_chat(model: Option<String>) -> Result<()> {
                 io::stdout().flush()?;
 
                 match client
-                    .chat(model.clone(), messages.clone(), 0.7, None)
+                    .chat(
+                        model.clone(),
+                        messages.clone(),
+                        0.7,
+                        None,
+                        effort_level.clone(),
+                    )
                     .await
                 {
                     Ok(response) => {
                         println!("\r   ");
                         if let Some(content) = &response.choices[0].message.content {
-                            println!("{} {}\n", "Assistant:".cyan(), content);
+                            println!(
+                                "{} {}\n",
+                                format!("{}:", response_label(&model, &effort_level)).cyan(),
+                                content
+                            );
                             messages.push(ChatMessage {
                                 role: "assistant".to_string(),
                                 content: Some(content.clone()),
@@ -425,16 +577,27 @@ async fn cmd_agent(
     task: &str,
     model: Option<String>,
     verbose: bool,
-    max_iterations: usize,
+    max_iterations: Option<usize>,
 ) -> Result<()> {
     let config = load_config()?;
     let model = resolve_model(&config, model);
+    let max_iterations = resolve_max_iterations(&config, max_iterations);
     let approval = config.approval.clone();
+    let effort_level = config.effort_level.clone();
     let client = Client::new(config)?;
 
     println!("{}\n", "Starting agent task...".blue());
 
-    agent::run_agent(&client, task, &model, max_iterations, verbose, &approval).await?;
+    agent::run_agent(
+        &client,
+        task,
+        &model,
+        max_iterations,
+        verbose,
+        &approval,
+        effort_level,
+    )
+    .await?;
 
     Ok(())
 }

@@ -225,8 +225,25 @@ orca agent "Your Rust task" -v
 ### Increase iterations for complex tasks
 
 ```bash
-orca agent "Complex multi-file project setup" --max-iterations 15
+# Override for a single call
+orca agent "Complex multi-file project setup" --max-iterations 30
+
+# Or raise the persistent default so every agent call gets more room
+orca max-iterations 30
 ```
+
+### Set a reasoning effort level
+
+```bash
+# Push harder on reasoning for tough tasks
+orca effort-level high
+orca agent "Design a lock-free concurrent queue in Rust"
+
+# Back off for quick, cheap responses
+orca effort-level low
+```
+
+Once set, response labels show the effort level alongside the model, e.g. `anthropic/claude-opus-4.5 (high):`, so it's clear which effort level produced the output.
 
 ### Chain operations
 

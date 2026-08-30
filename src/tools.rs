@@ -193,9 +193,28 @@ pub async fn execute_tool(
 }
 
 fn write_file(filepath: &str, content: &str, mode: &str) -> Result<serde_json::Value> {
-    let path = std::path::Path::new(filepath).canonicalize()?;
     let cwd = std::env::current_dir()?;
     let home = home::home_dir().unwrap_or_default();
+
+    let raw_path = std::path::Path::new(filepath);
+    let absolute = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        cwd.join(raw_path)
+    };
+
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| anyhow!("Invalid file path: {}", filepath))?;
+    let file_name = absolute
+        .file_name()
+        .ok_or_else(|| anyhow!("Invalid file path: {}", filepath))?;
+
+    // Create directories if needed, then canonicalize the (now-existing) parent
+    // so the security check below still resolves symlinks/`..` even though the
+    // target file itself may not exist yet.
+    fs::create_dir_all(parent)?;
+    let path = parent.canonicalize()?.join(file_name);
 
     // Security check
     if !path.starts_with(&cwd) && !path.starts_with(&home) {
@@ -203,11 +222,6 @@ fn write_file(filepath: &str, content: &str, mode: &str) -> Result<serde_json::V
             "success": false,
             "error": format!("Security: cannot write outside {:?}", cwd)
         }));
-    }
-
-    // Create directories if needed
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
     }
 
     if mode == "append" {

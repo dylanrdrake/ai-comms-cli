@@ -86,6 +86,35 @@ orca model --clear
 
 Once set, `ask`, `chat`, and `agent` all use this default unless overridden with `-m`/`--model` for that specific call.
 
+#### `max-iterations [value]`
+View or set the persistent default for how many tool-calling iterations `agent` may run before giving up.
+
+```bash
+# Show the current default
+orca max-iterations
+
+# Set the default
+orca max-iterations 20
+```
+
+Defaults to 20. Overridden per call with `--max-iterations` on `agent`.
+
+#### `effort-level [value]`
+View or set the persistent default reasoning effort (`low`, `medium`, or `high`) sent to models that support it. Applies to `ask`, `chat`, and `agent`.
+
+```bash
+# Show the current effort level
+orca effort-level
+
+# Set the default
+orca effort-level high
+
+# Clear it (falls back to the provider default)
+orca effort-level --clear
+```
+
+When an effort level is set, `ask`, `chat`, and `agent` label responses as `<model> (<effort>)` instead of just `<model>`, so you can see which effort level produced a given answer.
+
 #### `approval`
 Configure approval settings for agentic actions. By default, the agent prompts for approval before reading files, writing files, or running terminal commands.
 
@@ -137,8 +166,8 @@ orca agent "Read src/main.rs, identify improvements, and write an optimized vers
 # Show detailed iteration logs
 orca agent "Create utils.rs with a reverse array function" -v
 
-# Specify max iterations
-orca agent "Generate project structure" --max-iterations 20
+# Override the default max iterations for this call
+orca agent "Generate project structure" --max-iterations 30
 ```
 
 ## Agentic Tools
@@ -173,12 +202,16 @@ Configuration is stored at `~/.orcacli/config.json`:
     "read_disk": true,
     "write_disk": true,
     "terminal": true
-  }
+  },
+  "max_iterations": 20,
+  "effort_level": "high"
 }
 ```
 
 - `default_model` is managed via `orca model` and is used by `ask`, `chat`, and `agent` when `-m`/`--model` isn't passed.
 - `approval` settings control whether the agent prompts before performing actions. Managed via `orca approval`.
+- `max_iterations` is managed via `orca max-iterations` and is the default for `agent` when `--max-iterations` isn't passed.
+- `effort_level` is managed via `orca effort-level` and is sent as `reasoning_effort` for `ask`, `chat`, and `agent` when set.
 
 ## Examples
 

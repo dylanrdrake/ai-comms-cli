@@ -27,6 +27,8 @@ impl Default for ApprovalSettings {
     }
 }
 
+pub const VALID_EFFORT_LEVELS: [&str; 3] = ["low", "medium", "high"];
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub api_key: Option<String>,
@@ -36,10 +38,18 @@ pub struct Config {
     pub default_model: Option<String>,
     #[serde(default)]
     pub approval: ApprovalSettings,
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: usize,
+    #[serde(default)]
+    pub effort_level: Option<String>,
 }
 
 fn default_base_url() -> String {
     "https://api.orcarouter.ai/v1".to_string()
+}
+
+pub fn default_max_iterations() -> usize {
+    20
 }
 
 impl Default for Config {
@@ -49,6 +59,8 @@ impl Default for Config {
             base_url: "https://api.orcarouter.ai/v1".to_string(),
             default_model: None,
             approval: ApprovalSettings::default(),
+            max_iterations: default_max_iterations(),
+            effort_level: None,
         }
     }
 }
