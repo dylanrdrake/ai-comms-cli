@@ -1,10 +1,20 @@
 use crate::client::{Client, ChatMessage};
 use crate::config::ApprovalSettings;
+use crate::spinner::Spinner;
 use crate::tools::{execute_tool, get_tool_definitions};
 use anyhow::Result;
 use colored::*;
 use serde_json::json;
 use std::io::{self, Write};
+
+/// Seeds a continuous agent-chat session so the model treats the growing
+/// transcript as history to build on, not a backlog of tasks to redo.
+pub const AGENT_CHAT_SYSTEM_PROMPT: &str = "You are a coding agent operating in a continuous \
+interactive chat session. The conversation history may contain earlier user requests that you \
+already completed, along with your replies and any tool calls/results for them. Treat each new \
+user message as the only request currently being asked of you - use earlier turns purely as \
+background context. Do not restate, re-summarize, or redo work from earlier turns unless the \
+user explicitly asks you to.";
 
 fn get_tool_category(tool_name: &str) -> &'static str {
     match tool_name {
@@ -79,8 +89,33 @@ pub async fn run_agent(
         role: "user".to_string(),
         content: Some(task.to_string()),
         tool_calls: None,
+        tool_call_id: None,
     }];
 
+    run_agent_turn(
+        client,
+        &mut messages,
+        model,
+        max_iterations,
+        verbose,
+        approval,
+        effort_level,
+    )
+    .await
+}
+
+/// Runs the tool-calling agent loop against an existing message history,
+/// appending the assistant/tool messages produced along the way so the
+/// history can be reused for a follow-up turn (e.g. a continuous chat).
+pub async fn run_agent_turn(
+    client: &Client,
+    messages: &mut Vec<ChatMessage>,
+    model: &str,
+    max_iterations: usize,
+    verbose: bool,
+    approval: &ApprovalSettings,
+    effort_level: Option<String>,
+) -> Result<Option<String>> {
     let tool_definitions = get_tool_definitions();
     let mut iteration = 0;
     let mut final_response = None;
@@ -93,6 +128,7 @@ pub async fn run_agent(
         }
 
         // Call the LLM with tool definitions
+        let spinner = Spinner::start("Thinking...");
         let response = client
             .chat(
                 model.to_string(),
@@ -101,7 +137,9 @@ pub async fn run_agent(
                 Some(tool_definitions.clone()),
                 effort_level.clone(),
             )
-            .await?;
+            .await;
+        spinner.stop().await;
+        let response = response?;
 
         let choice = &response.choices[0];
 
@@ -115,16 +153,20 @@ pub async fn run_agent(
             final_response = Some(content.clone());
         }
 
-        // If no tool calls, we're done
-        if choice.message.tool_calls.is_none() || choice.message.tool_calls.as_ref().unwrap().is_empty() {
+        let no_tool_calls = choice.message.tool_calls.is_none()
+            || choice.message.tool_calls.as_ref().unwrap().is_empty();
+
+        // Record the assistant's turn in history before deciding whether to
+        // keep looping, so a plain text answer (no tool calls) is still
+        // remembered on the next turn instead of vanishing from context.
+        messages.push(choice.message.clone());
+
+        if no_tool_calls {
             if verbose {
                 println!("{}", "✓ Agent finished".green());
             }
             return Ok(final_response);
         }
-
-        // Add the assistant's response to messages
-        messages.push(choice.message.clone());
 
         // Process each tool call
         if let Some(tool_calls) = &choice.message.tool_calls {
@@ -160,11 +202,12 @@ pub async fn run_agent(
                     println!("{} {}", "  Result:".bright_black(), result);
                 }
 
-                // Add tool result back to messages
+                // Add tool result back to messages, threaded to the call that produced it
                 messages.push(ChatMessage {
-                    role: "user".to_string(),
+                    role: "tool".to_string(),
                     content: Some(result.to_string()),
                     tool_calls: None,
+                    tool_call_id: Some(tool_call.id.clone()),
                 });
             }
         }

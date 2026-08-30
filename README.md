@@ -170,9 +170,23 @@ orca agent "Create utils.rs with a reverse array function" -v
 orca agent "Generate project structure" --max-iterations 30
 ```
 
+#### `agent-chat`
+Start an interactive, continuous agentic chat session: like `chat`, but each turn runs the full tool-calling agent loop (read/write files, run commands) against a conversation history that persists for the whole session, so later prompts can refer back to earlier ones.
+
+```bash
+orca agent-chat
+# Type exit to quit
+
+# Show detailed iteration logs for every turn
+orca agent-chat -v
+
+# Override the default max iterations per turn
+orca agent-chat --max-iterations 30
+```
+
 ## Agentic Tools
 
-When running `agent` commands, the LLM has access to these tools:
+When running `agent` or `agent-chat` commands, the LLM has access to these tools:
 
 ### `write_file`
 Write or append content to a file.

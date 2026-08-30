@@ -1,6 +1,7 @@
 mod agent;
 mod client;
 mod config;
+mod spinner;
 mod tools;
 
 use anyhow::Result;
@@ -11,6 +12,7 @@ use std::io::{self, Write};
 
 use client::{ChatMessage, Client};
 use config::{get_config_path, load_config, save_config, ApprovalSettings, VALID_EFFORT_LEVELS};
+use spinner::Spinner;
 
 #[derive(Parser)]
 #[command(name = "orca")]
@@ -105,6 +107,21 @@ enum Commands {
         #[arg(long)]
         max_iterations: Option<usize>,
     },
+
+    /// Interactive agentic chat session (tools + persistent conversation context)
+    AgentChat {
+        /// Model to use (overrides the persistent default for this call)
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Show detailed agent iterations
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Maximum number of iterations per turn (overrides the persistent default for this call)
+        #[arg(long)]
+        max_iterations: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -188,6 +205,11 @@ async fn main() -> Result<()> {
             verbose,
             max_iterations,
         } => cmd_agent(&task, model, verbose, max_iterations).await?,
+        Commands::AgentChat {
+            model,
+            verbose,
+            max_iterations,
+        } => cmd_agent_chat(model, verbose, max_iterations).await?,
     }
 
     Ok(())
@@ -440,13 +462,12 @@ async fn cmd_models() -> Result<()> {
     let config = load_config()?;
     let client = Client::new(config)?;
 
-    let spinner = "Fetching models...".yellow();
-    print!("{} ", spinner);
-    io::stdout().flush()?;
+    let spinner = Spinner::start("Fetching models...");
+    let models = client.list_models().await;
+    spinner.stop().await;
+    let models = models?;
 
-    let models = client.list_models().await?;
-
-    println!("\r{} ", "✓".green());
+    println!("{} ", "✓".green());
     println!(
         "\n{}\n",
         format!("Available models ({}):", models.len()).blue()
@@ -469,16 +490,14 @@ async fn cmd_ask(prompt: &str, model: Option<String>, temperature: f32) -> Resul
     let effort_level = config.effort_level.clone();
     let client = Client::new(config)?;
 
-    let spinner = "Thinking...".yellow();
-    print!("{} ", spinner);
-    io::stdout().flush()?;
-
     let messages = vec![ChatMessage {
         role: "user".to_string(),
         content: Some(prompt.to_string()),
         tool_calls: None,
+        tool_call_id: None,
     }];
 
+    let spinner = Spinner::start("Thinking...");
     let response = client
         .chat(
             model.clone(),
@@ -487,9 +506,11 @@ async fn cmd_ask(prompt: &str, model: Option<String>, temperature: f32) -> Resul
             None,
             effort_level.clone(),
         )
-        .await?;
+        .await;
+    spinner.stop().await;
+    let response = response?;
 
-    println!("\r{} ", "✓".green());
+    println!("{} ", "✓".green());
     println!("\n{}:", response_label(&model, &effort_level).cyan());
     if let Some(content) = &response.choices[0].message.content {
         println!("{}", content);
@@ -523,13 +544,11 @@ async fn cmd_chat(model: Option<String>) -> Result<()> {
                     role: "user".to_string(),
                     content: Some(line.clone()),
                     tool_calls: None,
+                    tool_call_id: None,
                 });
 
-                let spinner = "...".yellow();
-                print!("{} ", spinner);
-                io::stdout().flush()?;
-
-                match client
+                let spinner = Spinner::start("Thinking...");
+                let result = client
                     .chat(
                         model.clone(),
                         messages.clone(),
@@ -537,10 +556,11 @@ async fn cmd_chat(model: Option<String>) -> Result<()> {
                         None,
                         effort_level.clone(),
                     )
-                    .await
-                {
+                    .await;
+                spinner.stop().await;
+
+                match result {
                     Ok(response) => {
-                        println!("\r   ");
                         if let Some(content) = &response.choices[0].message.content {
                             println!(
                                 "{} {}\n",
@@ -551,11 +571,12 @@ async fn cmd_chat(model: Option<String>) -> Result<()> {
                                 role: "assistant".to_string(),
                                 content: Some(content.clone()),
                                 tool_calls: None,
+                                tool_call_id: None,
                             });
                         }
                     }
                     Err(e) => {
-                        println!("\r{} {}\n", "✗".red(), e);
+                        println!("{} {}\n", "✗".red(), e);
                     }
                 }
             }
@@ -598,6 +619,80 @@ async fn cmd_agent(
         effort_level,
     )
     .await?;
+
+    Ok(())
+}
+
+async fn cmd_agent_chat(
+    model: Option<String>,
+    verbose: bool,
+    max_iterations: Option<usize>,
+) -> Result<()> {
+    let config = load_config()?;
+    let model = resolve_model(&config, model);
+    let max_iterations = resolve_max_iterations(&config, max_iterations);
+    let approval = config.approval.clone();
+    let effort_level = config.effort_level.clone();
+    let client = Client::new(config)?;
+
+    println!(
+        "{}\n",
+        "Starting agent chat session (type 'exit' to quit)".blue()
+    );
+
+    let mut rl = DefaultEditor::new()?;
+    let mut messages: Vec<ChatMessage> = vec![ChatMessage {
+        role: "system".to_string(),
+        content: Some(agent::AGENT_CHAT_SYSTEM_PROMPT.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    }];
+
+    loop {
+        let readline = rl.readline(&format!("{} ", "You:".blue()));
+
+        match readline {
+            Ok(line) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                if line.to_lowercase() == "exit" {
+                    println!("{} Agent chat session ended", "✓".green());
+                    break;
+                }
+
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(line.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+
+                if let Err(e) = agent::run_agent_turn(
+                    &client,
+                    &mut messages,
+                    &model,
+                    max_iterations,
+                    verbose,
+                    &approval,
+                    effort_level.clone(),
+                )
+                .await
+                {
+                    println!("{} {}\n", "✗".red(), e);
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("{} Agent chat session ended", "✓".green());
+                break;
+            }
+            Err(e) => {
+                eprintln!("{} Error: {}", "✗".red(), e);
+                break;
+            }
+        }
+    }
 
     Ok(())
 }

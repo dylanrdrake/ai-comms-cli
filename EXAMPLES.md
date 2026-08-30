@@ -214,6 +214,20 @@ orca agent "Create an efficient-memory.rs with a data structure that minimizes a
 orca agent "Create parallel.rs with a multi-threaded or async implementation for processing batches of items"
 ```
 
+## Continuous Agentic Chat
+
+### Iterate on a project across multiple prompts
+
+```bash
+orca agent-chat
+You: Create a Cargo project for a CLI todo app with add/list/done commands
+You: Now add a --priority flag to the add subcommand
+You: Read src/main.rs back to me and suggest one refactor
+# Type exit to quit
+```
+
+Each prompt is answered with the full agent tool loop (reading/writing files, running commands), and the whole conversation — including tool results — stays in context for the next prompt, so you can build on prior turns instead of restating everything in one `orca agent` call.
+
 ## Tips & Tricks
 
 ### Use verbose mode to debug agent iterations

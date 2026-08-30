@@ -8,6 +8,8 @@ pub struct ChatMessage {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -125,5 +127,18 @@ impl Client {
 
         let model_list: ModelList = response.json().await?;
         Ok(model_list.data.into_iter().map(|m| m.id).collect())
+    }
+}
+
+#[cfg(test)]
+mod deser_tests {
+    use super::*;
+
+    #[test]
+    fn chat_message_deserializes_without_tool_call_id() {
+        let json = r#"{"role":"assistant","content":"hi"}"#;
+        let m: ChatMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.tool_call_id, None);
     }
 }
