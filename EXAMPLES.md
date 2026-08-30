@@ -228,6 +228,28 @@ You: Read src/main.rs back to me and suggest one refactor
 
 Each prompt is answered with the full agent tool loop (reading/writing files, running commands), and the whole conversation — including tool results — stays in context for the next prompt, so you can build on prior turns instead of restating everything in one `orca agent` call.
 
+### Resume a saved session later
+
+```bash
+orca sessions list
+#   a1b2c3d4  [agent_chat]  orcarouter/auto  Create a Cargo project for a CLI todo app...
+
+orca agent-chat --resume a1b2c3d4
+# prints the prior transcript, then drops you back into the prompt
+```
+
+Don't remember the id? Leave `--resume` bare and pick from a list instead:
+
+```bash
+orca agent-chat --resume
+# Select a session to resume:
+#   1. a1b2c3d4  Create a Cargo project for a CLI todo app...
+#   2. f9e8d7c6  Refactor the auth middleware
+# Session number: 1
+```
+
+`chat` and `agent-chat` sessions are saved automatically as you go, so this works even if you closed the terminal without typing `exit`. See the [Session Persistence](README.md#session-persistence) section of the README for details.
+
 ## Tips & Tricks
 
 ### Use verbose mode to debug agent iterations

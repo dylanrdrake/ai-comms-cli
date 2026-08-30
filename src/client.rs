@@ -33,8 +33,17 @@ pub struct ChatRequest {
     pub temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
+    /// Flat effort field, e.g. OrcaRouter's `reasoning_effort: "high"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Nested effort field, e.g. OpenRouter's `reasoning: { "effort": "high" }`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningEffort>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReasoningEffort {
+    pub effort: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,19 +68,31 @@ pub struct Model {
 
 pub struct Client {
     config: Config,
+    api_key: String,
     http_client: reqwest::Client,
 }
 
 impl Client {
     pub fn new(config: Config) -> Result<Self> {
-        if config.api_key.is_none() {
-            return Err(anyhow!("API key not configured. Run: orca login"));
-        }
+        let api_key = crate::config::get_api_key()?
+            .ok_or_else(|| anyhow!("API key not configured. Run: orca login"))?;
 
         Ok(Client {
             config,
+            api_key,
             http_client: reqwest::Client::new(),
         })
+    }
+
+    /// Applies the `Authorization` header plus any user-configured
+    /// `extra_headers` (e.g. OpenRouter's optional `HTTP-Referer`/`X-Title`)
+    /// to an outgoing request.
+    fn apply_headers(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req = req.header("Authorization", format!("Bearer {}", self.api_key));
+        for (key, value) in &self.config.extra_headers {
+            req = req.header(key.as_str(), value.as_str());
+        }
+        req
     }
 
     pub async fn chat(
@@ -82,6 +103,23 @@ impl Client {
         tools: Option<Vec<serde_json::Value>>,
         effort_level: Option<String>,
     ) -> Result<ChatResponse> {
+        let effort_style = self
+            .config
+            .effort_style
+            .as_deref()
+            .unwrap_or(crate::config::DEFAULT_EFFORT_STYLE);
+
+        let (reasoning_effort, reasoning) = match (&effort_level, effort_style) {
+            (Some(effort), "flat") => (Some(effort.clone()), None),
+            (Some(effort), "nested") => (
+                None,
+                Some(ReasoningEffort {
+                    effort: effort.clone(),
+                }),
+            ),
+            _ => (None, None),
+        };
+
         let request = ChatRequest {
             model,
             messages,
@@ -92,16 +130,14 @@ impl Client {
             } else {
                 None
             },
-            reasoning_effort: effort_level,
+            reasoning_effort,
+            reasoning,
         };
 
-        let response = self
+        let req = self
             .http_client
-            .post(format!("{}/chat/completions", self.config.base_url))
-            .header("Authorization", format!("Bearer {}", self.config.api_key.as_ref().unwrap()))
-            .json(&request)
-            .send()
-            .await?;
+            .post(format!("{}/chat/completions", self.config.base_url));
+        let response = self.apply_headers(req).json(&request).send().await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
@@ -113,12 +149,10 @@ impl Client {
     }
 
     pub async fn list_models(&self) -> Result<Vec<String>> {
-        let response = self
+        let req = self
             .http_client
-            .get(format!("{}/models", self.config.base_url))
-            .header("Authorization", format!("Bearer {}", self.config.api_key.as_ref().unwrap()))
-            .send()
-            .await?;
+            .get(format!("{}/models", self.config.base_url));
+        let response = self.apply_headers(req).send().await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await?;

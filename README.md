@@ -1,6 +1,6 @@
 # OrcaCLI
 
-A consolidated CLI agent frontend for OrcaRouter with agentic tool capabilities, written in Rust.
+A consolidated CLI agent frontend for OrcaRouter with agentic tool capabilities, written in Rust. Also works with any other OpenAI-compatible service (OpenRouter, Together, Groq, self-hosted gateways, etc) via `orca endpoint` — see [Using other providers](#using-other-providers).
 
 ## Features
 
@@ -10,6 +10,8 @@ A consolidated CLI agent frontend for OrcaRouter with agentic tool capabilities,
 - **File operations** — LLM can read, write, and modify local files
 - **Model selection** — Choose from 200+ models or use adaptive routing
 - **Agentic loops** — Multi-turn execution with tool calling
+- **Persistent sessions** — `chat`/`agent-chat` conversations are saved to SQLite and resumable across restarts
+- **Secure credential storage** — API keys live in your OS keychain, not a plaintext file
 
 ## Installation
 
@@ -43,14 +45,14 @@ orca ask "Hello"
 ### Commands
 
 #### `login`
-Set up or update your OrcaRouter API key.
+Set up or update your OrcaRouter API key. The key is stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service) rather than in a plaintext config file.
 
 ```bash
 orca login
 ```
 
 #### `logout`
-Remove your stored API key.
+Remove your stored API key from the OS keychain.
 
 ```bash
 orca logout
@@ -115,6 +117,50 @@ orca effort-level --clear
 
 When an effort level is set, `ask`, `chat`, and `agent` label responses as `<model> (<effort>)` instead of just `<model>`, so you can see which effort level produced a given answer.
 
+#### `endpoint [url]`
+View or set the API base URL, so you can point `orca` at any OpenAI-compatible service instead of OrcaRouter (OpenRouter, Together, Groq, a self-hosted gateway, etc).
+
+```bash
+# Show the current endpoint
+orca endpoint
+
+# Point at OpenRouter
+orca endpoint https://openrouter.ai/api/v1
+
+# Clear it (falls back to the OrcaRouter default)
+orca endpoint --clear
+```
+
+Switching endpoints doesn't switch your API key or default model automatically — run `orca login` to set the new provider's key, and `orca model` to set a model it actually serves.
+
+#### `effort-style [value]`
+View or set how the reasoning effort level (`orca effort-level`) is serialized in requests, since providers disagree on the shape:
+
+- `flat` (default) — sends `reasoning_effort: "<level>"` at the top level, as OrcaRouter expects.
+- `nested` — sends `reasoning: { effort: "<level>" }`, as OpenRouter expects.
+- `none` — omits effort entirely, for providers that reject unrecognized fields.
+
+```bash
+orca effort-style
+orca effort-style nested
+orca effort-style --clear
+```
+
+#### `headers`
+View or manage extra HTTP headers sent with every API request, useful for providers with optional attribution headers (e.g. OpenRouter's `HTTP-Referer`/`X-Title`).
+
+```bash
+# Show current extra headers
+orca headers
+
+# Set a header
+orca headers set HTTP-Referer https://myapp.example.com
+orca headers set X-Title "My App"
+
+# Remove one
+orca headers unset HTTP-Referer
+```
+
 #### `approval`
 Configure approval settings for agentic actions. By default, the agent prompts for approval before reading files, writing files, or running terminal commands.
 
@@ -146,11 +192,17 @@ orca ask "Write a poem" -t 1.5
 ```
 
 #### `chat`
-Start an interactive multi-turn conversation.
+Start an interactive multi-turn conversation. The session is saved automatically as you go (see [Session Persistence](#session-persistence)), so you can pick it back up later.
 
 ```bash
 orca chat
 # Type exit to quit
+
+# Resume a previous session by id (or a unique prefix of it)
+orca chat --resume a1b2c3d4
+
+# Or omit the id to pick from a numbered list of your saved chat sessions
+orca chat --resume
 ```
 
 #### `agent <task>`
@@ -171,7 +223,7 @@ orca agent "Generate project structure" --max-iterations 30
 ```
 
 #### `agent-chat`
-Start an interactive, continuous agentic chat session: like `chat`, but each turn runs the full tool-calling agent loop (read/write files, run commands) against a conversation history that persists for the whole session, so later prompts can refer back to earlier ones.
+Start an interactive, continuous agentic chat session: like `chat`, but each turn runs the full tool-calling agent loop (read/write files, run commands) against a conversation history that persists for the whole session, so later prompts can refer back to earlier ones. Like `chat`, the session is saved automatically (see [Session Persistence](#session-persistence)).
 
 ```bash
 orca agent-chat
@@ -182,6 +234,26 @@ orca agent-chat -v
 
 # Override the default max iterations per turn
 orca agent-chat --max-iterations 30
+
+# Resume a previous agent-chat session by id (or a unique prefix of it)
+orca agent-chat --resume a1b2c3d4
+
+# Or omit the id to pick from a numbered list of your saved agent-chat sessions
+orca agent-chat --resume
+```
+
+#### `sessions`
+List, inspect, or delete saved `chat`/`agent-chat` sessions.
+
+```bash
+# List all saved sessions (id prefix, kind, model, title)
+orca sessions list
+
+# Show a session's full message history
+orca sessions show a1b2c3d4
+
+# Delete a saved session
+orca sessions delete a1b2c3d4
 ```
 
 ## Agentic Tools
@@ -209,7 +281,6 @@ Configuration is stored at `~/.orcacli/config.json`:
 
 ```json
 {
-  "api_key": "sk-orca-...",
   "base_url": "https://api.orcarouter.ai/v1",
   "default_model": "anthropic/claude-opus-4.5",
   "approval": {
@@ -218,14 +289,50 @@ Configuration is stored at `~/.orcacli/config.json`:
     "terminal": true
   },
   "max_iterations": 20,
-  "effort_level": "high"
+  "effort_level": "high",
+  "effort_style": "flat",
+  "extra_headers": {}
 }
 ```
 
+- Your API key is **not** in this file — `orca login`/`logout` store and remove it from the OS keychain instead (see [Security](#security)). If you have an old config with a plaintext `api_key` field, the next command that loads config transparently migrates it into the OS keychain and rewrites the file without it.
+- `base_url` is managed via `orca endpoint` and is the API endpoint used by every command. Defaults to OrcaRouter; point it at any OpenAI-compatible service.
 - `default_model` is managed via `orca model` and is used by `ask`, `chat`, and `agent` when `-m`/`--model` isn't passed.
 - `approval` settings control whether the agent prompts before performing actions. Managed via `orca approval`.
 - `max_iterations` is managed via `orca max-iterations` and is the default for `agent` when `--max-iterations` isn't passed.
-- `effort_level` is managed via `orca effort-level` and is sent as `reasoning_effort` for `ask`, `chat`, and `agent` when set.
+- `effort_level` is managed via `orca effort-level` and is sent for `ask`, `chat`, and `agent` when set, shaped according to `effort_style`.
+- `effort_style` is managed via `orca effort-style` and controls whether the effort level is sent flat, nested, or omitted (see [`effort-style`](#effort-style-value)).
+- `extra_headers` is managed via `orca headers` and is merged into every API request.
+
+### Using other providers
+
+OrcaCLI talks to any service exposing an OpenAI-compatible `/chat/completions` and `/models` API over `Authorization: Bearer` auth — this covers OrcaRouter, OpenRouter, Together, Groq, Fireworks, and self-hosted gateways (vLLM, Ollama's OpenAI shim, LM Studio). It does not cover providers with a different auth scheme or URL shape, like Azure OpenAI.
+
+To switch to OpenRouter, for example:
+
+```bash
+orca endpoint https://openrouter.ai/api/v1
+orca login                          # enter your OpenRouter key
+orca model openrouter/auto          # or any model OpenRouter serves
+orca effort-style nested            # OpenRouter expects reasoning as a nested object
+orca headers set HTTP-Referer https://myapp.example.com   # optional, for OpenRouter's attribution
+```
+
+Only one provider is active at a time today — switching back to OrcaRouter means re-running `orca endpoint`, `orca login`, `orca model`, and `orca effort-style` for it. Named provider profiles (switch between saved providers with one command) are tracked in `TODO.md`.
+
+## Session Persistence
+
+`chat` and `agent-chat` sessions are saved automatically to a SQLite database at `~/.orcacli/chats.db`. Every message (yours, the assistant's, and any tool calls/results in `agent-chat`) is written as the conversation happens, so you don't lose anything if you exit or your terminal closes.
+
+Each session gets an id (a UUID) and a title derived from your first message. Use:
+
+- `orca sessions list` to see saved sessions (shown by 8-character id prefix, kind, model, and title)
+- `orca sessions show <id>` to view a session's full transcript
+- `orca sessions delete <id>` to remove one
+- `orca chat --resume <id>` / `orca agent-chat --resume <id>` to continue a saved session
+- `orca chat --resume` / `orca agent-chat --resume` with no id to pick one from a numbered list of your saved sessions of that kind
+
+Any unique prefix of a session's id works wherever a full id is expected. Resuming a `chat` session with `agent-chat --resume` (or vice versa) is rejected, since the two modes carry different system prompts and tool history.
 
 ## Examples
 
@@ -316,7 +423,8 @@ sudo dnf groupinstall "Development Tools"
 ## Security
 
 - File operations are restricted to your current working directory and home directory
-- API keys are stored in `~/.orcacli/config.json` — add it to `.gitignore`
+- API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.orcacli/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `orca` command, and the field is stripped from the file afterward
+- `chat`/`agent-chat` history (including tool calls and their results) is stored unencrypted in `~/.orcacli/chats.db` — add it to `.gitignore` and avoid pasting secrets into a session if you plan to keep or share the database file
 
 ## Development
 
