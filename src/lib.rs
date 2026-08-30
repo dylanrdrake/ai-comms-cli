@@ -5,3 +5,4 @@ pub mod crypto;
 pub mod spinner;
 pub mod store;
 pub mod tools;
+pub mod wrap;

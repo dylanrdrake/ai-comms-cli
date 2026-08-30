@@ -24,6 +24,7 @@ uuid = { version = "1.10", features = ["v4"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 aes-gcm = "0.10"
 base64 = "0.22"
+textwrap = { version = "0.16", features = ["terminal_size"] }
 
 [profile.release]
 opt-level = 3

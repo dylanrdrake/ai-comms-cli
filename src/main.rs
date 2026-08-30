@@ -5,6 +5,7 @@ mod crypto;
 mod spinner;
 mod store;
 mod tools;
+mod wrap;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -771,7 +772,7 @@ async fn cmd_ask(prompt: &str, model: Option<String>, temperature: f32) -> Resul
     println!("{} ", "✓".green());
     println!("\n{}:", response_label(&model, &effort_level).cyan());
     if let Some(content) = &response.choices[0].message.content {
-        println!("{}", content);
+        println!("{}", wrap::wrap(content));
     }
 
     Ok(())
@@ -784,12 +785,16 @@ fn print_transcript(messages: &[ChatMessage], model_label: &str) {
         match m.role.as_str() {
             "user" => {
                 if let Some(content) = &m.content {
-                    println!("{} {}", "You:".blue(), content);
+                    println!("{} {}", "You:".blue(), wrap::wrap(content));
                 }
             }
             "assistant" => {
                 if let Some(content) = &m.content {
-                    println!("{} {}\n", format!("{}:", model_label).cyan(), content);
+                    println!(
+                        "\n{} {}\n",
+                        format!("{}:", model_label).cyan(),
+                        wrap::wrap(content)
+                    );
                 }
             }
             _ => {}
@@ -866,6 +871,7 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
                     title_set = true;
                 }
 
+                println!();
                 let spinner = Spinner::start("Thinking...");
                 let result = client
                     .chat(
@@ -882,9 +888,9 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
                     Ok(response) => {
                         if let Some(content) = &response.choices[0].message.content {
                             println!(
-                                "{} {}\n",
+                                "\n{} {}\n",
                                 format!("{}:", response_label(&model, &effort_level)).cyan(),
-                                content
+                                wrap::wrap(content)
                             );
                             let seq = messages.len();
                             let assistant_message = ChatMessage {
@@ -1036,6 +1042,7 @@ async fn cmd_agent_chat(
                     tool_call_id: None,
                 });
 
+                println!();
                 if let Err(e) = agent::run_agent_turn(
                     &client,
                     &mut messages,

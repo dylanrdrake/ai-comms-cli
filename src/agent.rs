@@ -149,7 +149,7 @@ pub async fn run_agent_turn(
                 Some(effort) => format!("{} ({}):", model, effort),
                 None => format!("{}:", model),
             };
-            println!("{} {}", label.cyan(), content);
+            println!("\n{} {}", label.cyan(), crate::wrap::wrap(content));
             final_response = Some(content.clone());
         }
 
