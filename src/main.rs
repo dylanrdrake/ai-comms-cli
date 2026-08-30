@@ -10,7 +10,7 @@ use rustyline::DefaultEditor;
 use std::io::{self, Write};
 
 use client::{ChatMessage, Client};
-use config::{load_config, save_config, get_config_path};
+use config::{load_config, save_config, get_config_path, ApprovalSettings};
 
 #[derive(Parser)]
 #[command(name = "orca")]
@@ -43,6 +43,12 @@ enum Commands {
         /// Clear the stored default model (falls back to orcarouter/auto)
         #[arg(long)]
         clear: bool,
+    },
+
+    /// Configure approval settings for agentic actions
+    Approval {
+        #[command(subcommand)]
+        action: Option<ApprovalCommands>,
     },
 
     /// Send a prompt to OrcaRouter
@@ -85,6 +91,44 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum ApprovalCommands {
+    /// Show current approval settings
+    Show,
+    /// Set approval for reading from disk (read_file, list_files)
+    Read {
+        /// Enable or disable approval prompts
+        #[arg(value_parser = parse_bool)]
+        enabled: bool,
+    },
+    /// Set approval for writing to disk (write_file, replace_in_file)
+    Write {
+        /// Enable or disable approval prompts
+        #[arg(value_parser = parse_bool)]
+        enabled: bool,
+    },
+    /// Set approval for terminal commands (run_terminal_command)
+    Terminal {
+        /// Enable or disable approval prompts
+        #[arg(value_parser = parse_bool)]
+        enabled: bool,
+    },
+    /// Set all approval settings at once
+    All {
+        /// Enable or disable all approval prompts
+        #[arg(value_parser = parse_bool)]
+        enabled: bool,
+    },
+}
+
+fn parse_bool(s: &str) -> Result<bool, String> {
+    match s.to_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" => Ok(true),
+        "false" | "off" | "no" | "0" => Ok(false),
+        _ => Err(format!("Invalid boolean value: '{}'. Use true/false, on/off, yes/no, or 1/0", s)),
+    }
+}
+
 const DEFAULT_MODEL: &str = "orcarouter/auto";
 
 fn resolve_model(config: &config::Config, cli_model: Option<String>) -> String {
@@ -103,6 +147,7 @@ async fn main() -> Result<()> {
         Commands::Status => cmd_status().await?,
         Commands::Models => cmd_models().await?,
         Commands::Model { name, clear } => cmd_model(name, clear).await?,
+        Commands::Approval { action } => cmd_approval(action).await?,
         Commands::Ask {
             prompt,
             model,
@@ -172,6 +217,62 @@ async fn cmd_status() -> Result<()> {
         config.default_model.as_deref().unwrap_or(DEFAULT_MODEL)
     );
     println!("  Config file: {}", get_config_path()?.display());
+    println!("\n{}", "Approval Settings:".blue());
+    print_approval_status(&config.approval);
+    Ok(())
+}
+
+fn format_approval(enabled: bool) -> String {
+    if enabled {
+        format!("{} Ask", "✓".green())
+    } else {
+        format!("{} Auto", "✗".yellow())
+    }
+}
+
+fn print_approval_status(approval: &ApprovalSettings) {
+    println!("  Read from disk:    {}", format_approval(approval.read_disk));
+    println!("  Write to disk:     {}", format_approval(approval.write_disk));
+    println!("  Terminal commands: {}", format_approval(approval.terminal));
+}
+
+async fn cmd_approval(action: Option<ApprovalCommands>) -> Result<()> {
+    let mut config = load_config()?;
+
+    match action {
+        None | Some(ApprovalCommands::Show) => {
+            println!("{}", "Approval Settings:".blue());
+            print_approval_status(&config.approval);
+            println!("\n{}", "Usage:".bright_black());
+            println!("  orca approval read <on|off>     Set read approval");
+            println!("  orca approval write <on|off>    Set write approval");
+            println!("  orca approval terminal <on|off> Set terminal approval");
+            println!("  orca approval all <on|off>      Set all approvals");
+        }
+        Some(ApprovalCommands::Read { enabled }) => {
+            config.approval.read_disk = enabled;
+            save_config(&config)?;
+            println!("{} Read approval set to {}", "✓".green(), format_approval(enabled));
+        }
+        Some(ApprovalCommands::Write { enabled }) => {
+            config.approval.write_disk = enabled;
+            save_config(&config)?;
+            println!("{} Write approval set to {}", "✓".green(), format_approval(enabled));
+        }
+        Some(ApprovalCommands::Terminal { enabled }) => {
+            config.approval.terminal = enabled;
+            save_config(&config)?;
+            println!("{} Terminal approval set to {}", "✓".green(), format_approval(enabled));
+        }
+        Some(ApprovalCommands::All { enabled }) => {
+            config.approval.read_disk = enabled;
+            config.approval.write_disk = enabled;
+            config.approval.terminal = enabled;
+            save_config(&config)?;
+            println!("{} All approvals set to {}", "✓".green(), format_approval(enabled));
+        }
+    }
+
     Ok(())
 }
 
@@ -328,11 +429,12 @@ async fn cmd_agent(
 ) -> Result<()> {
     let config = load_config()?;
     let model = resolve_model(&config, model);
+    let approval = config.approval.clone();
     let client = Client::new(config)?;
 
     println!("{}\n", "Starting agent task...".blue());
 
-    agent::run_agent(&client, task, &model, max_iterations, verbose).await?;
+    agent::run_agent(&client, task, &model, max_iterations, verbose, &approval).await?;
 
     Ok(())
 }

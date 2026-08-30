@@ -86,6 +86,23 @@ orca model --clear
 
 Once set, `ask`, `chat`, and `agent` all use this default unless overridden with `-m`/`--model` for that specific call.
 
+#### `approval`
+Configure approval settings for agentic actions. By default, the agent prompts for approval before reading files, writing files, or running terminal commands.
+
+```bash
+# Show current approval settings
+orca approval
+
+# Configure individual approvals (use on/off, true/false, yes/no, or 1/0)
+orca approval read off      # Auto-approve file reads
+orca approval write on      # Prompt before file writes
+orca approval terminal on   # Prompt before terminal commands
+
+# Set all approvals at once
+orca approval all off       # Auto-approve everything (use with caution)
+orca approval all on        # Prompt for all actions
+```
+
 #### `ask <prompt>`
 Send a single prompt to the LLM.
 
@@ -140,6 +157,9 @@ List files in a directory.
 ### `replace_in_file`
 Replace text in an existing file.
 
+### `run_terminal_command`
+Execute a shell command and return the output. Supports custom working directory and timeout.
+
 ## Configuration
 
 Configuration is stored at `~/.orcacli/config.json`:
@@ -148,11 +168,17 @@ Configuration is stored at `~/.orcacli/config.json`:
 {
   "api_key": "sk-orca-...",
   "base_url": "https://api.orcarouter.ai/v1",
-  "default_model": "anthropic/claude-opus-4.5"
+  "default_model": "anthropic/claude-opus-4.5",
+  "approval": {
+    "read_disk": true,
+    "write_disk": true,
+    "terminal": true
+  }
 }
 ```
 
-`default_model` is managed via `orca model` (see above) and is used by `ask`, `chat`, and `agent` when `-m`/`--model` isn't passed.
+- `default_model` is managed via `orca model` and is used by `ask`, `chat`, and `agent` when `-m`/`--model` isn't passed.
+- `approval` settings control whether the agent prompts before performing actions. Managed via `orca approval`.
 
 ## Examples
 

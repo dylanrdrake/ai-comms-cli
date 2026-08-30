@@ -4,12 +4,38 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ApprovalSettings {
+    #[serde(default = "default_true")]
+    pub read_disk: bool,
+    #[serde(default = "default_true")]
+    pub write_disk: bool,
+    #[serde(default = "default_true")]
+    pub terminal: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ApprovalSettings {
+    fn default() -> Self {
+        ApprovalSettings {
+            read_disk: true,
+            write_disk: true,
+            terminal: true,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub api_key: Option<String>,
     #[serde(default = "default_base_url")]
     pub base_url: String,
     #[serde(default)]
     pub default_model: Option<String>,
+    #[serde(default)]
+    pub approval: ApprovalSettings,
 }
 
 fn default_base_url() -> String {
@@ -22,6 +48,7 @@ impl Default for Config {
             api_key: None,
             base_url: "https://api.orcarouter.ai/v1".to_string(),
             default_model: None,
+            approval: ApprovalSettings::default(),
         }
     }
 }
