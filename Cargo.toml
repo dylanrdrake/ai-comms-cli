@@ -1,10 +1,11 @@
 [package]
-name = "orca-cli"
+name = "ai-comms-cli"
 version = "0.1.0"
 edition = "2021"
+description = "An OpenAI-compatible CLI frontend for any LLM provider"
 
 [[bin]]
-name = "orca"
+name = "comms"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,6 +1,6 @@
-# OrcaCLI Rust Edition - Examples
+# AI Comms CLI - Examples
 
-Real-world usage examples for the Rust version of OrcaCLI.
+Real-world usage examples for AI Comms CLI.
 
 ## Quick Start
 
@@ -9,11 +9,11 @@ Real-world usage examples for the Rust version of OrcaCLI.
 cargo install --path .
 
 # 2. Login
-orca login
+comms login
 
 # 3. Try it
-orca ask "What can you do?"
-orca agent "Create a hello.rs file that prints 'Hello, Rust!'"
+comms ask "What can you do?"
+comms agent "Create a hello.rs file that prints 'Hello, Rust!'"
 ```
 
 ## Code Generation
@@ -21,7 +21,7 @@ orca agent "Create a hello.rs file that prints 'Hello, Rust!'"
 ### Generate a Rust utility function
 
 ```bash
-orca agent "Create a file utils.rs with functions to:
+comms agent "Create a file utils.rs with functions to:
 - Format dates
 - Calculate age from birthdate
 - Validate email addresses"
@@ -30,7 +30,7 @@ orca agent "Create a file utils.rs with functions to:
 ### Generate with tests
 
 ```bash
-orca agent "Create calculator.rs with add, subtract, multiply, divide functions, then create calculator_tests.rs with comprehensive tests"
+comms agent "Create calculator.rs with add, subtract, multiply, divide functions, then create calculator_tests.rs with comprehensive tests"
 ```
 
 ## Code Modification
@@ -38,19 +38,19 @@ orca agent "Create calculator.rs with add, subtract, multiply, divide functions,
 ### Read and improve existing code
 
 ```bash
-orca agent "Read src/main.rs and create an improved version with better error handling and documentation, save as src/main_improved.rs"
+comms agent "Read src/main.rs and create an improved version with better error handling and documentation, save as src/main_improved.rs"
 ```
 
 ### Fix bugs in code
 
 ```bash
-orca agent "Read src/buggy.rs, identify any bugs or inefficiencies, and write a fixed version to src/buggy_fixed.rs"
+comms agent "Read src/buggy.rs, identify any bugs or inefficiencies, and write a fixed version to src/buggy_fixed.rs"
 ```
 
 ### Refactor for performance
 
 ```bash
-orca agent "Read src/index.rs, analyze for performance improvements, and write an optimized version to src/index_optimized.rs"
+comms agent "Read src/index.rs, analyze for performance improvements, and write an optimized version to src/index_optimized.rs"
 ```
 
 ## Project Structure
@@ -58,7 +58,7 @@ orca agent "Read src/index.rs, analyze for performance improvements, and write a
 ### Generate a basic Rust project
 
 ```bash
-orca agent "Create a Rust project structure:
+comms agent "Create a Rust project structure:
 - Cargo.toml (with name and version)
 - src/main.rs (entry point with main function)
 - src/lib.rs (library module)
@@ -69,7 +69,7 @@ orca agent "Create a Rust project structure:
 ### Create a CLI tool skeleton
 
 ```bash
-orca agent "Create a Rust CLI tool with:
+comms agent "Create a Rust CLI tool with:
 - Cargo.toml (with clap dependency)
 - src/main.rs (argument parsing using clap)
 - src/commands.rs (command handlers)
@@ -80,7 +80,7 @@ orca agent "Create a Rust CLI tool with:
 ### Generate an async HTTP client
 
 ```bash
-orca agent "Create a Rust HTTP client library:
+comms agent "Create a Rust HTTP client library:
 - Cargo.toml (with reqwest and tokio dependencies)
 - src/lib.rs (module setup)
 - src/client.rs (HTTP client struct)
@@ -93,19 +93,19 @@ orca agent "Create a Rust HTTP client library:
 ### Generate and verify
 
 ```bash
-orca agent "Generate a random number generator in random.rs using rand crate, then read it back and verify the file exists and has valid Rust syntax" -v
+comms agent "Generate a random number generator in random.rs using rand crate, then read it back and verify the file exists and has valid Rust syntax" -v
 ```
 
 ### Create and document
 
 ```bash
-orca agent "Create a sorting.rs file with merge sort and quick sort implementations, then read it and create a SORTING.md file documenting the algorithms and complexity"
+comms agent "Create a sorting.rs file with merge sort and quick sort implementations, then read it and create a SORTING.md file documenting the algorithms and complexity"
 ```
 
 ### Build and chain modifications
 
 ```bash
-orca agent "Create math.rs with basic math functions, then read it and create stats.rs that uses math.rs functions for statistical calculations"
+comms agent "Create math.rs with basic math functions, then read it and create stats.rs that uses math.rs functions for statistical calculations"
 ```
 
 ## Using Different Models
@@ -113,19 +113,19 @@ orca agent "Create math.rs with basic math functions, then read it and create st
 ### Claude for code review
 
 ```bash
-orca agent "Read src/main.rs and provide detailed Rust-specific code review feedback" -m anthropic/claude-opus-4.5
+comms agent "Read src/main.rs and provide detailed Rust-specific code review feedback" -m anthropic/claude-opus-4.5
 ```
 
 ### GPT-4 for complex algorithms
 
 ```bash
-orca agent "Create an implementation of the A* pathfinding algorithm in Rust" -m openai/gpt-4o
+comms agent "Create an implementation of the A* pathfinding algorithm in Rust" -m openai/gpt-4o
 ```
 
 ### Adaptive routing (default)
 
 ```bash
-orca agent "Generate Rust boilerplate code for a web API" -m orcarouter/auto
+comms agent "Generate Rust boilerplate code for a web API" -m orcarouter/auto
 ```
 
 ## Interactive Chat
@@ -133,7 +133,7 @@ orca agent "Generate Rust boilerplate code for a web API" -m orcarouter/auto
 ### Have a Rust programming conversation
 
 ```bash
-orca chat
+comms chat
 # You: What's the best way to handle errors in Rust?
 # Assistant: [response about Result and ?]
 # You: Can you show me an example?
@@ -144,7 +144,7 @@ orca chat
 ### Get design advice
 
 ```bash
-orca chat
+comms chat
 # You: Should I use a trait or a struct for this?
 # Assistant: [design discussion]
 # You: What about performance?
@@ -157,7 +157,7 @@ orca chat
 ### Create a web server
 
 ```bash
-orca agent "Create a basic Axum web server:
+comms agent "Create a basic Axum web server:
 - Cargo.toml (with axum and tokio dependencies)
 - src/main.rs (server setup with routes)
 - src/handlers.rs (request handlers)
@@ -167,7 +167,7 @@ orca agent "Create a basic Axum web server:
 ### Database integration
 
 ```bash
-orca agent "Create a database abstraction layer:
+comms agent "Create a database abstraction layer:
 - Cargo.toml (with sqlx dependency)
 - src/db.rs (database connection and queries)
 - src/models.rs (data models)
@@ -177,7 +177,7 @@ orca agent "Create a database abstraction layer:
 ### Generate testing utilities
 
 ```bash
-orca agent "Create test_utils.rs with helper functions for:
+comms agent "Create test_utils.rs with helper functions for:
 - Creating test fixtures
 - Temporary file management
 - Mock object creation
@@ -187,7 +187,7 @@ orca agent "Create test_utils.rs with helper functions for:
 ### Create GitHub Actions workflow
 
 ```bash
-orca agent "Create .github/workflows/ci.yml for a Rust project with:
+comms agent "Create .github/workflows/ci.yml for a Rust project with:
 - cargo test
 - cargo clippy
 - cargo fmt --check
@@ -199,19 +199,19 @@ orca agent "Create .github/workflows/ci.yml for a Rust project with:
 ### Optimize hot loop
 
 ```bash
-orca agent "Read hot_loop.rs, identify performance bottlenecks, and rewrite using SIMD or other optimization techniques" -m openai/gpt-4o
+comms agent "Read hot_loop.rs, identify performance bottlenecks, and rewrite using SIMD or other optimization techniques" -m openai/gpt-4o
 ```
 
 ### Memory-efficient data structure
 
 ```bash
-orca agent "Create an efficient-memory.rs with a data structure that minimizes allocations while processing large datasets"
+comms agent "Create an efficient-memory.rs with a data structure that minimizes allocations while processing large datasets"
 ```
 
 ### Concurrent processing
 
 ```bash
-orca agent "Create parallel.rs with a multi-threaded or async implementation for processing batches of items"
+comms agent "Create parallel.rs with a multi-threaded or async implementation for processing batches of items"
 ```
 
 ## Continuous Agentic Chat
@@ -219,29 +219,29 @@ orca agent "Create parallel.rs with a multi-threaded or async implementation for
 ### Iterate on a project across multiple prompts
 
 ```bash
-orca agent-chat
+comms agent-chat
 You: Create a Cargo project for a CLI todo app with add/list/done commands
 You: Now add a --priority flag to the add subcommand
 You: Read src/main.rs back to me and suggest one refactor
 # Type exit to quit
 ```
 
-Each prompt is answered with the full agent tool loop (reading/writing files, running commands), and the whole conversation — including tool results — stays in context for the next prompt, so you can build on prior turns instead of restating everything in one `orca agent` call.
+Each prompt is answered with the full agent tool loop (reading/writing files, running commands), and the whole conversation — including tool results — stays in context for the next prompt, so you can build on prior turns instead of restating everything in one `comms agent` call.
 
 ### Resume a saved session later
 
 ```bash
-orca sessions list
+comms sessions list
 #   a1b2c3d4  [agent_chat]  orcarouter/auto  Create a Cargo project for a CLI todo app...
 
-orca agent-chat --resume a1b2c3d4
+comms agent-chat --resume a1b2c3d4
 # prints the prior transcript, then drops you back into the prompt
 ```
 
 Don't remember the id? Leave `--resume` bare and pick from a list instead:
 
 ```bash
-orca agent-chat --resume
+comms agent-chat --resume
 # Select a session to resume:
 #   1. a1b2c3d4  Create a Cargo project for a CLI todo app...
 #   2. f9e8d7c6  Refactor the auth middleware
@@ -255,28 +255,28 @@ orca agent-chat --resume
 ### Use verbose mode to debug agent iterations
 
 ```bash
-orca agent "Your Rust task" -v
+comms agent "Your Rust task" -v
 ```
 
 ### Increase iterations for complex tasks
 
 ```bash
 # Override for a single call
-orca agent "Complex multi-file project setup" --max-iterations 30
+comms agent "Complex multi-file project setup" --max-iterations 30
 
 # Or raise the persistent default so every agent call gets more room
-orca max-iterations 30
+comms max-iterations 30
 ```
 
 ### Set a reasoning effort level
 
 ```bash
 # Push harder on reasoning for tough tasks
-orca effort-level high
-orca agent "Design a lock-free concurrent queue in Rust"
+comms effort-level high
+comms agent "Design a lock-free concurrent queue in Rust"
 
 # Back off for quick, cheap responses
-orca effort-level low
+comms effort-level low
 ```
 
 Once set, response labels show the effort level alongside the model, e.g. `anthropic/claude-opus-4.5 (high):`, so it's clear which effort level produced the output.
@@ -284,17 +284,17 @@ Once set, response labels show the effort level alongside the model, e.g. `anthr
 ### Chain operations
 
 ```bash
-orca agent "List files in src/, then read src/main.rs, then create a refactored version"
+comms agent "List files in src/, then read src/main.rs, then create a refactored version"
 ```
 
 ### Experiment with temperature
 
 ```bash
 # More consistent (default)
-orca agent "Generate function" -m orcarouter/auto -t 0.5
+comms agent "Generate function" -m orcarouter/auto -t 0.5
 
 # More creative
-orca agent "Generate function" -m orcarouter/auto -t 1.5
+comms agent "Generate function" -m orcarouter/auto -t 1.5
 ```
 
 ## Workflow Examples
@@ -302,7 +302,7 @@ orca agent "Generate function" -m orcarouter/auto -t 1.5
 ### Building a microservice
 
 ```bash
-orca agent "Create a Rust microservice with:
+comms agent "Create a Rust microservice with:
 1. Cargo.toml (with axum, tokio, sqlx)
 2. src/main.rs (server entry point)
 3. src/handlers.rs (API endpoints)
@@ -315,7 +315,7 @@ orca agent "Create a Rust microservice with:
 ### Setting up testing
 
 ```bash
-orca agent "Create a comprehensive test setup:
+comms agent "Create a comprehensive test setup:
 1. Cargo.toml (with test dependencies)
 2. src/lib.rs (library with public API)
 3. src/main.rs (binary that uses lib)
@@ -326,7 +326,7 @@ orca agent "Create a comprehensive test setup:
 ### Create a library
 
 ```bash
-orca agent "Scaffold a reusable Rust library:
+comms agent "Scaffold a reusable Rust library:
 1. Cargo.toml (publishable on crates.io)
 2. src/lib.rs (module exports)
 3. src/core.rs (core functionality)
@@ -339,7 +339,7 @@ orca agent "Scaffold a reusable Rust library:
 ### Generate CLI tool with subcommands
 
 ```bash
-orca agent "Create a feature-rich CLI tool using clap:
+comms agent "Create a feature-rich CLI tool using clap:
 1. Cargo.toml (with clap v4)
 2. src/main.rs (argument parsing)
 3. src/commands/ (subcommand modules)

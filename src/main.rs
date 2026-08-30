@@ -20,8 +20,8 @@ use spinner::Spinner;
 use store::{KIND_AGENT_CHAT, KIND_CHAT};
 
 #[derive(Parser)]
-#[command(name = "orca")]
-#[command(about = "OrcaRouter CLI Agent - A consolidated agent frontend for OrcaRouter", long_about = None)]
+#[command(name = "comms")]
+#[command(about = "AI Comms CLI - An OpenAI-compatible frontend for any LLM provider", long_about = None)]
 #[command(version = "0.1.0")]
 struct Cli {
     #[command(subcommand)]
@@ -30,7 +30,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Set up OrcaRouter API key
+    /// Set up your API key
     Login,
 
     /// Remove stored API key
@@ -100,7 +100,7 @@ enum Commands {
         clear: bool,
     },
 
-    /// Send a prompt to OrcaRouter
+    /// Send a prompt to the LLM
     Ask {
         /// Your prompt/question
         prompt: String,
@@ -358,7 +358,7 @@ async fn main() -> Result<()> {
 }
 
 async fn cmd_login() -> Result<()> {
-    print!("{} ", "Enter your OrcaRouter API key:".blue());
+    print!("{} ", "Enter your API key:".blue());
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -390,7 +390,7 @@ async fn cmd_logout() -> Result<()> {
 
 async fn cmd_status() -> Result<()> {
     let config = load_config()?;
-    println!("{}", "OrcaCLI Configuration:".blue());
+    println!("{}", "AI Comms CLI Configuration:".blue());
     println!("  Base URL: {}", config.base_url);
     println!(
         "  API Key: {}",
@@ -459,10 +459,10 @@ async fn cmd_approval(action: Option<ApprovalCommands>) -> Result<()> {
             println!("{}", "Approval Settings:".blue());
             print_approval_status(&config.approval);
             println!("\n{}", "Usage:".bright_black());
-            println!("  orca approval read <on|off>     Set read approval");
-            println!("  orca approval write <on|off>    Set write approval");
-            println!("  orca approval terminal <on|off> Set terminal approval");
-            println!("  orca approval all <on|off>      Set all approvals");
+            println!("  comms approval read <on|off>     Set read approval");
+            println!("  comms approval write <on|off>    Set write approval");
+            println!("  comms approval terminal <on|off> Set terminal approval");
+            println!("  comms approval all <on|off>      Set all approvals");
         }
         Some(ApprovalCommands::Read { enabled }) => {
             let value = parse_bool(&enabled).map_err(|e| anyhow::anyhow!(e))?;
@@ -563,7 +563,7 @@ async fn cmd_endpoint(url: Option<String>, clear: bool) -> Result<()> {
             save_config(&config)?;
             println!("{} Endpoint set to {}", "✓".green(), trimmed);
             println!(
-                "{} Remember to run `orca login` if this provider uses a different API key",
+                "{} Remember to run `comms login` if this provider uses a different API key",
                 "i".bright_black()
             );
         }
@@ -805,7 +805,7 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
             let summary = resolve_resume_target(&conn, &id_or_prefix, KIND_CHAT)?;
             if summary.kind != KIND_CHAT {
                 anyhow::bail!(
-                    "Session {} is a {} session, resume it with `orca agent-chat --resume {}` instead",
+                    "Session {} is a {} session, resume it with `comms agent-chat --resume {}` instead",
                     summary.id,
                     summary.kind,
                     summary.id
@@ -917,7 +917,7 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
     }
 
     println!(
-        "{} Session saved. Resume with: orca chat --resume {}",
+        "{} Session saved. Resume with: comms chat --resume {}",
         "✓".green(),
         &session_id[..8]
     );
@@ -968,7 +968,7 @@ async fn cmd_agent_chat(
             let summary = resolve_resume_target(&conn, &id_or_prefix, KIND_AGENT_CHAT)?;
             if summary.kind != KIND_AGENT_CHAT {
                 anyhow::bail!(
-                    "Session {} is a {} session, resume it with `orca chat --resume {}` instead",
+                    "Session {} is a {} session, resume it with `comms chat --resume {}` instead",
                     summary.id,
                     summary.kind,
                     summary.id
@@ -1078,7 +1078,7 @@ async fn cmd_agent_chat(
     }
 
     println!(
-        "{} Session saved. Resume with: orca agent-chat --resume {}",
+        "{} Session saved. Resume with: comms agent-chat --resume {}",
         "✓".green(),
         &session_id[..8]
     );

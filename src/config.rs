@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-const KEYRING_SERVICE: &str = "orcacli";
+const KEYRING_SERVICE: &str = "ai-comms-cli";
 const KEYRING_USERNAME: &str = "api_key";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -95,7 +95,7 @@ impl Default for Config {
 pub fn get_config_dir() -> Result<PathBuf> {
     let config_dir = home::home_dir()
         .ok_or(anyhow!("Could not determine home directory"))?
-        .join(".orcacli");
+        .join(".comms");
 
     fs::create_dir_all(&config_dir)?;
     Ok(config_dir)

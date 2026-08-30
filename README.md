@@ -1,6 +1,6 @@
-# OrcaCLI
+# AI Comms CLI
 
-A consolidated CLI agent frontend for OrcaRouter with agentic tool capabilities, written in Rust. Also works with any other OpenAI-compatible service (OpenRouter, Together, Groq, self-hosted gateways, etc) via `orca endpoint` — see [Using other providers](#using-other-providers).
+An OpenAI-compatible CLI frontend for any LLM provider, with agentic tool capabilities, written in Rust. Defaults to OrcaRouter, but works with any OpenAI-compatible service (OpenRouter, Together, Groq, self-hosted gateways, etc) via `comms endpoint` — see [Using other providers](#using-other-providers).
 
 ## Features
 
@@ -17,7 +17,7 @@ A consolidated CLI agent frontend for OrcaRouter with agentic tool capabilities,
 
 ### Prerequisites
 - Rust 1.70+ (install from [rustup.rs](https://rustup.rs))
-- An OrcaRouter API key from [orcarouter.ai](https://www.orcarouter.ai)
+- An API key for your provider — defaults to OrcaRouter, get one from [orcarouter.ai](https://www.orcarouter.ai) (or see [Using other providers](#using-other-providers))
 
 ### Build from Source
 
@@ -25,7 +25,7 @@ A consolidated CLI agent frontend for OrcaRouter with agentic tool capabilities,
 cargo build --release
 ```
 
-The binary will be at `target/release/orca` (or `orca.exe` on Windows).
+The binary will be at `target/release/comms` (or `comms.exe` on Windows).
 
 ### Install Globally
 
@@ -33,11 +33,11 @@ The binary will be at `target/release/orca` (or `orca.exe` on Windows).
 cargo install --path .
 ```
 
-Then use `orca` from anywhere:
+Then use `comms` from anywhere:
 
 ```bash
-orca login
-orca ask "Hello"
+comms login
+comms ask "Hello"
 ```
 
 ## Usage
@@ -45,31 +45,31 @@ orca ask "Hello"
 ### Commands
 
 #### `login`
-Set up or update your OrcaRouter API key. The key is stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service) rather than in a plaintext config file.
+Set up or update your API key. The key is stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service) rather than in a plaintext config file.
 
 ```bash
-orca login
+comms login
 ```
 
 #### `logout`
 Remove your stored API key from the OS keychain.
 
 ```bash
-orca logout
+comms logout
 ```
 
 #### `status`
 Check your configuration.
 
 ```bash
-orca status
+comms status
 ```
 
 #### `models`
-List available models from OrcaRouter (shows first 20).
+List available models from your configured provider (shows first 20).
 
 ```bash
-orca models
+comms models
 ```
 
 #### `model [name]`
@@ -77,13 +77,13 @@ View or set the persistent default model, so you don't need to pass `-m` on ever
 
 ```bash
 # Show the current default
-orca model
+comms model
 
 # Set the default model
-orca model anthropic/claude-opus-4.5
+comms model anthropic/claude-opus-4.5
 
 # Clear the default (falls back to orcarouter/auto)
-orca model --clear
+comms model --clear
 ```
 
 Once set, `ask`, `chat`, and `agent` all use this default unless overridden with `-m`/`--model` for that specific call.
@@ -93,10 +93,10 @@ View or set the persistent default for how many tool-calling iterations `agent` 
 
 ```bash
 # Show the current default
-orca max-iterations
+comms max-iterations
 
 # Set the default
-orca max-iterations 20
+comms max-iterations 20
 ```
 
 Defaults to 20. Overridden per call with `--max-iterations` on `agent`.
@@ -106,44 +106,44 @@ View or set the persistent default reasoning effort (`low`, `medium`, or `high`)
 
 ```bash
 # Show the current effort level
-orca effort-level
+comms effort-level
 
 # Set the default
-orca effort-level high
+comms effort-level high
 
 # Clear it (falls back to the provider default)
-orca effort-level --clear
+comms effort-level --clear
 ```
 
 When an effort level is set, `ask`, `chat`, and `agent` label responses as `<model> (<effort>)` instead of just `<model>`, so you can see which effort level produced a given answer.
 
 #### `endpoint [url]`
-View or set the API base URL, so you can point `orca` at any OpenAI-compatible service instead of OrcaRouter (OpenRouter, Together, Groq, a self-hosted gateway, etc).
+View or set the API base URL, so you can point `comms` at any OpenAI-compatible service instead of OrcaRouter (OpenRouter, Together, Groq, a self-hosted gateway, etc).
 
 ```bash
 # Show the current endpoint
-orca endpoint
+comms endpoint
 
 # Point at OpenRouter
-orca endpoint https://openrouter.ai/api/v1
+comms endpoint https://openrouter.ai/api/v1
 
 # Clear it (falls back to the OrcaRouter default)
-orca endpoint --clear
+comms endpoint --clear
 ```
 
-Switching endpoints doesn't switch your API key or default model automatically — run `orca login` to set the new provider's key, and `orca model` to set a model it actually serves.
+Switching endpoints doesn't switch your API key or default model automatically — run `comms login` to set the new provider's key, and `comms model` to set a model it actually serves.
 
 #### `effort-style [value]`
-View or set how the reasoning effort level (`orca effort-level`) is serialized in requests, since providers disagree on the shape:
+View or set how the reasoning effort level (`comms effort-level`) is serialized in requests, since providers disagree on the shape:
 
 - `flat` (default) — sends `reasoning_effort: "<level>"` at the top level, as OrcaRouter expects.
 - `nested` — sends `reasoning: { effort: "<level>" }`, as OpenRouter expects.
 - `none` — omits effort entirely, for providers that reject unrecognized fields.
 
 ```bash
-orca effort-style
-orca effort-style nested
-orca effort-style --clear
+comms effort-style
+comms effort-style nested
+comms effort-style --clear
 ```
 
 #### `headers`
@@ -151,14 +151,14 @@ View or manage extra HTTP headers sent with every API request, useful for provid
 
 ```bash
 # Show current extra headers
-orca headers
+comms headers
 
 # Set a header
-orca headers set HTTP-Referer https://myapp.example.com
-orca headers set X-Title "My App"
+comms headers set HTTP-Referer https://myapp.example.com
+comms headers set X-Title "My App"
 
 # Remove one
-orca headers unset HTTP-Referer
+comms headers unset HTTP-Referer
 ```
 
 #### `approval`
@@ -166,43 +166,43 @@ Configure approval settings for agentic actions. By default, the agent prompts f
 
 ```bash
 # Show current approval settings
-orca approval
+comms approval
 
 # Configure individual approvals (use on/off, true/false, yes/no, or 1/0)
-orca approval read off      # Auto-approve file reads
-orca approval write on      # Prompt before file writes
-orca approval terminal on   # Prompt before terminal commands
+comms approval read off      # Auto-approve file reads
+comms approval write on      # Prompt before file writes
+comms approval terminal on   # Prompt before terminal commands
 
 # Set all approvals at once
-orca approval all off       # Auto-approve everything (use with caution)
-orca approval all on        # Prompt for all actions
+comms approval all off       # Auto-approve everything (use with caution)
+comms approval all on        # Prompt for all actions
 ```
 
 #### `ask <prompt>`
 Send a single prompt to the LLM.
 
 ```bash
-orca ask "What is OrcaRouter?"
+comms ask "What's the capital of France?"
 
 # Specify a model
-orca ask "Explain quantum computing" -m anthropic/claude-opus-4.5
+comms ask "Explain quantum computing" -m anthropic/claude-opus-4.5
 
 # Adjust temperature
-orca ask "Write a poem" -t 1.5
+comms ask "Write a poem" -t 1.5
 ```
 
 #### `chat`
 Start an interactive multi-turn conversation. The session is saved automatically as you go (see [Session Persistence](#session-persistence)), so you can pick it back up later.
 
 ```bash
-orca chat
+comms chat
 # Type exit to quit
 
 # Resume a previous session by id (or a unique prefix of it)
-orca chat --resume a1b2c3d4
+comms chat --resume a1b2c3d4
 
 # Or omit the id to pick from a numbered list of your saved chat sessions
-orca chat --resume
+comms chat --resume
 ```
 
 #### `agent <task>`
@@ -210,36 +210,36 @@ Run an agentic task where the LLM can use tools (read/write files).
 
 ```bash
 # Create a new file
-orca agent "Create a file called hello.rs that prints 'Hello, world!'"
+comms agent "Create a file called hello.rs that prints 'Hello, world!'"
 
 # Modify existing code
-orca agent "Read src/main.rs, identify improvements, and write an optimized version"
+comms agent "Read src/main.rs, identify improvements, and write an optimized version"
 
 # Show detailed iteration logs
-orca agent "Create utils.rs with a reverse array function" -v
+comms agent "Create utils.rs with a reverse array function" -v
 
 # Override the default max iterations for this call
-orca agent "Generate project structure" --max-iterations 30
+comms agent "Generate project structure" --max-iterations 30
 ```
 
 #### `agent-chat`
 Start an interactive, continuous agentic chat session: like `chat`, but each turn runs the full tool-calling agent loop (read/write files, run commands) against a conversation history that persists for the whole session, so later prompts can refer back to earlier ones. Like `chat`, the session is saved automatically (see [Session Persistence](#session-persistence)).
 
 ```bash
-orca agent-chat
+comms agent-chat
 # Type exit to quit
 
 # Show detailed iteration logs for every turn
-orca agent-chat -v
+comms agent-chat -v
 
 # Override the default max iterations per turn
-orca agent-chat --max-iterations 30
+comms agent-chat --max-iterations 30
 
 # Resume a previous agent-chat session by id (or a unique prefix of it)
-orca agent-chat --resume a1b2c3d4
+comms agent-chat --resume a1b2c3d4
 
 # Or omit the id to pick from a numbered list of your saved agent-chat sessions
-orca agent-chat --resume
+comms agent-chat --resume
 ```
 
 #### `sessions`
@@ -247,13 +247,13 @@ List, inspect, or delete saved `chat`/`agent-chat` sessions.
 
 ```bash
 # List all saved sessions (id prefix, kind, model, title)
-orca sessions list
+comms sessions list
 
 # Show a session's full message history
-orca sessions show a1b2c3d4
+comms sessions show a1b2c3d4
 
 # Delete a saved session
-orca sessions delete a1b2c3d4
+comms sessions delete a1b2c3d4
 ```
 
 ## Agentic Tools
@@ -277,7 +277,7 @@ Execute a shell command and return the output. Supports custom working directory
 
 ## Configuration
 
-Configuration is stored at `~/.orcacli/config.json`:
+Configuration is stored at `~/.comms/config.json`:
 
 ```json
 {
@@ -295,42 +295,42 @@ Configuration is stored at `~/.orcacli/config.json`:
 }
 ```
 
-- Your API key is **not** in this file — `orca login`/`logout` store and remove it from the OS keychain instead (see [Security](#security)). If you have an old config with a plaintext `api_key` field, the next command that loads config transparently migrates it into the OS keychain and rewrites the file without it.
-- `base_url` is managed via `orca endpoint` and is the API endpoint used by every command. Defaults to OrcaRouter; point it at any OpenAI-compatible service.
-- `default_model` is managed via `orca model` and is used by `ask`, `chat`, and `agent` when `-m`/`--model` isn't passed.
-- `approval` settings control whether the agent prompts before performing actions. Managed via `orca approval`.
-- `max_iterations` is managed via `orca max-iterations` and is the default for `agent` when `--max-iterations` isn't passed.
-- `effort_level` is managed via `orca effort-level` and is sent for `ask`, `chat`, and `agent` when set, shaped according to `effort_style`.
-- `effort_style` is managed via `orca effort-style` and controls whether the effort level is sent flat, nested, or omitted (see [`effort-style`](#effort-style-value)).
-- `extra_headers` is managed via `orca headers` and is merged into every API request.
+- Your API key is **not** in this file — `comms login`/`logout` store and remove it from the OS keychain instead (see [Security](#security)). If you have an old config with a plaintext `api_key` field, the next command that loads config transparently migrates it into the OS keychain and rewrites the file without it.
+- `base_url` is managed via `comms endpoint` and is the API endpoint used by every command. Defaults to OrcaRouter; point it at any OpenAI-compatible service.
+- `default_model` is managed via `comms model` and is used by `ask`, `chat`, and `agent` when `-m`/`--model` isn't passed.
+- `approval` settings control whether the agent prompts before performing actions. Managed via `comms approval`.
+- `max_iterations` is managed via `comms max-iterations` and is the default for `agent` when `--max-iterations` isn't passed.
+- `effort_level` is managed via `comms effort-level` and is sent for `ask`, `chat`, and `agent` when set, shaped according to `effort_style`.
+- `effort_style` is managed via `comms effort-style` and controls whether the effort level is sent flat, nested, or omitted (see [`effort-style`](#effort-style-value)).
+- `extra_headers` is managed via `comms headers` and is merged into every API request.
 
 ### Using other providers
 
-OrcaCLI talks to any service exposing an OpenAI-compatible `/chat/completions` and `/models` API over `Authorization: Bearer` auth — this covers OrcaRouter, OpenRouter, Together, Groq, Fireworks, and self-hosted gateways (vLLM, Ollama's OpenAI shim, LM Studio). It does not cover providers with a different auth scheme or URL shape, like Azure OpenAI.
+AI Comms CLI talks to any service exposing an OpenAI-compatible `/chat/completions` and `/models` API over `Authorization: Bearer` auth — this covers OrcaRouter, OpenRouter, Together, Groq, Fireworks, and self-hosted gateways (vLLM, Ollama's OpenAI shim, LM Studio). It does not cover providers with a different auth scheme or URL shape, like Azure OpenAI.
 
 To switch to OpenRouter, for example:
 
 ```bash
-orca endpoint https://openrouter.ai/api/v1
-orca login                          # enter your OpenRouter key
-orca model openrouter/auto          # or any model OpenRouter serves
-orca effort-style nested            # OpenRouter expects reasoning as a nested object
-orca headers set HTTP-Referer https://myapp.example.com   # optional, for OpenRouter's attribution
+comms endpoint https://openrouter.ai/api/v1
+comms login                          # enter your OpenRouter key
+comms model openrouter/auto          # or any model OpenRouter serves
+comms effort-style nested            # OpenRouter expects reasoning as a nested object
+comms headers set HTTP-Referer https://myapp.example.com   # optional, for OpenRouter's attribution
 ```
 
-Only one provider is active at a time today — switching back to OrcaRouter means re-running `orca endpoint`, `orca login`, `orca model`, and `orca effort-style` for it. Named provider profiles (switch between saved providers with one command) are tracked in `TODO.md`.
+Only one provider is active at a time today — switching back to OrcaRouter means re-running `comms endpoint`, `comms login`, `comms model`, and `comms effort-style` for it. Named provider profiles (switch between saved providers with one command) are tracked in `TODO.md`.
 
 ## Session Persistence
 
-`chat` and `agent-chat` sessions are saved automatically to a SQLite database at `~/.orcacli/chats.db`. Every message (yours, the assistant's, and any tool calls/results in `agent-chat`) is written as the conversation happens, so you don't lose anything if you exit or your terminal closes.
+`chat` and `agent-chat` sessions are saved automatically to a SQLite database at `~/.comms/chats.db`. Every message (yours, the assistant's, and any tool calls/results in `agent-chat`) is written as the conversation happens, so you don't lose anything if you exit or your terminal closes.
 
 Each session gets an id (a UUID) and a title derived from your first message. Use:
 
-- `orca sessions list` to see saved sessions (shown by 8-character id prefix, kind, model, and title)
-- `orca sessions show <id>` to view a session's full transcript
-- `orca sessions delete <id>` to remove one
-- `orca chat --resume <id>` / `orca agent-chat --resume <id>` to continue a saved session
-- `orca chat --resume` / `orca agent-chat --resume` with no id to pick one from a numbered list of your saved sessions of that kind
+- `comms sessions list` to see saved sessions (shown by 8-character id prefix, kind, model, and title)
+- `comms sessions show <id>` to view a session's full transcript
+- `comms sessions delete <id>` to remove one
+- `comms chat --resume <id>` / `comms agent-chat --resume <id>` to continue a saved session
+- `comms chat --resume` / `comms agent-chat --resume` with no id to pick one from a numbered list of your saved sessions of that kind
 
 Any unique prefix of a session's id works wherever a full id is expected. Resuming a `chat` session with `agent-chat --resume` (or vice versa) is rejected, since the two modes carry different system prompts and tool history.
 
@@ -339,32 +339,32 @@ Any unique prefix of a session's id works wherever a full id is expected. Resumi
 ### Generate and save code
 
 ```bash
-orca agent "Write a function that calculates fibonacci numbers and save it to math.rs"
+comms agent "Write a function that calculates fibonacci numbers and save it to math.rs"
 ```
 
 ### Multi-file project setup
 
 ```bash
-orca agent "Create a basic Rust project structure with Cargo.toml, src/main.rs, and src/lib.rs"
+comms agent "Create a basic Rust project structure with Cargo.toml, src/main.rs, and src/lib.rs"
 ```
 
 ### Fix existing code
 
 ```bash
-orca agent "Read main.rs, find any issues, and write a corrected version"
+comms agent "Read main.rs, find any issues, and write a corrected version"
 ```
 
 ### Using different models
 
 ```bash
 # Claude for code review
-orca agent "Read app.rs and provide detailed code review feedback" -m anthropic/claude-opus-4.5
+comms agent "Read app.rs and provide detailed code review feedback" -m anthropic/claude-opus-4.5
 
 # GPT-4 for complex logic
-orca agent "Create an algorithm to solve the traveling salesman problem" -m openai/gpt-4o
+comms agent "Create an algorithm to solve the traveling salesman problem" -m openai/gpt-4o
 
 # Adaptive routing (default)
-orca agent "Generate boilerplate code" -m orcarouter/auto
+comms agent "Generate boilerplate code" -m orcarouter/auto
 ```
 
 ## Rust vs Node.js Comparison
@@ -398,11 +398,11 @@ cargo build --release --target x86_64-unknown-linux-gnu
 
 ### "API key not configured"
 
-Run `orca login` and enter your key from [orcarouter.ai](https://www.orcarouter.ai/console/keys).
+Run `comms login` and enter your key from [orcarouter.ai](https://www.orcarouter.ai/console/keys).
 
 ### "Model not found"
 
-Run `orca models` to see available models, then use the correct model ID with `-m`.
+Run `comms models` to see available models, then use the correct model ID with `-m`.
 
 ### Build errors on macOS
 
@@ -423,8 +423,8 @@ sudo dnf groupinstall "Development Tools"
 ## Security
 
 - File operations are restricted to your current working directory and home directory
-- API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.orcacli/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `orca` command, and the field is stripped from the file afterward
-- `chat`/`agent-chat` history (including tool calls and their results) is stored unencrypted in `~/.orcacli/chats.db` — add it to `.gitignore` and avoid pasting secrets into a session if you plan to keep or share the database file
+- API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.comms/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `comms` command, and the field is stripped from the file afterward
+- `chat`/`agent-chat` history (including tool calls and their results) is stored unencrypted in `~/.comms/chats.db` — add it to `.gitignore` and avoid pasting secrets into a session if you plan to keep or share the database file
 
 ## Development
 
@@ -454,7 +454,7 @@ time node index.js ask "Hello"
 # real    0m0.280s
 
 # Rust version
-time orca ask "Hello"
+time comms ask "Hello"
 # real    0m0.015s
 ```
 
@@ -464,4 +464,4 @@ MIT
 
 ## Support
 
-For issues with OrcaRouter itself, visit [docs.orcarouter.ai](https://docs.orcarouter.ai)
+For issues with a specific provider's API itself (rate limits, billing, model availability), see that provider's own docs — e.g. [docs.orcarouter.ai](https://docs.orcarouter.ai) for the default OrcaRouter endpoint.

@@ -75,7 +75,7 @@ pub struct Client {
 impl Client {
     pub fn new(config: Config) -> Result<Self> {
         let api_key = crate::config::get_api_key()?
-            .ok_or_else(|| anyhow!("API key not configured. Run: orca login"))?;
+            .ok_or_else(|| anyhow!("API key not configured. Run: comms login"))?;
 
         Ok(Client {
             config,
