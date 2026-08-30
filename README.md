@@ -1,4 +1,4 @@
-# OrcaCLI (Rust Edition)
+# OrcaCLI
 
 A consolidated CLI agent frontend for OrcaRouter with agentic tool capabilities, written in Rust.
 
