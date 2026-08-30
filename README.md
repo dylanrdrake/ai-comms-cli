@@ -4,8 +4,7 @@ An OpenAI-compatible CLI frontend for any LLM provider, with agentic tool capabi
 
 ## Features
 
-- **Fast & lightweight** — Compiled Rust binary, no Node.js required
-- **Same functionality** — All features from the Node.js version
+- **Fast & lightweight** — Compiled Rust binary, single executable with no runtime dependencies
 - **Multiple interaction modes** — Q&A, interactive chat, agentic tasks
 - **File operations** — LLM can read, write, and modify local files
 - **Model selection** — Choose from 200+ models or use adaptive routing
@@ -367,17 +366,6 @@ comms agent "Create an algorithm to solve the traveling salesman problem" -m ope
 comms agent "Generate boilerplate code" -m orcarouter/auto
 ```
 
-## Rust vs Node.js Comparison
-
-| Feature | Rust | Node.js |
-|---------|------|---------|
-| Binary Size | ~20 MB | N/A (needs Node.js) |
-| Startup Time | <100ms | ~300ms |
-| Memory | ~20 MB | ~100 MB |
-| Dependencies | Compiled in | Runtime (node_modules) |
-| Installation | Single binary | npm install required |
-| Cross-platform | Yes | Yes |
-
 ## Building for Different Platforms
 
 ```bash
@@ -446,14 +434,7 @@ cargo clippy
 
 ## Performance
 
-Rust version is significantly faster:
-
 ```bash
-# Node.js version
-time node index.js ask "Hello"
-# real    0m0.280s
-
-# Rust version
 time comms ask "Hello"
 # real    0m0.015s
 ```
