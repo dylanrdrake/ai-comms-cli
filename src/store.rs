@@ -1,5 +1,6 @@
 use crate::client::{ChatMessage, ToolCall};
 use crate::config::get_config_dir;
+use crate::crypto;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -88,10 +89,11 @@ pub fn derive_title(messages: &[ChatMessage]) -> String {
 pub fn create_session(conn: &Connection, model: &str, kind: &str) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
     let ts = now();
+    let title = crypto::encrypt("Untitled")?;
 
     conn.execute(
         "INSERT INTO sessions (id, title, model, kind, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-        params![id, "Untitled", model, kind, ts],
+        params![id, title, model, kind, ts],
     )?;
 
     Ok(id)
@@ -99,6 +101,7 @@ pub fn create_session(conn: &Connection, model: &str, kind: &str) -> Result<Stri
 
 /// Updates the session's title (e.g. once the first user message is known).
 pub fn set_session_title(conn: &Connection, session_id: &str, title: &str) -> Result<()> {
+    let title = crypto::encrypt(title)?;
     conn.execute(
         "UPDATE sessions SET title = ?1 WHERE id = ?2",
         params![title, session_id],
@@ -120,13 +123,16 @@ pub fn append_message(
         .map(serde_json::to_string)
         .transpose()?;
 
+    let content = crypto::encrypt_opt(message.content.as_deref())?;
+    let tool_calls_json = crypto::encrypt_opt(tool_calls_json.as_deref())?;
+
     conn.execute(
         "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             session_id,
             seq as i64,
             message.role,
-            message.content,
+            content,
             tool_calls_json,
             message.tool_call_id,
         ],
@@ -159,7 +165,9 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
 
     let mut sessions = Vec::new();
     for row in rows {
-        sessions.push(row?);
+        let mut session = row?;
+        session.title = crypto::decrypt(&session.title)?;
+        sessions.push(session);
     }
     Ok(sessions)
 }
@@ -174,9 +182,10 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
     let mut rows = stmt.query(params![id_or_prefix, pattern])?;
 
     if let Some(row) = rows.next()? {
+        let title: String = row.get(1)?;
         Ok(Some(SessionSummary {
             id: row.get(0)?,
-            title: row.get(1)?,
+            title: crypto::decrypt(&title)?,
             model: row.get(2)?,
             kind: row.get(3)?,
             created_at: row.get(4)?,
@@ -204,6 +213,8 @@ pub fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<ChatMess
     let mut messages = Vec::new();
     for row in rows {
         let (role, content, tool_calls_json, tool_call_id) = row?;
+        let content = crypto::decrypt_opt(content)?;
+        let tool_calls_json = crypto::decrypt_opt(tool_calls_json)?;
         let tool_calls: Option<Vec<ToolCall>> = match tool_calls_json {
             Some(json) => Some(serde_json::from_str(&json)?),
             None => None,

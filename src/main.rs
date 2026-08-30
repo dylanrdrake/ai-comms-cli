@@ -1,6 +1,7 @@
 mod agent;
 mod client;
 mod config;
+mod crypto;
 mod spinner;
 mod store;
 mod tools;

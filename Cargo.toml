@@ -22,6 +22,8 @@ thiserror = "1.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1.10", features = ["v4"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+aes-gcm = "0.10"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3
