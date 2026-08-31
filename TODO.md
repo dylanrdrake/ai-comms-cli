@@ -9,4 +9,6 @@ Websearch
 
 1. Add provider column to message records. Can you switch providers mid-session? Do sessions save their last selected model?
 
-0. setup a pipeline that builds new executable release and publishes to GitHub
+
+
+

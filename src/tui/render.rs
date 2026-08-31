@@ -7,11 +7,23 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 /// Spinner frames, reused from the CLI's so both front ends feel the same.
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Most rows the message box will grow to before it scrolls internally,
+/// so a long paste can't squeeze the conversation off the screen.
+const MAX_INPUT_ROWS: u16 = 10;
+
 pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
+    // The message box grows with what's typed instead of staying at one row,
+    // so multi-line input is visible while writing it.
+    let input_width = frame.area().width.saturating_sub(2);
+    let input_rows = (input_lines(&app.input, input_width).len() as u16)
+        .clamp(1, MAX_INPUT_ROWS)
+        // Never take so much that the conversation has nowhere to go.
+        .min(frame.area().height.saturating_sub(5).max(1));
+
     let areas = Layout::vertical([
-        Constraint::Min(1),    // transcript
-        Constraint::Length(3), // input
-        Constraint::Length(1), // status
+        Constraint::Min(1),                 // transcript
+        Constraint::Length(input_rows + 2), // input, plus its borders
+        Constraint::Length(1),              // status
     ])
     .split(frame.area());
 
@@ -51,7 +63,14 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
                     None => Span::styled("assistant  ", Style::new().dark_gray().bold()),
                 };
                 let cursor = streaming.then(|| Span::styled("▌", Style::new().cyan()));
-                push_block(&mut lines, prefix, text, cursor);
+                if *streaming {
+                    // Mid-stream the text is usually mid-construct — an
+                    // unclosed fence or a half-written list — so render it
+                    // plainly and let the finished message reformat once.
+                    push_block(&mut lines, prefix, text, cursor);
+                } else {
+                    push_rendered(&mut lines, prefix, markdown_lines(text), cursor);
+                }
                 lines.push(Line::raw(""));
             }
             TranscriptItem::ToolCall {
@@ -106,9 +125,19 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
 
     let inner_width = area.width.saturating_sub(2);
     let visible = area.height.saturating_sub(2);
-    // ratatui's own line_count is still unstable, so measure with textwrap
-    // (already a dependency, and the same algorithm the CLI wraps with).
-    let mut total = wrapped_height(&lines, inner_width);
+
+    // Measured with ratatui's own wrapper rather than estimated: any
+    // disagreement between the estimate and the real layout shows up as the
+    // view scrolling to the wrong place, which on a long transcript means
+    // the newest messages land outside the pane entirely. The clone is only
+    // for measuring; the rendered paragraph is built below.
+    let measure = |lines: Vec<Line<'static>>| -> (u16, Vec<Line<'static>>) {
+        let height = Paragraph::new(Text::from(lines.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(inner_width) as u16;
+        (height, lines)
+    };
+    let (mut total, mut lines) = measure(lines);
 
     // Grow the conversation up from the input box instead of down from the
     // title, the way a chat reads: until there's enough to fill the pane,
@@ -163,22 +192,78 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
         (" message ", Style::new().dark_gray())
     };
 
-    let paragraph = Paragraph::new(app.input.as_str())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(style)
-                .title(Span::styled(title, style)),
-        )
-        .wrap(Wrap { trim: false });
+    let width = area.width.saturating_sub(2).max(1);
+    let rows = input_lines(&app.input, width);
+    let (cursor_row, cursor_col) = input_cursor(&app.input, app.cursor, width);
+
+    // Once the text is taller than the box, follow the cursor rather than
+    // pinning to the top, so what you're typing stays on screen.
+    let visible = area.height.saturating_sub(2).max(1);
+    let scroll = (cursor_row + 1).saturating_sub(visible);
+
+    // Wrapped by hand rather than by `Wrap`, so the cursor position below is
+    // computed against exactly the rows being drawn.
+    let paragraph = Paragraph::new(Text::from(
+        rows.into_iter().map(Line::from).collect::<Vec<_>>(),
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(style)
+            .title(Span::styled(title, style)),
+    )
+    .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
 
     if app.focus == Focus::Input {
-        // Place the real terminal cursor so it lands after the typed text.
-        let width = area.width.saturating_sub(2).max(1);
-        let col = app.input[..app.cursor].chars().count() as u16;
-        frame.set_cursor_position((area.x + 1 + (col % width), area.y + 1 + (col / width)));
+        frame.set_cursor_position((
+            area.x + 1 + cursor_col,
+            area.y + 1 + cursor_row.saturating_sub(scroll),
+        ));
     }
+}
+
+/// Splits the input into the rows it occupies: on explicit newlines, and
+/// hard-wrapped at `width`. Hard rather than word wrapping so that a cursor
+/// position can be computed exactly against what's drawn.
+fn input_lines(input: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let mut rows = Vec::new();
+    for segment in input.split('\n') {
+        let chars: Vec<char> = segment.chars().collect();
+        if chars.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        for chunk in chars.chunks(width) {
+            rows.push(chunk.iter().collect());
+        }
+        // A segment filling the last row exactly puts the caret on the next.
+        if chars.len() % width == 0 {
+            rows.push(String::new());
+        }
+    }
+    rows
+}
+
+/// Where the caret sits, in the same rows [`input_lines`] produces.
+fn input_cursor(input: &str, cursor: usize, width: u16) -> (u16, u16) {
+    let width = width.max(1) as usize;
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for ch in input[..cursor.min(input.len())].chars() {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+            if col == width {
+                row += 1;
+                col = 0;
+            }
+        }
+    }
+    (row as u16, col as u16)
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
@@ -301,6 +386,77 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// Renders markdown to styled rows.
+///
+/// Applied only to assistant replies: a user's own `*asterisks*` should
+/// appear as typed, and tool lines are already formatted. The result is
+/// re-homed into owned spans because the transcript outlives the borrow of
+/// the message it came from.
+fn markdown_lines(text: &str) -> Vec<Line<'static>> {
+    let mut inside_code = false;
+
+    tui_markdown::from_str(text)
+        .lines
+        .into_iter()
+        .filter_map(|line| {
+            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+
+            // The fences come through as literal rows of backticks. The code
+            // between them is already syntax-coloured, so they'd just be
+            // noise: label the opening one with its language and drop the
+            // close.
+            if plain.trim_end().starts_with("```") {
+                inside_code = !inside_code;
+                if !inside_code {
+                    return None;
+                }
+                let language = plain.trim().trim_start_matches('`').trim();
+                let tag = if language.is_empty() {
+                    "code".to_string()
+                } else {
+                    language.to_string()
+                };
+                return Some(Line::from(Span::styled(
+                    tag,
+                    Style::new().dark_gray().italic(),
+                )));
+            }
+
+            let spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| Span::styled(span.content.into_owned(), span.style))
+                .collect();
+            Some(Line::from(spans))
+        })
+        .collect()
+}
+
+/// Pushes already-rendered rows under a speaker label, keeping the label on
+/// the first row and any trailing marker on the last.
+fn push_rendered(
+    lines: &mut Vec<Line<'static>>,
+    prefix: Span<'static>,
+    mut rendered: Vec<Line<'static>>,
+    trailing: Option<Span<'static>>,
+) {
+    if rendered.is_empty() {
+        rendered.push(Line::raw(""));
+    }
+    let last = rendered.len() - 1;
+    for (index, mut line) in rendered.into_iter().enumerate() {
+        if index == 0 {
+            line.spans.insert(0, prefix.clone());
+        }
+        if index == last {
+            if let Some(trailing) = trailing.clone() {
+                line.spans.push(trailing);
+            }
+        }
+        lines.push(line);
+    }
+}
+
 /// Pushes one speaker's text, split into a `Line` per newline.
 ///
 /// A ratatui `Line` is a single row: it doesn't break on an embedded `\n`,
@@ -330,34 +486,6 @@ fn push_block(
         }
         lines.push(Line::from(spans));
     }
-}
-
-/// How many terminal rows `lines` occupy once wrapped to `width`, which is
-/// what the scroll offset is measured against.
-fn wrapped_height(lines: &[Line], width: u16) -> u16 {
-    if width == 0 {
-        return lines.len() as u16;
-    }
-    // Match ratatui's wrapping, which breaks on whitespace and splits words
-    // only when they can't fit. textwrap's default additionally breaks at
-    // hyphens, which over-counts badly on text full of hyphenated names and
-    // paths — and an over-count scrolls the view clean past the newest
-    // message.
-    let options = textwrap::Options::new(width as usize)
-        .word_splitter(textwrap::WordSplitter::NoHyphenation)
-        .break_words(true);
-
-    lines
-        .iter()
-        .map(|line| {
-            let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            if plain.is_empty() {
-                1
-            } else {
-                textwrap::wrap(&plain, &options).len().max(1) as u16
-            }
-        })
-        .sum()
 }
 
 /// One-line preview of a possibly long/multi-line value.
@@ -544,16 +672,133 @@ mod tests {
         }
     }
 
+    fn plain(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
     #[test]
-    fn wrapped_height_counts_reflowed_rows() {
-        let lines = vec![
-            Line::raw("short"),
-            Line::raw("a ".repeat(30).trim_end().to_string()),
-            Line::raw(""),
-        ];
-        // "short" is 1 row; the long line wraps to several; blank is 1.
-        assert!(wrapped_height(&lines, 20) > 3);
-        assert_eq!(wrapped_height(&[Line::raw("hi")], 20), 1);
+    fn markdown_strips_markers_and_styles_the_text() {
+        let rendered = markdown_lines("**bold** and `code`");
+        let text = plain(&rendered).join("");
+        assert!(text.contains("bold"), "{text:?}");
+        assert!(!text.contains("**"), "markers should be gone: {text:?}");
+        assert!(!text.contains('`'), "markers should be gone: {text:?}");
+
+        let styled = rendered
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .count();
+        assert!(styled > 0, "bold should carry a style");
+    }
+
+    #[test]
+    fn code_fences_become_a_language_tag_and_keep_their_code() {
+        let rendered = markdown_lines("before\n\n```rust\nfn main() {}\n```\n\nafter");
+        let text = plain(&rendered);
+        assert!(
+            text.iter().all(|l| !l.contains("```")),
+            "backticks should not survive: {text:?}"
+        );
+        assert!(text.iter().any(|l| l.trim() == "rust"), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("fn main()")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("before")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("after")), "{text:?}");
+    }
+
+    #[test]
+    fn an_unlabelled_fence_still_marks_the_block() {
+        let text = plain(&markdown_lines("```\nplain code\n```"));
+        assert!(text.iter().any(|l| l.trim() == "code"), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("plain code")), "{text:?}");
+        assert!(text.iter().all(|l| !l.contains("```")), "{text:?}");
+    }
+
+    #[test]
+    fn lists_survive_rendering() {
+        let text = plain(&markdown_lines("- one\n- two\n\n1. first\n2. second")).join("\n");
+        for expected in ["one", "two", "first", "second"] {
+            assert!(text.contains(expected), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn only_assistant_text_is_treated_as_markdown() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript
+            .push(TranscriptItem::User("literal **stars** here".to_string()));
+        app.transcript.push(TranscriptItem::Assistant {
+            text: "rendered **stars** here".to_string(),
+            streaming: false,
+            label: Some("m".into()),
+        });
+        let out = render_to_string(&app, 60, 14);
+        // The user's own asterisks are shown as typed; the reply's are not.
+        assert!(out.contains("literal **stars**"), "{out}");
+        assert!(!out.contains("rendered **stars**"), "{out}");
+        assert!(out.contains("rendered stars"), "{out}");
+    }
+
+    #[test]
+    fn a_streaming_reply_is_left_unformatted_until_it_finishes() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        // Mid-stream an unclosed fence would otherwise render as a stray tag.
+        app.transcript.push(TranscriptItem::Assistant {
+            text: "partial **bold".to_string(),
+            streaming: true,
+            label: Some("m".into()),
+        });
+        let out = render_to_string(&app, 60, 14);
+        assert!(out.contains("partial **bold"), "{out}");
+    }
+
+    #[test]
+    fn input_wraps_and_tracks_the_caret_together() {
+        // The caret must land in the same rows the box actually draws.
+        let rows = input_lines("abcdefghij", 4);
+        assert_eq!(rows, vec!["abcd", "efgh", "ij"]);
+        assert_eq!(input_cursor("abcdefghij", 10, 4), (2, 2));
+
+        // Explicit newlines start a row, including empty ones.
+        assert_eq!(input_lines("a\n\nb", 10), vec!["a", "", "b"]);
+        assert_eq!(input_cursor("a\n\nb", 4, 10), (2, 1));
+
+        // A segment that exactly fills a row puts the caret on the next.
+        assert_eq!(input_lines("abcd", 4), vec!["abcd", ""]);
+        assert_eq!(input_cursor("abcd", 4, 4), (1, 0));
+    }
+
+    #[test]
+    fn the_message_box_grows_with_multiline_input() {
+        let mut app = sample_app();
+        let single = render_to_string(&app, 40, 16);
+        app.input = "one\ntwo\nthree".to_string();
+        app.cursor = app.input.len();
+        let multi = render_to_string(&app, 40, 16);
+
+        // All three lines are visible, and the box grew to show them.
+        assert!(multi.contains("one") && multi.contains("two") && multi.contains("three"));
+        let box_rows = |out: &str| out.lines().filter(|l| l.contains('│')).count();
+        assert!(
+            box_rows(&multi) > 0 && multi != single,
+            "expected the input box to grow:\n{multi}"
+        );
+    }
+
+    #[test]
+    fn a_huge_input_cannot_squeeze_out_the_conversation() {
+        let mut app = sample_app();
+        app.input = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.cursor = app.input.len();
+        // Must render, and the transcript must still get rows.
+        let out = render_to_string(&app, 40, 14);
+        assert!(out.lines().count() == 14, "{out}");
     }
 
     #[test]

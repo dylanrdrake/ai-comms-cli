@@ -29,8 +29,15 @@ futures-util = "0.3"
 async-stream = "0.3"
 # `crossterm_0_29` keeps ratatui's vendored backend on the same crossterm
 # version we depend on directly for its async EventStream.
-ratatui = { version = "0.30", features = ["crossterm_0_29"] }
+# `unstable-rendered-line-info` exposes Paragraph::line_count, the only way to
+# measure wrapped height with ratatui's own wrapper. Estimating it separately
+# drifts from the real layout and scrolls the transcript off its own content.
+ratatui = { version = "0.30", features = [
+    "crossterm_0_29",
+    "unstable-rendered-line-info",
+] }
 crossterm = { version = "0.29", features = ["event-stream"] }
+tui-markdown = "0.3.9"
 
 [profile.release]
 opt-level = 3

@@ -417,6 +417,15 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
     }
 
     match key.code {
+        // Alt-Enter always inserts a newline; Shift-Enter does too on the
+        // terminals that report the modifier at all, which many don't.
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+        {
+            app.insert_char('\n')
+        }
         KeyCode::Enter => {
             if let Some(text) = app.take_input() {
                 match app::classify(&text) {
