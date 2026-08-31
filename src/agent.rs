@@ -1,11 +1,9 @@
 use crate::client::{ChatMessage, Client};
 use crate::config::ApprovalSettings;
-use crate::spinner::Spinner;
 use crate::tools::{execute_tool, get_tool_definitions};
+use crate::ui::{AgentEvent, AgentUi, ApprovalRequest};
 use anyhow::Result;
-use colored::*;
 use serde_json::json;
-use std::io::{self, Write};
 
 /// Seeds a continuous agent-chat session so the model treats the growing
 /// transcript as history to build on, not a backlog of tasks to redo.
@@ -34,54 +32,12 @@ fn requires_approval(tool_name: &str, approval: &ApprovalSettings) -> bool {
     }
 }
 
-fn prompt_user_approval(tool_name: &str, arguments: &str) -> Result<bool> {
-    let category = get_tool_category(tool_name);
-    let category_label = match category {
-        "read" => "Read from disk",
-        "write" => "Write to disk",
-        "terminal" => "Terminal command",
-        _ => "Unknown action",
-    };
-
-    println!("\n{} {} requested:", "⚠".yellow(), category_label);
-    println!("  Tool: {}", tool_name.cyan());
-    
-    // Parse and display arguments nicely
-    if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-        if let Some(obj) = args.as_object() {
-            for (key, value) in obj {
-                let display_value = if key == "content" {
-                    // Truncate long content
-                    let s = value.as_str().map(|s| s.to_string()).unwrap_or_else(|| value.to_string());
-                    if s.len() > 100 {
-                        format!("{}... ({} chars)", &s[..100], s.len())
-                    } else {
-                        s
-                    }
-                } else {
-                    value.as_str().map(|s| s.to_string()).unwrap_or_else(|| value.to_string())
-                };
-                println!("  {}: {}", key, display_value.bright_black());
-            }
-        }
-    }
-
-    print!("\n{} ", "Allow? [y/N]:".blue());
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let response = input.trim().to_lowercase();
-
-    Ok(response == "y" || response == "yes")
-}
-
 pub async fn run_agent(
     client: &Client,
+    ui: &mut impl AgentUi,
     task: &str,
     model: &str,
     max_iterations: usize,
-    verbose: bool,
     approval: &ApprovalSettings,
     effort_level: Option<String>,
 ) -> Result<Option<String>> {
@@ -94,10 +50,10 @@ pub async fn run_agent(
 
     run_agent_turn(
         client,
+        ui,
         &mut messages,
         model,
         max_iterations,
-        verbose,
         approval,
         effort_level,
     )
@@ -107,12 +63,16 @@ pub async fn run_agent(
 /// Runs the tool-calling agent loop against an existing message history,
 /// appending the assistant/tool messages produced along the way so the
 /// history can be reused for a follow-up turn (e.g. a continuous chat).
+///
+/// Progress is reported to `ui` rather than printed, and any tool needing
+/// permission is put to `ui` as an [`ApprovalRequest`], so the same loop
+/// drives the CLI, a GUI, or a test harness unchanged.
 pub async fn run_agent_turn(
     client: &Client,
+    ui: &mut impl AgentUi,
     messages: &mut Vec<ChatMessage>,
     model: &str,
     max_iterations: usize,
-    verbose: bool,
     approval: &ApprovalSettings,
     effort_level: Option<String>,
 ) -> Result<Option<String>> {
@@ -123,12 +83,10 @@ pub async fn run_agent_turn(
     while iteration < max_iterations {
         iteration += 1;
 
-        if verbose {
-            println!("{}", format!("\n[Iteration {}]", iteration).bright_black());
-        }
+        ui.event(AgentEvent::IterationStarted { iteration }).await;
 
         // Call the LLM with tool definitions
-        let spinner = Spinner::start("Thinking...");
+        ui.event(AgentEvent::RequestStarted).await;
         let response = client
             .chat(
                 model.to_string(),
@@ -138,7 +96,7 @@ pub async fn run_agent_turn(
                 effort_level.clone(),
             )
             .await;
-        spinner.stop().await;
+        ui.event(AgentEvent::RequestFinished).await;
         let response = response?;
 
         let choice = &response.choices[0];
@@ -148,12 +106,13 @@ pub async fn run_agent_turn(
 
         // If the LLM generated text, show it
         if choice.message.has_visible_content() {
-            let label = match &effort_level {
-                Some(effort) => format!("{} ({}):", model, effort),
-                None => format!("{}:", model),
-            };
             let content = choice.message.content.as_deref().unwrap();
-            println!("{} {}", label.cyan(), crate::wrap::wrap(content));
+            ui.event(AgentEvent::AssistantMessage {
+                model: model.to_string(),
+                effort_level: effort_level.clone(),
+                text: content.to_string(),
+            })
+            .await;
             final_response = Some(content.to_string());
         }
 
@@ -163,9 +122,7 @@ pub async fn run_agent_turn(
         messages.push(choice.message.clone());
 
         if no_tool_calls {
-            if verbose {
-                println!("{}", "✓ Agent finished".green());
-            }
+            ui.event(AgentEvent::TurnFinished).await;
             return Ok(final_response);
         }
 
@@ -174,14 +131,20 @@ pub async fn run_agent_turn(
             for tool_call in tool_calls {
                 let tool_name = &tool_call.function.name;
 
-                if verbose {
-                    println!("{} {}", "→ Calling tool:".yellow(), tool_name);
-                    println!("{} {}", "  Input:".bright_black(), tool_call.function.arguments);
-                }
+                ui.event(AgentEvent::ToolCallStarted {
+                    name: tool_name.clone(),
+                    arguments: tool_call.function.arguments.clone(),
+                })
+                .await;
 
                 // Check if approval is needed
                 let approved = if requires_approval(tool_name, approval) {
-                    prompt_user_approval(tool_name, &tool_call.function.arguments)?
+                    ui.approve(ApprovalRequest {
+                        tool_name: tool_name.clone(),
+                        category: get_tool_category(tool_name),
+                        arguments: tool_call.function.arguments.clone(),
+                    })
+                    .await?
                 } else {
                     true
                 };
@@ -195,13 +158,18 @@ pub async fn run_agent_turn(
                         Err(e) => json!({ "error": e.to_string() }),
                     }
                 } else {
-                    println!("{} Tool execution denied by user", "✗".red());
+                    ui.event(AgentEvent::ToolCallDenied {
+                        name: tool_name.clone(),
+                    })
+                    .await;
                     json!({ "error": "User denied permission for this action" })
                 };
 
-                if verbose {
-                    println!("{} {}", "  Result:".bright_black(), result);
-                }
+                ui.event(AgentEvent::ToolCallCompleted {
+                    name: tool_name.clone(),
+                    result: result.to_string(),
+                })
+                .await;
 
                 // Add tool result back to messages, threaded to the call that produced it
                 messages.push(ChatMessage {
