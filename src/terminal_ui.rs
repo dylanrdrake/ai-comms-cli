@@ -8,6 +8,7 @@ use crate::ui::{response_label, AgentEvent, AgentUi, ApprovalRequest};
 use crate::wrap;
 use anyhow::Result;
 use colored::*;
+use std::future::Future;
 use std::io::{self, Write};
 
 pub struct TerminalAgentUi {
@@ -28,52 +29,69 @@ impl TerminalAgentUi {
 }
 
 impl AgentUi for TerminalAgentUi {
-    async fn event(&mut self, event: AgentEvent) {
-        match event {
-            AgentEvent::IterationStarted { iteration } => {
-                if self.verbose {
-                    println!("{}", format!("\n[Iteration {}]", iteration).bright_black());
+    fn event(&mut self, event: AgentEvent) -> impl Future<Output = ()> + Send {
+        async move {
+            match event {
+                AgentEvent::IterationStarted { iteration } => {
+                    if self.verbose {
+                        println!("{}", format!("\n[Iteration {}]", iteration).bright_black());
+                    }
                 }
-            }
-            AgentEvent::RequestStarted => {
-                self.spinner = Some(Spinner::start("Thinking..."));
-            }
-            AgentEvent::RequestFinished => {
-                if let Some(spinner) = self.spinner.take() {
-                    spinner.stop().await;
+                AgentEvent::RequestStarted => {
+                    self.spinner = Some(Spinner::start("Thinking..."));
                 }
-            }
-            AgentEvent::AssistantMessage {
-                model,
-                effort_level,
-                text,
-            } => {
-                let label = format!("{}:", response_label(&model, &effort_level));
-                println!("{} {}", label.cyan(), wrap::wrap(&text));
-            }
-            AgentEvent::ToolCallStarted { name, arguments } => {
-                if self.verbose {
-                    println!("{} {}", "→ Calling tool:".yellow(), name);
-                    println!("{} {}", "  Input:".bright_black(), arguments);
+                AgentEvent::RequestFinished => {
+                    if let Some(spinner) = self.spinner.take() {
+                        spinner.stop().await;
+                    }
                 }
-            }
-            AgentEvent::ToolCallDenied { .. } => {
-                println!("{} Tool execution denied by user", "✗".red());
-            }
-            AgentEvent::ToolCallCompleted { result, .. } => {
-                if self.verbose {
-                    println!("{} {}", "  Result:".bright_black(), result);
+                // Deliberately ignored: a scrolling terminal can't re-wrap
+                // text it has already printed, so the CLI buffers and renders
+                // the complete `AssistantMessage` below instead.
+                AgentEvent::AssistantDelta { .. } => {}
+                AgentEvent::AssistantMessage {
+                    model,
+                    effort_level,
+                    text,
+                } => {
+                    let label = format!("{}:", response_label(&model, &effort_level));
+                    println!("{} {}", label.cyan(), wrap::wrap(&text));
                 }
-            }
-            AgentEvent::TurnFinished => {
-                if self.verbose {
-                    println!("{}", "✓ Agent finished".green());
+                AgentEvent::ToolCallStarted { name, arguments } => {
+                    if self.verbose {
+                        println!("{} {}", "→ Calling tool:".yellow(), name);
+                        println!("{} {}", "  Input:".bright_black(), arguments);
+                    }
+                }
+                AgentEvent::ToolCallDenied { .. } => {
+                    println!("{} Tool execution denied by user", "✗".red());
+                }
+                AgentEvent::ToolCallCompleted { result, .. } => {
+                    if self.verbose {
+                        println!("{} {}", "  Result:".bright_black(), result);
+                    }
+                }
+                AgentEvent::Error { message } => {
+                    println!("{} {}", "✗".red(), message);
+                }
+                AgentEvent::TurnFinished => {
+                    if self.verbose {
+                        println!("{}", "✓ Agent finished".green());
+                    }
                 }
             }
         }
     }
 
-    async fn approve(&mut self, request: ApprovalRequest) -> Result<bool> {
+    fn approve(&mut self, request: ApprovalRequest) -> impl Future<Output = Result<bool>> + Send {
+        async move { self.prompt_approval(request) }
+    }
+}
+
+impl TerminalAgentUi {
+    /// The blocking stdin prompt behind [`AgentUi::approve`], kept separate
+    /// so the async wrapper stays trivial.
+    fn prompt_approval(&mut self, request: ApprovalRequest) -> Result<bool> {
         let category_label = match request.category {
             "read" => "Read from disk",
             "write" => "Write to disk",

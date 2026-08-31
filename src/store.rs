@@ -25,10 +25,10 @@ pub struct SessionSummary {
     pub title: String,
     pub model: String,
     pub kind: String,
-    // Not yet surfaced in the CLI output, kept for future sorting/display use.
+    /// Not surfaced by the CLI, but kept for sorting and display.
     #[allow(dead_code)]
     pub created_at: i64,
-    #[allow(dead_code)]
+    /// Drives "12m ago" in the TUI's session lists.
     pub updated_at: i64,
 }
 
@@ -146,6 +146,17 @@ pub fn set_session_title(conn: &Connection, session_id: &str, title: &str) -> Re
     Ok(())
 }
 
+/// Records the model a session is now using, so `sessions list` and a later
+/// resume reflect the switch rather than reverting to whatever it started
+/// with. Stored in the clear, like the other session metadata.
+pub fn set_session_model(conn: &Connection, session_id: &str, model: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET model = ?1 WHERE id = ?2",
+        params![model, session_id],
+    )?;
+    Ok(())
+}
+
 /// Appends a single message to a session and bumps its updated_at timestamp.
 /// `seq` should be the message's 0-based position within the session.
 /// `model`/`effort_level` record what was active when the message was
@@ -253,7 +264,14 @@ pub fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<StoredMe
         let tool_call_id: Option<String> = row.get(3)?;
         let model: Option<String> = row.get(4)?;
         let effort_level: Option<String> = row.get(5)?;
-        Ok((role, content, tool_calls_json, tool_call_id, model, effort_level))
+        Ok((
+            role,
+            content,
+            tool_calls_json,
+            tool_call_id,
+            model,
+            effort_level,
+        ))
     })?;
 
     let mut messages = Vec::new();

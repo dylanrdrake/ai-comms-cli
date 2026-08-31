@@ -63,6 +63,13 @@ impl ChatSession {
         let title_set = messages.iter().any(|m| m.role == "user");
         let saved_len = messages.len();
 
+        // Resuming with a different model (a `--model` flag) is a real
+        // switch, not a one-off override: record it so the session reports
+        // what it's actually using and doesn't silently revert next time.
+        if model != summary.model {
+            store::set_session_model(&conn, &summary.id, &model)?;
+        }
+
         Ok((
             ChatSession {
                 conn,
@@ -75,6 +82,18 @@ impl ChatSession {
             },
             history,
         ))
+    }
+
+    /// Switches the model for subsequent turns and records it. Messages
+    /// already sent keep the model they were produced with, since each row
+    /// carries its own.
+    pub fn set_model(&mut self, model: String) -> Result<()> {
+        if self.model == model {
+            return Ok(());
+        }
+        store::set_session_model(&self.conn, &self.id, &model)?;
+        self.model = model;
+        Ok(())
     }
 
     /// The full session id. The CLI mostly shows [`ChatSession::short_id`],
@@ -128,6 +147,10 @@ impl ChatSession {
         });
     }
 
+    /// The counterpart to [`ChatSession::push_user`]. The agent loop appends
+    /// assistant turns itself through `messages_mut`, so this is for callers
+    /// driving a conversation directly.
+    #[allow(dead_code)]
     pub fn push_assistant(&mut self, text: String) {
         self.push(ChatMessage {
             role: "assistant".to_string(),
@@ -182,6 +205,22 @@ impl ChatSession {
     pub fn push_and_persist(&mut self, message: ChatMessage) -> Result<()> {
         self.push(message);
         self.persist_pending()
+    }
+
+    /// Deletes the session if nothing was ever said in it, reporting whether
+    /// it did.
+    ///
+    /// A session row is created up front so messages have somewhere to go,
+    /// which means opening a conversation and backing out without typing
+    /// leaves an empty "Untitled" behind. Harmless when sessions are only
+    /// listed on demand, but clutter once a launch screen shows recent ones.
+    /// A resumed session is never empty, so this only ever discards a
+    /// genuinely unused one.
+    pub fn discard_if_unused(&self) -> Result<bool> {
+        if self.messages.iter().any(|m| m.role == "user") {
+            return Ok(false);
+        }
+        store::delete_session(&self.conn, &self.id)
     }
 }
 
@@ -292,6 +331,78 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.title, "first question");
+    }
+
+    #[test]
+    fn set_model_persists_so_a_later_resume_picks_it_up() {
+        let mut session = memory_session();
+        session.push_user("hello".to_string());
+        session.persist_pending().unwrap();
+
+        session.set_model("second-model".to_string()).unwrap();
+        assert_eq!(session.model(), "second-model");
+
+        // The sessions row must reflect it, not just the in-memory session.
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.model, "second-model");
+    }
+
+    #[test]
+    fn resuming_with_a_different_model_records_the_switch() {
+        let mut session = memory_session();
+        session.push_user("hello".to_string());
+        session.persist_pending().unwrap();
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        let ChatSession { conn, .. } = session;
+
+        let (resumed, _) =
+            ChatSession::resume(conn, &summary, "switched-model".to_string(), None).unwrap();
+        assert_eq!(resumed.model(), "switched-model");
+
+        // And resuming again with no override keeps the switched model
+        // rather than reverting to the original.
+        let summary = store::find_session(&resumed.conn, resumed.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.model, "switched-model");
+    }
+
+    #[test]
+    fn an_unused_session_is_discarded() {
+        let session = memory_session();
+        assert!(session.discard_if_unused().unwrap());
+        assert!(store::find_session(&session.conn, session.id())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_session_with_only_a_system_prompt_still_counts_as_unused() {
+        let mut session = memory_session();
+        session
+            .push_and_persist(ChatMessage {
+                role: "system".to_string(),
+                content: Some("system prompt".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            })
+            .unwrap();
+        assert!(session.discard_if_unused().unwrap());
+    }
+
+    #[test]
+    fn a_used_session_is_kept() {
+        let mut session = memory_session();
+        session.push_user("hello".to_string());
+        session.persist_pending().unwrap();
+        assert!(!session.discard_if_unused().unwrap());
+        assert!(store::find_session(&session.conn, session.id())
+            .unwrap()
+            .is_some());
     }
 
     #[test]

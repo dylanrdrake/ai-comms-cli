@@ -117,10 +117,7 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
     ]
 }
 
-pub async fn execute_tool(
-    name: &str,
-    arguments: &str,
-) -> Result<serde_json::Value> {
+pub async fn execute_tool(name: &str, arguments: &str) -> Result<serde_json::Value> {
     let args: serde_json::Value = serde_json::from_str(arguments)?;
 
     match name {
@@ -133,10 +130,7 @@ pub async fn execute_tool(
                 .get("content")
                 .and_then(|v| v.as_str())
                 .ok_or(anyhow!("Missing content"))?;
-            let mode = args
-                .get("mode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("write");
+            let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("write");
 
             write_file(filepath, content, mode)
         }
@@ -149,10 +143,7 @@ pub async fn execute_tool(
             read_file(filepath)
         }
         "list_files" => {
-            let dirpath = args
-                .get("dirpath")
-                .and_then(|v| v.as_str())
-                .unwrap_or(".");
+            let dirpath = args.get("dirpath").and_then(|v| v.as_str()).unwrap_or(".");
 
             list_files(dirpath)
         }
@@ -177,9 +168,7 @@ pub async fn execute_tool(
                 .get("command")
                 .and_then(|v| v.as_str())
                 .ok_or(anyhow!("Missing command"))?;
-            let working_dir = args
-                .get("working_dir")
-                .and_then(|v| v.as_str());
+            let working_dir = args.get("working_dir").and_then(|v| v.as_str());
             let timeout_secs = args
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())
@@ -346,7 +335,12 @@ async fn run_terminal_command(
     cmd.arg(shell_arg)
         .arg(command)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Without this, cancelling a turn mid-tool-call drops the Child
+        // without killing it, leaving an orphaned shell process running with
+        // nothing watching it. The timeout path kills explicitly; this covers
+        // the task simply being dropped.
+        .kill_on_drop(true);
 
     if let Some(dir) = working_dir {
         let path = Path::new(dir);
@@ -390,11 +384,7 @@ async fn run_terminal_command(
         buf
     });
 
-    let wait_result = timeout(
-        Duration::from_secs(timeout_secs.max(1)),
-        child.wait(),
-    )
-    .await;
+    let wait_result = timeout(Duration::from_secs(timeout_secs.max(1)), child.wait()).await;
 
     let status = match wait_result {
         Ok(Ok(status)) => status,

@@ -1,8 +1,9 @@
-use crate::client::{ChatMessage, Client};
+use crate::client::{ChatMessage, Client, StreamEvent};
 use crate::config::ApprovalSettings;
 use crate::tools::{execute_tool, get_tool_definitions};
 use crate::ui::{AgentEvent, AgentUi, ApprovalRequest};
 use anyhow::Result;
+use futures_util::{pin_mut, StreamExt};
 use serde_json::json;
 
 /// Seeds a continuous agent-chat session so the model treats the growing
@@ -60,6 +61,92 @@ pub async fn run_agent(
     .await
 }
 
+/// Performs one request to the model and returns the assembled reply,
+/// streaming it if the user has streaming on.
+///
+/// Both paths produce the same `ChatMessage`; streaming additionally emits
+/// [`AgentEvent::AssistantDelta`] as text arrives, so a front end that can
+/// re-render (a TUI) shows it live while one that can't (the CLI) simply
+/// ignores the deltas and renders the finished message.
+async fn request_turn(
+    client: &Client,
+    ui: &mut impl AgentUi,
+    messages: Vec<ChatMessage>,
+    model: &str,
+    tools: Option<Vec<serde_json::Value>>,
+    effort_level: Option<String>,
+) -> Result<ChatMessage> {
+    if client.streaming_enabled() {
+        let stream = client.chat_stream(model.to_string(), messages, 0.7, tools, effort_level);
+        pin_mut!(stream);
+
+        let mut assembled = None;
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::Content(text) => {
+                    ui.event(AgentEvent::AssistantDelta { text }).await;
+                }
+                StreamEvent::Done(message) => assembled = Some(message),
+            }
+        }
+
+        assembled.ok_or_else(|| anyhow::anyhow!("Response stream ended without a message"))
+    } else {
+        let response = client
+            .chat(model.to_string(), messages, 0.7, tools, effort_level)
+            .await?;
+        response
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message)
+            .ok_or_else(|| anyhow::anyhow!("Provider returned no choices"))
+    }
+}
+
+/// Runs one plain (non-agentic) exchange: send the history, report the
+/// reply, append it. The `chat` counterpart to [`run_agent_turn`], so both
+/// modes reach a front end through the same events instead of `chat` being
+/// open-coded by each caller.
+pub async fn run_chat_turn(
+    client: &Client,
+    ui: &mut impl AgentUi,
+    messages: &mut Vec<ChatMessage>,
+    model: &str,
+    effort_level: Option<String>,
+) -> Result<Option<String>> {
+    ui.event(AgentEvent::RequestStarted).await;
+    let turn = request_turn(
+        client,
+        ui,
+        messages.clone(),
+        model,
+        None,
+        effort_level.clone(),
+    )
+    .await;
+    ui.event(AgentEvent::RequestFinished).await;
+    let message = turn?;
+
+    let mut final_response = None;
+    // Matches the CLI's long-standing behavior: a reply with nothing visible
+    // in it is neither shown nor added to the history.
+    if message.has_visible_content() {
+        let content = message.content.as_deref().unwrap().to_string();
+        ui.event(AgentEvent::AssistantMessage {
+            model: model.to_string(),
+            effort_level,
+            text: content.clone(),
+        })
+        .await;
+        final_response = Some(content);
+        messages.push(message);
+    }
+
+    ui.event(AgentEvent::TurnFinished).await;
+    Ok(final_response)
+}
+
 /// Runs the tool-calling agent loop against an existing message history,
 /// appending the assistant/tool messages produced along the way so the
 /// history can be reused for a follow-up turn (e.g. a continuous chat).
@@ -87,26 +174,24 @@ pub async fn run_agent_turn(
 
         // Call the LLM with tool definitions
         ui.event(AgentEvent::RequestStarted).await;
-        let response = client
-            .chat(
-                model.to_string(),
-                messages.clone(),
-                0.7,
-                Some(tool_definitions.clone()),
-                effort_level.clone(),
-            )
-            .await;
+        let turn = request_turn(
+            client,
+            ui,
+            messages.clone(),
+            model,
+            Some(tool_definitions.clone()),
+            effort_level.clone(),
+        )
+        .await;
         ui.event(AgentEvent::RequestFinished).await;
-        let response = response?;
+        let message = turn?;
 
-        let choice = &response.choices[0];
-
-        let no_tool_calls = choice.message.tool_calls.is_none()
-            || choice.message.tool_calls.as_ref().unwrap().is_empty();
+        let no_tool_calls =
+            message.tool_calls.is_none() || message.tool_calls.as_ref().unwrap().is_empty();
 
         // If the LLM generated text, show it
-        if choice.message.has_visible_content() {
-            let content = choice.message.content.as_deref().unwrap();
+        if message.has_visible_content() {
+            let content = message.content.as_deref().unwrap();
             ui.event(AgentEvent::AssistantMessage {
                 model: model.to_string(),
                 effort_level: effort_level.clone(),
@@ -119,7 +204,8 @@ pub async fn run_agent_turn(
         // Record the assistant's turn in history before deciding whether to
         // keep looping, so a plain text answer (no tool calls) is still
         // remembered on the next turn instead of vanishing from context.
-        messages.push(choice.message.clone());
+        let tool_calls = message.tool_calls.clone();
+        messages.push(message);
 
         if no_tool_calls {
             ui.event(AgentEvent::TurnFinished).await;
@@ -127,7 +213,7 @@ pub async fn run_agent_turn(
         }
 
         // Process each tool call
-        if let Some(tool_calls) = &choice.message.tool_calls {
+        if let Some(tool_calls) = &tool_calls {
             for tool_call in tool_calls {
                 let tool_name = &tool_call.function.name;
 

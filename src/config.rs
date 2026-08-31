@@ -67,6 +67,11 @@ pub struct Config {
     /// optional `HTTP-Referer`/`X-Title` attribution headers).
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+    /// Whether to stream responses token-by-token. On by default; turn it off
+    /// for providers that handle streaming (especially streaming alongside
+    /// tool calls) badly, which falls back to waiting for the whole reply.
+    #[serde(default = "default_true")]
+    pub stream: bool,
 }
 
 pub fn default_base_url() -> String {
@@ -88,6 +93,7 @@ impl Default for Config {
             effort_level: None,
             effort_style: None,
             extra_headers: HashMap::new(),
+            stream: true,
         }
     }
 }

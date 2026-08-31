@@ -5,11 +5,12 @@ An OpenAI-compatible CLI frontend for any LLM provider, with agentic tool capabi
 ## Features
 
 - **Fast & lightweight** — Compiled Rust binary, single executable with no runtime dependencies
-- **Multiple interaction modes** — Q&A, interactive chat, agentic tasks
+- **Multiple interaction modes** — Q&A, interactive chat, agentic tasks, and a full-screen TUI
+- **Streaming responses** — Replies appear as they're generated rather than all at once
 - **File operations** — LLM can read, write, and modify local files
 - **Model selection** — Choose from 200+ models or use adaptive routing
 - **Agentic loops** — Multi-turn execution with tool calling
-- **Persistent sessions** — `chat`/`agent-chat` conversations are saved to SQLite and resumable across restarts
+- **Persistent sessions** — `chat`/`agent-chat`/`tui` conversations are saved to SQLite and resumable across restarts
 - **Secure credential storage** — API keys live in your OS keychain, not a plaintext file
 
 ## Installation
@@ -86,6 +87,13 @@ comms model --clear
 ```
 
 Once set, `ask`, `chat`, and `agent` all use this default unless overridden with `-m`/`--model` for that specific call.
+
+**Per-session models.** A session remembers the model it's using. Passing
+`--model` when resuming, or running `/model` inside the TUI, switches it *and*
+records it — so resuming later with no flag picks up where you left off rather
+than reverting. Replies already in the history keep the model that produced
+them, so a session whose model changed part-way is labeled accurately
+throughout.
 
 #### `max-iterations [value]`
 View or set the persistent default for how many tool-calling iterations `agent` may run before giving up.
@@ -241,8 +249,74 @@ comms agent-chat --resume a1b2c3d4
 comms agent-chat --resume
 ```
 
+#### `tui`
+A full-screen terminal UI. Unlike the line-based `chat`/`agent-chat`, it owns
+the screen, which is what lets the input box stay live while a reply streams
+in, tool approvals appear inline, and a running turn be interrupted.
+
+Run bare, it opens on a **launch screen**: start a new chat or agent chat, jump
+straight back into a recent session, or go to a sessions browser covering both
+kinds. The flags skip it and go straight into a conversation.
+
+```bash
+comms tui                      # launch screen
+comms tui --chat               # straight into a new plain chat
+comms tui --agent              # straight into a new agent chat (tools enabled)
+comms tui --resume a1b2c3d4    # straight into a saved session
+```
+
+`--chat`, `--agent`, and `--resume` are mutually exclusive; a resumed session
+keeps whichever mode it was created in.
+
+**Launch screen / sessions browser**
+
+| Key | Does |
+|---|---|
+| `↑` / `↓` (or `k` / `j`) | Move the selection |
+| `Enter` | Open the selected row |
+| `d` | Delete a session (sessions browser only, asks to confirm) |
+| `Esc` | Back to the launch screen |
+| `q` | Quit |
+
+**In a conversation**
+
+| Key | Does |
+|---|---|
+| `Enter` | Send. If a reply is still streaming, the message is queued and sent when it finishes |
+| `Esc` | Cancel the in-flight turn (kills a running tool command too) |
+| `y` / `n` | Answer a tool approval prompt |
+| `PgUp` / `PgDn` / `End` | Scroll the transcript; `End` re-pins to the newest |
+| `Ctrl-B` | Back to the launch screen (the session is saved) |
+| `Ctrl-C` | Quit |
+
+**Commands.** Type these in the message box instead of a message:
+
+| Command | Does |
+|---|---|
+| `/model <name>` | Switch the model for the rest of the session, and remember it |
+| `/model` | Show the model currently in use |
+
+Only recognized commands are intercepted — a message that merely starts with a
+slash (`/etc/hosts`, say) is sent as normal text.
+
+Sessions are saved exactly as the other commands save them, so a `tui` session
+can be resumed with `comms chat --resume` and vice versa (agent sessions pair
+with `agent-chat`). Opening a conversation and leaving without saying anything
+discards it rather than leaving an empty "Untitled" in your session list.
+
+#### `stream [on|off]`
+Whether replies stream in as they're generated. On by default. Turn it off for
+providers that handle streaming — particularly streaming alongside tool calls —
+badly; the CLI then waits for the whole reply as it used to.
+
+```bash
+comms stream          # show the current setting
+comms stream off      # wait for complete replies
+comms stream on
+```
+
 #### `sessions`
-List, inspect, or delete saved `chat`/`agent-chat` sessions.
+List, inspect, or delete saved `chat`/`agent-chat`/`tui` sessions.
 
 ```bash
 # List all saved sessions (id prefix, kind, model, title)
@@ -321,7 +395,7 @@ Only one provider is active at a time today — switching back to OrcaRouter mea
 
 ## Session Persistence
 
-`chat` and `agent-chat` sessions are saved automatically to a SQLite database at `~/.comms/chats.db`. Every message (yours, the assistant's, and any tool calls/results in `agent-chat`) is written as the conversation happens, so you don't lose anything if you exit or your terminal closes.
+`chat`, `agent-chat`, and `tui` sessions are saved automatically to a SQLite database at `~/.comms/chats.db`. Every message (yours, the assistant's, and any tool calls/results in agent mode) is written as the conversation happens, so you don't lose anything if you exit or your terminal closes — including a turn you cancelled partway through.
 
 Each session gets an id (a UUID) and a title derived from your first message. Use:
 

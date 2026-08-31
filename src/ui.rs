@@ -10,6 +10,7 @@
 //! trait instead. [`crate::terminal_ui`] is the CLI's implementation.
 
 use anyhow::Result;
+use std::future::Future;
 
 /// Formats a model name with its effort level for display, e.g.
 /// "orcarouter/auto (high)", or just the model name when no effort is set.
@@ -38,12 +39,21 @@ pub enum AgentEvent {
     RequestStarted,
     /// The in-flight request resolved, successfully or not.
     RequestFinished,
-    /// The model produced visible text for the user.
+    /// A fragment of the reply, as it streams in. Only emitted when
+    /// streaming is on. The deltas of a turn concatenate to exactly the
+    /// `AssistantMessage` that follows them, so a front end renders one or
+    /// the other — never both.
+    AssistantDelta { text: String },
+    /// The model produced visible text for the user. Always emitted at the
+    /// end of a turn, streaming or not, with the complete text.
     AssistantMessage {
         model: String,
         effort_level: Option<String>,
         text: String,
     },
+    /// Something went wrong that the user should see but that doesn't end
+    /// the session — a failed request, a message that couldn't be saved.
+    Error { message: String },
     /// The model asked to run a tool. Emitted before any approval prompt.
     ToolCallStarted { name: String, arguments: String },
     /// The user declined to let a tool run.
@@ -68,20 +78,21 @@ pub struct ApprovalRequest {
 
 /// How the agent loop talks to whoever is driving it.
 ///
-/// Both methods are `async` so an implementation can await real work — a GUI
-/// answering `approve` from a channel once someone clicks a button, say —
-/// rather than blocking the executor. The `async_fn_in_trait` lint is about
-/// callers being unable to add `Send` bounds to the returned futures; this is
-/// an application trait with known implementors, not a published API, so
-/// there's nothing to constrain.
-#[allow(async_fn_in_trait)]
+/// Both methods return futures so an implementation can await real work — a
+/// GUI answering `approve` from a channel once someone clicks a button, say —
+/// rather than blocking the executor.
+///
+/// They're written as explicit `-> impl Future + Send` rather than `async fn`
+/// because an `async fn` in a trait gives its future no `Send` bound, which
+/// makes the whole agent loop un-spawnable from any generic context. The TUI
+/// runs the loop on a background task, so `Send` is required.
 pub trait AgentUi {
     /// Report progress. Implementations should not block for long here.
-    async fn event(&mut self, event: AgentEvent);
+    fn event(&mut self, event: AgentEvent) -> impl Future<Output = ()> + Send;
 
     /// Ask whether a tool may run. Returning `Ok(false)` denies it and lets
     /// the loop continue; returning `Err` aborts the turn.
-    async fn approve(&mut self, request: ApprovalRequest) -> Result<bool>;
+    fn approve(&mut self, request: ApprovalRequest) -> impl Future<Output = Result<bool>> + Send;
 }
 
 /// An [`AgentUi`] that shows nothing and denies every approval request.
@@ -90,9 +101,11 @@ pub trait AgentUi {
 pub struct SilentUi;
 
 impl AgentUi for SilentUi {
-    async fn event(&mut self, _event: AgentEvent) {}
+    fn event(&mut self, _event: AgentEvent) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
-    async fn approve(&mut self, _request: ApprovalRequest) -> Result<bool> {
-        Ok(false)
+    fn approve(&mut self, _request: ApprovalRequest) -> impl Future<Output = Result<bool>> + Send {
+        async { Ok(false) }
     }
 }

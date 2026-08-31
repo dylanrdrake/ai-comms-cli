@@ -1,12 +1,14 @@
 mod agent;
 mod client;
 mod config;
+mod conversation;
 mod crypto;
 mod session;
 mod spinner;
 mod store;
 mod terminal_ui;
 mod tools;
+mod tui;
 mod ui;
 mod wrap;
 
@@ -15,6 +17,7 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use rustyline::DefaultEditor;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use client::{ChatMessage, Client};
 use config::{
@@ -98,6 +101,14 @@ enum Commands {
         value: Option<usize>,
     },
 
+    /// View or set whether responses stream in as they're generated
+    Stream {
+        /// on/off (also accepts true/false, yes/no, 1/0). Omit to show the
+        /// current setting.
+        #[arg(value_parser = parse_bool)]
+        value: Option<bool>,
+    },
+
     /// View or set the persistent default reasoning effort level (low, medium, high)
     EffortLevel {
         /// Effort level to set as the default (omit to show the current default)
@@ -170,6 +181,31 @@ enum Commands {
         /// value to pick from a list of your saved agent-chat sessions
         #[arg(long, num_args = 0..=1, default_missing_value = PICK_SESSION_SENTINEL)]
         resume: Option<String>,
+    },
+
+    /// Full-screen terminal UI: streaming replies, an always-live input box,
+    /// and inline tool approval. With no flags, opens the launch screen.
+    Tui {
+        /// Skip the launch screen and start a new plain chat
+        #[arg(short, long, conflicts_with_all = ["agent", "resume"])]
+        chat: bool,
+
+        /// Skip the launch screen and start a new agent chat (tools enabled)
+        #[arg(short, long, conflicts_with_all = ["chat", "resume"])]
+        agent: bool,
+
+        /// Skip the launch screen and resume a saved session by id (or
+        /// unique id prefix)
+        #[arg(long, conflicts_with_all = ["chat", "agent"])]
+        resume: Option<String>,
+
+        /// Model to use (overrides the persistent default for this call)
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Maximum number of iterations per turn (agent mode only)
+        #[arg(long)]
+        max_iterations: Option<usize>,
     },
 
     /// Manage saved chat sessions
@@ -278,18 +314,17 @@ fn resolve_resume_target(
     if sessions.is_empty() {
         anyhow::bail!(
             "No saved {} sessions to resume",
-            if kind == KIND_CHAT { "chat" } else { "agent-chat" }
+            if kind == KIND_CHAT {
+                "chat"
+            } else {
+                "agent-chat"
+            }
         );
     }
 
     println!("{}\n", "Select a session to resume:".blue());
     for (i, s) in sessions.iter().enumerate() {
-        println!(
-            "  {}. {}  {}",
-            i + 1,
-            (&s.id[..8]).bright_black(),
-            s.title
-        );
+        println!("  {}. {}  {}", i + 1, (&s.id[..8]).bright_black(), s.title);
     }
 
     print!("\n{} ", "Session number:".blue());
@@ -333,6 +368,7 @@ async fn main() -> Result<()> {
         Commands::Headers { action } => cmd_headers(action).await?,
         Commands::Approval { action } => cmd_approval(action).await?,
         Commands::MaxIterations { value } => cmd_max_iterations(value).await?,
+        Commands::Stream { value } => cmd_stream(value).await?,
         Commands::EffortLevel { value, clear } => cmd_effort_level(value, clear).await?,
         Commands::Ask {
             prompt,
@@ -352,6 +388,13 @@ async fn main() -> Result<()> {
             max_iterations,
             resume,
         } => cmd_agent_chat(model, verbose, max_iterations, resume).await?,
+        Commands::Tui {
+            chat,
+            agent,
+            resume,
+            model,
+            max_iterations,
+        } => cmd_tui(chat, agent, resume, model, max_iterations).await?,
         Commands::Sessions { action } => cmd_sessions(action).await?,
     }
 
@@ -420,6 +463,7 @@ async fn cmd_status() -> Result<()> {
             .as_deref()
             .unwrap_or(config::DEFAULT_EFFORT_STYLE)
     );
+    println!("  Streaming: {}", if config.stream { "on" } else { "off" });
     if !config.extra_headers.is_empty() {
         println!("  Extra headers: {}", config.extra_headers.len());
     }
@@ -652,6 +696,30 @@ async fn cmd_headers(action: Option<HeaderCommands>) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_stream(value: Option<bool>) -> Result<()> {
+    let mut config = load_config()?;
+
+    match value {
+        Some(enabled) => {
+            config.stream = enabled;
+            save_config(&config)?;
+            println!(
+                "{} Streaming responses {}",
+                "✓".green(),
+                if enabled { "enabled" } else { "disabled" }
+            );
+        }
+        None => {
+            println!(
+                "Streaming responses: {}",
+                if config.stream { "on" } else { "off" }
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn cmd_max_iterations(value: Option<usize>) -> Result<()> {
     let mut config = load_config()?;
 
@@ -849,6 +917,9 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
     println!("{}\n", "Starting chat session (type 'exit' to quit)".blue());
 
     let mut rl = DefaultEditor::new()?;
+    // Plain chat has no tool calls, so nothing here ever prompts; verbose is
+    // off because there are no iterations to narrate.
+    let mut ui = TerminalAgentUi::new(false);
 
     loop {
         let readline = rl.readline(&format!("{} ", "You:".blue()));
@@ -866,38 +937,26 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
                 }
 
                 println!();
-                let spinner = Spinner::start("Thinking...");
-                let result = client
-                    .chat(
-                        session.model().to_string(),
-                        session.messages().to_vec(),
-                        0.7,
-                        None,
-                        effort_level.clone(),
-                    )
-                    .await;
-                spinner.stop().await;
+                let model = session.model().to_string();
+                let turn = agent::run_chat_turn(
+                    &client,
+                    &mut ui,
+                    session.messages_mut(),
+                    &model,
+                    effort_level.clone(),
+                )
+                .await;
 
-                match result {
-                    Ok(response) => {
-                        let choice = &response.choices[0];
-                        if choice.message.has_visible_content() {
-                            let content = choice.message.content.as_deref().unwrap();
-                            println!(
-                                "{} {}\n",
-                                format!("{}:", response_label(session.model(), &effort_level))
-                                    .cyan(),
-                                wrap::wrap(content)
-                            );
-                            session.push_assistant(content.to_string());
-                            if let Err(e) = session.persist_pending() {
-                                eprintln!("{} Failed to save message: {}", "✗".red(), e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("{} {}\n", "✗".red(), e);
-                    }
+                match turn {
+                    // The reply itself is printed by the UI; this is the
+                    // blank line that has always followed it.
+                    Ok(Some(_)) => println!(),
+                    Ok(None) => {}
+                    Err(e) => println!("{} {}\n", "✗".red(), e),
+                }
+
+                if let Err(e) = session.persist_pending() {
+                    eprintln!("{} Failed to save message: {}", "✗".red(), e);
                 }
             }
             Err(rustyline::error::ReadlineError::Interrupted) => {
@@ -1068,6 +1127,43 @@ async fn cmd_agent_chat(
     Ok(())
 }
 
+async fn cmd_tui(
+    chat: bool,
+    agent: bool,
+    resume: Option<String>,
+    model: Option<String>,
+    max_iterations: Option<usize>,
+) -> Result<()> {
+    let config = load_config()?;
+
+    // A `--resume` id is resolved out here so a bad id fails as a normal CLI
+    // error rather than inside the alternate screen. Everything else the TUI
+    // picks for itself.
+    let start = if let Some(id_or_prefix) = resume {
+        let conn = store::open_db()?;
+        let summary = store::find_session(&conn, &id_or_prefix)?
+            .ok_or_else(|| anyhow::anyhow!("No session found matching '{}'", id_or_prefix))?;
+        tui::Start::Resume(Box::new(summary))
+    } else if chat {
+        tui::Start::New { agentic: false }
+    } else if agent {
+        tui::Start::New { agentic: true }
+    } else {
+        tui::Start::Launch
+    };
+
+    let context = tui::Context {
+        default_model: resolve_model(&config, None),
+        model_override: model,
+        effort_level: config.effort_level.clone(),
+        max_iterations: resolve_max_iterations(&config, max_iterations),
+        approval: config.approval.clone(),
+        client: Arc::new(Client::new(config)?),
+    };
+
+    tui::run(context, start).await
+}
+
 async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
     let conn = store::open_db()?;
 
@@ -1108,7 +1204,12 @@ async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
             let summary = store::find_session(&conn, &id)?
                 .ok_or_else(|| anyhow::anyhow!("No session found matching '{}'", id))?;
             store::delete_session(&conn, &summary.id)?;
-            println!("{} Deleted session {} ({})", "✓".green(), summary.id, summary.title);
+            println!(
+                "{} Deleted session {} ({})",
+                "✓".green(),
+                summary.id,
+                summary.title
+            );
         }
     }
 

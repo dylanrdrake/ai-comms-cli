@@ -25,7 +25,11 @@ impl Spinner {
         let handle = tokio::spawn(async move {
             let mut frame = 0;
             while running_clone.load(Ordering::Relaxed) {
-                print!("\r{} {}", FRAMES[frame % FRAMES.len()].cyan(), message.yellow());
+                print!(
+                    "\r{} {}",
+                    FRAMES[frame % FRAMES.len()].cyan(),
+                    message.yellow()
+                );
                 let _ = io::stdout().flush();
                 frame += 1;
                 tokio::time::sleep(TICK).await;

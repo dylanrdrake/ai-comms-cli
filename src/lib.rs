@@ -1,11 +1,13 @@
 pub mod agent;
 pub mod client;
 pub mod config;
+pub mod conversation;
 pub mod crypto;
 pub mod session;
 pub mod spinner;
 pub mod store;
 pub mod terminal_ui;
 pub mod tools;
+pub mod tui;
 pub mod ui;
 pub mod wrap;
