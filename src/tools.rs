@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 pub fn get_tool_definitions() -> Vec<serde_json::Value> {
     vec![
@@ -186,7 +185,7 @@ pub async fn execute_tool(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(30);
 
-            run_terminal_command(command, working_dir, timeout_secs)
+            run_terminal_command(command, working_dir, timeout_secs).await
         }
         _ => Err(anyhow!("Unknown tool: {}", name)),
     }
@@ -321,8 +320,15 @@ fn replace_in_file(filepath: &str, search: &str, replace: &str) -> Result<serde_
     }))
 }
 
-fn run_terminal_command(command: &str, working_dir: Option<&str>, _timeout_secs: u64) -> Result<serde_json::Value> {
+async fn run_terminal_command(
+    command: &str,
+    working_dir: Option<&str>,
+    timeout_secs: u64,
+) -> Result<serde_json::Value> {
     use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command as TokioCommand;
+    use tokio::time::{timeout, Duration};
 
     let shell = if cfg!(target_os = "windows") {
         "cmd"
@@ -336,7 +342,7 @@ fn run_terminal_command(command: &str, working_dir: Option<&str>, _timeout_secs:
         "-c"
     };
 
-    let mut cmd = Command::new(shell);
+    let mut cmd = TokioCommand::new(shell);
     cmd.arg(shell_arg)
         .arg(command)
         .stdout(Stdio::piped())
@@ -353,8 +359,8 @@ fn run_terminal_command(command: &str, working_dir: Option<&str>, _timeout_secs:
         cmd.current_dir(path);
     }
 
-    let output = match cmd.output() {
-        Ok(output) => output,
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             return Ok(json!({
                 "success": false,
@@ -363,14 +369,101 @@ fn run_terminal_command(command: &str, working_dir: Option<&str>, _timeout_secs:
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
+    // Take the pipes and drain them concurrently with waiting on the child,
+    // so a timeout can still `kill()` the child without losing ownership of
+    // (and deadlocking on) its stdout/stderr.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    let wait_result = timeout(
+        Duration::from_secs(timeout_secs.max(1)),
+        child.wait(),
+    )
+    .await;
+
+    let status = match wait_result {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            return Ok(json!({
+                "success": false,
+                "error": format!("Failed to execute command: {}", e)
+            }));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Ok(json!({
+                "success": false,
+                "error": format!(
+                    "Command timed out after {} seconds and was killed",
+                    timeout_secs
+                ),
+                "timed_out": true
+            }));
+        }
+    };
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+    let exit_code = status.code().unwrap_or(-1);
 
     Ok(json!({
-        "success": output.status.success(),
+        "success": status.success(),
         "exit_code": exit_code,
-        "stdout": stdout,
-        "stderr": stderr
+        "stdout": String::from_utf8_lossy(&stdout).to_string(),
+        "stderr": String::from_utf8_lossy(&stderr).to_string()
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_terminal_command_returns_stdout_and_exit_code() {
+        let result = run_terminal_command("echo hello", None, 5).await.unwrap();
+        assert_eq!(result["success"], true);
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(result["stdout"].as_str().unwrap().trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn run_terminal_command_reports_nonzero_exit() {
+        let result = run_terminal_command("exit 3", None, 5).await.unwrap();
+        assert_eq!(result["success"], false);
+        assert_eq!(result["exit_code"], 3);
+    }
+
+    #[tokio::test]
+    async fn run_terminal_command_enforces_timeout() {
+        let result = run_terminal_command("sleep 5", None, 1).await.unwrap();
+        assert_eq!(result["success"], false);
+        assert_eq!(result["timed_out"], true);
+    }
+
+    #[tokio::test]
+    async fn run_terminal_command_missing_working_dir_errors() {
+        let result = run_terminal_command("echo hi", Some("/no/such/dir"), 5)
+            .await
+            .unwrap();
+        assert_eq!(result["success"], false);
+    }
 }
