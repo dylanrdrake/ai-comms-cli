@@ -12,6 +12,15 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
 }
 
+impl ChatMessage {
+    /// True if `content` is `Some` and has non-whitespace text. Some
+    /// providers return `content: ""` instead of `null` when a message
+    /// carries no visible text (e.g. a tool-calls-only turn).
+    pub fn has_visible_content(&self) -> bool {
+        self.content.as_deref().is_some_and(|c| !c.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ToolCall {
     pub id: String,
@@ -174,5 +183,26 @@ mod deser_tests {
         let m: ChatMessage = serde_json::from_str(json).unwrap();
         assert_eq!(m.role, "assistant");
         assert_eq!(m.tool_call_id, None);
+    }
+
+    #[test]
+    fn has_visible_content_treats_none_and_blank_string_alike() {
+        let none = ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let blank = ChatMessage {
+            content: Some("   ".to_string()),
+            ..none.clone()
+        };
+        let real = ChatMessage {
+            content: Some("hi".to_string()),
+            ..none.clone()
+        };
+        assert!(!none.has_visible_content());
+        assert!(!blank.has_visible_content());
+        assert!(real.has_visible_content());
     }
 }

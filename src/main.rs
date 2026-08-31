@@ -771,8 +771,9 @@ async fn cmd_ask(prompt: &str, model: Option<String>, temperature: f32) -> Resul
 
     println!("{} ", "✓".green());
     println!("\n{}:", response_label(&model, &effort_level).cyan());
-    if let Some(content) = &response.choices[0].message.content {
-        println!("{}", wrap::wrap(content));
+    let choice = &response.choices[0];
+    if choice.message.has_visible_content() {
+        println!("{}", wrap::wrap(choice.message.content.as_deref().unwrap()));
     }
 
     Ok(())
@@ -780,8 +781,12 @@ async fn cmd_ask(prompt: &str, model: Option<String>, temperature: f32) -> Resul
 
 /// Prints a saved transcript's user/assistant turns (tool and system messages
 /// are omitted since they're internal bookkeeping, not conversation content).
-fn print_transcript(messages: &[ChatMessage], model_label: &str) {
-    for m in messages {
+/// Each assistant turn is labeled with the model/effort that produced it
+/// when known, falling back to `default_label` for older rows recorded
+/// before that was tracked.
+fn print_transcript(messages: &[store::StoredMessage], default_label: &str) {
+    for sm in messages {
+        let m = &sm.message;
         match m.role.as_str() {
             "user" => {
                 if let Some(content) = &m.content {
@@ -790,9 +795,13 @@ fn print_transcript(messages: &[ChatMessage], model_label: &str) {
             }
             "assistant" => {
                 if let Some(content) = &m.content {
+                    let label = match &sm.model {
+                        Some(model) => response_label(model, &sm.effort_level),
+                        None => default_label.to_string(),
+                    };
                     println!(
                         "\n{} {}\n",
-                        format!("{}:", model_label).cyan(),
+                        format!("{}:", label).cyan(),
                         wrap::wrap(content)
                     );
                 }
@@ -826,7 +835,8 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
                 summary.title
             );
             print_transcript(&history, &response_label(&model, &config.effort_level));
-            (summary.id, model, history)
+            let messages: Vec<ChatMessage> = history.into_iter().map(|sm| sm.message).collect();
+            (summary.id, model, messages)
         }
         None => {
             let model = resolve_model(&config, model);
@@ -860,7 +870,14 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
                     tool_calls: None,
                     tool_call_id: None,
                 });
-                if let Err(e) = store::append_message(&conn, &session_id, seq, &messages[seq]) {
+                if let Err(e) = store::append_message(
+                    &conn,
+                    &session_id,
+                    seq,
+                    &messages[seq],
+                    &model,
+                    effort_level.as_deref(),
+                ) {
                     eprintln!("{} Failed to save message: {}", "✗".red(), e);
                 }
                 if !title_set {
@@ -886,23 +903,30 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
 
                 match result {
                     Ok(response) => {
-                        if let Some(content) = &response.choices[0].message.content {
+                        let choice = &response.choices[0];
+                        if choice.message.has_visible_content() {
+                            let content = choice.message.content.as_deref().unwrap();
                             println!(
-                                "\n{} {}\n",
+                                "{} {}\n",
                                 format!("{}:", response_label(&model, &effort_level)).cyan(),
                                 wrap::wrap(content)
                             );
                             let seq = messages.len();
                             let assistant_message = ChatMessage {
                                 role: "assistant".to_string(),
-                                content: Some(content.clone()),
+                                content: Some(content.to_string()),
                                 tool_calls: None,
                                 tool_call_id: None,
                             };
                             messages.push(assistant_message.clone());
-                            if let Err(e) =
-                                store::append_message(&conn, &session_id, seq, &assistant_message)
-                            {
+                            if let Err(e) = store::append_message(
+                                &conn,
+                                &session_id,
+                                seq,
+                                &assistant_message,
+                                &model,
+                                effort_level.as_deref(),
+                            ) {
                                 eprintln!("{} Failed to save message: {}", "✗".red(), e);
                             }
                         }
@@ -990,8 +1014,9 @@ async fn cmd_agent_chat(
                 summary.title
             );
             print_transcript(&history, &response_label(&model, &config.effort_level));
-            let len = history.len();
-            (summary.id, model, history, len)
+            let messages: Vec<ChatMessage> = history.into_iter().map(|sm| sm.message).collect();
+            let len = messages.len();
+            (summary.id, model, messages, len)
         }
         None => {
             let model = resolve_model(&config, model);
@@ -1002,7 +1027,14 @@ async fn cmd_agent_chat(
                 tool_calls: None,
                 tool_call_id: None,
             }];
-            store::append_message(&conn, &session_id, 0, &messages[0])?;
+            store::append_message(
+                &conn,
+                &session_id,
+                0,
+                &messages[0],
+                &model,
+                config.effort_level.as_deref(),
+            )?;
             let len = messages.len();
             (session_id, model, messages, len)
         }
@@ -1054,13 +1086,21 @@ async fn cmd_agent_chat(
                 )
                 .await
                 {
-                    println!("{} {}\n", "✗".red(), e);
+                    println!("{} {}", "✗".red(), e);
                 }
+                println!();
 
                 // Persist any messages appended by this turn (the user message
                 // plus whatever the agent loop added: assistant/tool turns).
                 for (seq, message) in messages.iter().enumerate().skip(saved_len) {
-                    if let Err(e) = store::append_message(&conn, &session_id, seq, message) {
+                    if let Err(e) = store::append_message(
+                        &conn,
+                        &session_id,
+                        seq,
+                        message,
+                        &model,
+                        effort_level.as_deref(),
+                    ) {
                         eprintln!("{} Failed to save message: {}", "✗".red(), e);
                     }
                 }

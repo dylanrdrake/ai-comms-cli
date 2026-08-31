@@ -1,4 +1,4 @@
-use crate::client::{Client, ChatMessage};
+use crate::client::{ChatMessage, Client};
 use crate::config::ApprovalSettings;
 use crate::spinner::Spinner;
 use crate::tools::{execute_tool, get_tool_definitions};
@@ -143,18 +143,19 @@ pub async fn run_agent_turn(
 
         let choice = &response.choices[0];
 
+        let no_tool_calls = choice.message.tool_calls.is_none()
+            || choice.message.tool_calls.as_ref().unwrap().is_empty();
+
         // If the LLM generated text, show it
-        if let Some(content) = &choice.message.content {
+        if choice.message.has_visible_content() {
             let label = match &effort_level {
                 Some(effort) => format!("{} ({}):", model, effort),
                 None => format!("{}:", model),
             };
-            println!("\n{} {}", label.cyan(), crate::wrap::wrap(content));
-            final_response = Some(content.clone());
+            let content = choice.message.content.as_deref().unwrap();
+            println!("{} {}", label.cyan(), crate::wrap::wrap(content));
+            final_response = Some(content.to_string());
         }
-
-        let no_tool_calls = choice.message.tool_calls.is_none()
-            || choice.message.tool_calls.as_ref().unwrap().is_empty();
 
         // Record the assistant's turn in history before deciding whether to
         // keep looping, so a plain text answer (no tool calls) is still

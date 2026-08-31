@@ -9,6 +9,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const KIND_CHAT: &str = "chat";
 pub const KIND_AGENT_CHAT: &str = "agent_chat";
 
+/// A message as loaded from history, along with the model and effort level
+/// that were active when it was recorded (both `None` for rows written
+/// before this tracking was added).
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub message: ChatMessage,
+    pub model: Option<String>,
+    pub effort_level: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
@@ -55,14 +65,41 @@ pub fn open_db() -> Result<Connection> {
             role          TEXT NOT NULL,
             content       TEXT,
             tool_calls    TEXT,
-            tool_call_id  TEXT
+            tool_call_id  TEXT,
+            model         TEXT,
+            effort_level  TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
         ",
     )?;
 
+    // `model`/`effort_level` were added after messages already shipped without
+    // them; back them onto any database created before this change.
+    ensure_column(&conn, "messages", "model", "TEXT")?;
+    ensure_column(&conn, "messages", "effort_level", "TEXT")?;
+
     Ok(conn)
+}
+
+/// Adds `column` to `table` if it isn't already there. Used to migrate
+/// databases created before a column existed, without disturbing existing
+/// rows (new column comes back `NULL` for them).
+fn ensure_column(conn: &Connection, table: &str, column: &str, sql_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|name| name.ok())
+        .any(|name| name == column);
+
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {sql_type}"),
+            [],
+        )?;
+    }
+
+    Ok(())
 }
 
 /// Derives a short title from the first user message, falling back to "Untitled".
@@ -111,11 +148,15 @@ pub fn set_session_title(conn: &Connection, session_id: &str, title: &str) -> Re
 
 /// Appends a single message to a session and bumps its updated_at timestamp.
 /// `seq` should be the message's 0-based position within the session.
+/// `model`/`effort_level` record what was active when the message was
+/// produced, so history can show which model generated each reply.
 pub fn append_message(
     conn: &Connection,
     session_id: &str,
     seq: usize,
     message: &ChatMessage,
+    model: &str,
+    effort_level: Option<&str>,
 ) -> Result<()> {
     let tool_calls_json = message
         .tool_calls
@@ -127,7 +168,7 @@ pub fn append_message(
     let tool_calls_json = crypto::encrypt_opt(tool_calls_json.as_deref())?;
 
     conn.execute(
-        "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, model, effort_level) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             session_id,
             seq as i64,
@@ -135,6 +176,8 @@ pub fn append_message(
             content,
             tool_calls_json,
             message.tool_call_id,
+            model,
+            effort_level,
         ],
     )?;
 
@@ -196,10 +239,11 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
     }
 }
 
-/// Loads the full message history for a session, in order.
-pub fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<ChatMessage>> {
+/// Loads the full message history for a session, in order, along with the
+/// model/effort level that produced each message.
+pub fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<StoredMessage>> {
     let mut stmt = conn.prepare(
-        "SELECT role, content, tool_calls, tool_call_id FROM messages WHERE session_id = ?1 ORDER BY seq ASC",
+        "SELECT role, content, tool_calls, tool_call_id, model, effort_level FROM messages WHERE session_id = ?1 ORDER BY seq ASC",
     )?;
 
     let rows = stmt.query_map(params![session_id], |row| {
@@ -207,23 +251,29 @@ pub fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<ChatMess
         let content: Option<String> = row.get(1)?;
         let tool_calls_json: Option<String> = row.get(2)?;
         let tool_call_id: Option<String> = row.get(3)?;
-        Ok((role, content, tool_calls_json, tool_call_id))
+        let model: Option<String> = row.get(4)?;
+        let effort_level: Option<String> = row.get(5)?;
+        Ok((role, content, tool_calls_json, tool_call_id, model, effort_level))
     })?;
 
     let mut messages = Vec::new();
     for row in rows {
-        let (role, content, tool_calls_json, tool_call_id) = row?;
+        let (role, content, tool_calls_json, tool_call_id, model, effort_level) = row?;
         let content = crypto::decrypt_opt(content)?;
         let tool_calls_json = crypto::decrypt_opt(tool_calls_json)?;
         let tool_calls: Option<Vec<ToolCall>> = match tool_calls_json {
             Some(json) => Some(serde_json::from_str(&json)?),
             None => None,
         };
-        messages.push(ChatMessage {
-            role,
-            content,
-            tool_calls,
-            tool_call_id,
+        messages.push(StoredMessage {
+            message: ChatMessage {
+                role,
+                content,
+                tool_calls,
+                tool_call_id,
+            },
+            model,
+            effort_level,
         });
     }
 
@@ -272,7 +322,9 @@ mod tests {
                 role          TEXT NOT NULL,
                 content       TEXT,
                 tool_calls    TEXT,
-                tool_call_id  TEXT
+                tool_call_id  TEXT,
+                model         TEXT,
+                effort_level  TEXT
             );
             ",
         )
@@ -339,13 +391,15 @@ mod tests {
         ];
 
         for (seq, message) in messages.iter().enumerate() {
-            append_message(&conn, &id, seq, message).unwrap();
+            append_message(&conn, &id, seq, message, "orcarouter/auto", Some("high")).unwrap();
         }
 
         let loaded = load_messages(&conn, &id).unwrap();
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].role, "user");
-        assert_eq!(loaded[1].content, Some("hi there".to_string()));
+        assert_eq!(loaded[0].message.role, "user");
+        assert_eq!(loaded[1].message.content, Some("hi there".to_string()));
+        assert_eq!(loaded[1].model.as_deref(), Some("orcarouter/auto"));
+        assert_eq!(loaded[1].effort_level.as_deref(), Some("high"));
     }
 
     #[test]
@@ -386,6 +440,8 @@ mod tests {
                 tool_calls: None,
                 tool_call_id: None,
             },
+            "model-a",
+            None,
         )
         .unwrap();
 
