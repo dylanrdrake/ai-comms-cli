@@ -20,6 +20,11 @@ pub struct TerminalAgentUi {
     /// — is not gated, so plain `agent`/`agent-chat` isn't silent about
     /// tool calls the way it used to be.
     verbose: bool,
+    /// Whether a reply is prefixed with `model (effort):`. On for one-shot
+    /// `agent` calls, where there's no other way to see what answered; off
+    /// for `session`, matching the TUI transcript, which dropped the same
+    /// label — current model there is `/model`'s job, not every reply's.
+    show_model_label: bool,
     /// Live only between `RequestStarted` and `RequestFinished`.
     spinner: Option<Spinner>,
     /// The call's arguments, held from `ToolCallStarted` to whichever event
@@ -32,12 +37,19 @@ pub struct TerminalAgentUi {
 }
 
 impl TerminalAgentUi {
-    pub fn new(verbose: bool) -> Self {
+    pub fn new(verbose: bool, show_model_label: bool) -> Self {
         TerminalAgentUi {
             verbose,
+            show_model_label,
             spinner: None,
             pending_arguments: None,
         }
+    }
+
+    /// Flips the `-v`-equivalent detail level live, for `/verbose` in a
+    /// `session` loop. Takes effect from the next event on.
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose;
     }
 }
 
@@ -67,8 +79,12 @@ impl AgentUi for TerminalAgentUi {
                     effort_level,
                     text,
                 } => {
-                    let label = format!("{}:", response_label(&model, &effort_level));
-                    println!("{} {}", label.cyan(), wrap::wrap(&text));
+                    if self.show_model_label {
+                        let label = format!("{}:", response_label(&model, &effort_level));
+                        println!("{} {}", label.cyan(), wrap::wrap(&text));
+                    } else {
+                        println!("{}", wrap::wrap(&text));
+                    }
                 }
                 AgentEvent::ToolCallStarted { name, arguments } => {
                     tool_notice("▸".yellow(), &name, &arguments);

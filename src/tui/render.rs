@@ -26,19 +26,25 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
     };
     let input_rows = content_rows
         .clamp(1, MAX_INPUT_ROWS)
-        // Never take so much that the conversation has nowhere to go.
-        .min(frame.area().height.saturating_sub(5).max(1));
+        // Never take so much that the conversation has nowhere to go. The
+        // reserve covers the two status rows, the gap row above the input,
+        // and the input box's own two border rows — the session title rides
+        // in the transcript pane's own border, not a separate row.
+        .min(frame.area().height.saturating_sub(7).max(1));
 
     let areas = Layout::vertical([
-        Constraint::Min(1),                 // transcript
+        Constraint::Min(1),                 // transcript: comms - <title>
+        Constraint::Length(1),              // top status: ready/model/effort/temp
+        Constraint::Length(1),              // a hair of breathing room before input
         Constraint::Length(input_rows + 2), // input, plus its borders
-        Constraint::Length(1),              // status
+        Constraint::Length(1),              // bottom status: mode/verbose/controls
     ])
     .split(frame.area());
 
     draw_transcript(frame, areas[0], app);
-    draw_input(frame, areas[1], app);
-    draw_status(frame, areas[2], app, tick);
+    draw_top_status(frame, areas[1], app, tick);
+    draw_input(frame, areas[3], app);
+    draw_bottom_status(frame, areas[4], app);
 }
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
@@ -49,24 +55,17 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
             TranscriptItem::User(text) => {
                 push_block(
                     &mut lines,
-                    Span::styled("You  ", Style::new().blue().bold()),
+                    Span::styled("❯ ", Style::new().green().bold()),
                     text,
                     None,
                 );
                 lines.push(Line::raw(""));
             }
             TranscriptItem::Assistant {
-                text,
-                streaming,
-                label,
+                text, streaming, ..
             } => {
-                // A reply with no recorded model is shown as plainly
-                // "assistant", dimmed, rather than inheriting a label it
-                // can't be known to deserve.
-                let prefix = match label {
-                    Some(label) => Span::styled(format!("{label}  "), Style::new().cyan().bold()),
-                    None => Span::styled("assistant  ", Style::new().dark_gray().bold()),
-                };
+                // No model label — just the reply text.
+                let prefix = Span::raw("");
                 let cursor = streaming.then(|| Span::styled("▌", Style::new().cyan()));
                 if *streaming {
                     // Mid-stream the text is usually mid-construct — an
@@ -135,6 +134,28 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 )));
                 lines.push(Line::raw(""));
             }
+            TranscriptItem::ApprovalStatus { approval, changed } => {
+                lines.push(Line::from(Span::styled(
+                    format!("  — Approval {}:", if *changed { "set to" } else { "is" }),
+                    Style::new().dark_gray().italic(),
+                )));
+                for (label, enabled) in [
+                    ("Read from disk:    ", approval.read_disk),
+                    ("Write to disk:     ", approval.write_disk),
+                    ("Terminal commands: ", approval.terminal),
+                ] {
+                    let (mark, word, style) = if enabled {
+                        ("✓", "Ask", Style::new().green())
+                    } else {
+                        ("✗", "Auto", Style::new().yellow())
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("      {label}"), Style::new().dark_gray()),
+                        Span::styled(format!("{mark} {word}"), style),
+                    ]));
+                }
+                lines.push(Line::raw(""));
+            }
         }
     }
 
@@ -184,7 +205,10 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(Span::styled(" comms ", Style::new().bold()))
+                    .title(Span::styled(
+                        format!(" comms - {} ", app.title),
+                        Style::new().bold(),
+                    ))
                     .title_bottom(scroll_hint(app, max_offset)),
             )
             .scroll((offset, 0)),
@@ -290,7 +314,9 @@ fn input_cursor(input: &str, cursor: usize, width: u16) -> (u16, u16) {
     (row as u16, col as u16)
 }
 
-fn draw_status(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
+/// Ready/busy, model, and effort — the request-shaping settings, grouped
+/// above the input box.
+fn draw_top_status(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let mut spans = Vec::new();
 
     if app.busy {
@@ -302,6 +328,47 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         spans.push(Span::styled(" ready ", Style::new().green()));
     }
 
+    spans.push(Span::styled(
+        format!("· {} ", app.model),
+        Style::new().dark_gray(),
+    ));
+    spans.push(Span::styled(
+        format!("· {} ", app.effort_level.as_deref().unwrap_or("default")),
+        Style::new().dark_gray(),
+    ));
+    spans.push(Span::styled(
+        format!(
+            "· temp {} ",
+            app.temperature
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "default".to_string())
+        ),
+        Style::new().dark_gray(),
+    ));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Ask/agent, verbose, queue depth, session id, and the keybinding hints —
+/// grouped below the input box, closest to where you're typing.
+fn draw_bottom_status(frame: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![Span::styled(
+        format!(" {} ", if app.agentic { "agent" } else { "ask" }),
+        if app.agentic {
+            Style::new().yellow()
+        } else {
+            Style::new().cyan()
+        },
+    )];
+    spans.push(Span::styled(
+        format!("· {} ", if app.verbose { "verbose" } else { "quiet" }),
+        if app.verbose {
+            Style::new().yellow()
+        } else {
+            Style::new().dark_gray()
+        },
+    ));
+
     if app.queued > 0 {
         spans.push(Span::styled(
             format!("· {} queued ", app.queued),
@@ -309,22 +376,6 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         ));
     }
 
-    spans.push(Span::styled(
-        format!("· {} ", if app.agentic { "agent" } else { "chat" }),
-        if app.agentic {
-            Style::new().yellow()
-        } else {
-            Style::new().cyan()
-        },
-    ));
-    spans.push(Span::styled(
-        format!("· {} ", app.label()),
-        Style::new().dark_gray(),
-    ));
-    spans.push(Span::styled(
-        format!("· {} ", app.session_id),
-        Style::new().dark_gray(),
-    ));
     spans.push(Span::styled(
         "· Enter send · Esc cancel · PgUp/PgDn scroll · Ctrl-B back · Ctrl-C quit",
         Style::new().dark_gray(),
@@ -534,25 +585,83 @@ mod tests {
     #[test]
     fn renders_conversation_and_status() {
         let out = render_to_string(&sample_app(), 60, 20);
-        assert!(out.contains("You"), "{out}");
-        assert!(out.contains("hello"), "{out}");
+        assert!(out.contains("❯ hello"), "{out}");
         assert!(out.contains("hi there"), "{out}");
         assert!(out.contains("test-model"), "{out}");
         assert!(out.contains("ready"), "{out}");
     }
 
     #[test]
+    fn status_bar_labels_the_mode_ask_or_agent() {
+        let mut app = sample_app();
+        assert!(!app.agentic);
+        let out = render_to_string(&app, 60, 20);
+        assert!(out.contains("ask"), "{out}");
+        assert!(!out.contains("chat"), "{out}");
+
+        app.agentic = true;
+        let out = render_to_string(&app, 60, 20);
+        assert!(out.contains("agent"), "{out}");
+    }
+
+    #[test]
+    fn transcript_border_shows_comms_and_the_session_title() {
+        let mut app = sample_app();
+        app.title = "Write me a snake game".to_string();
+        let out = render_to_string(&app, 60, 20);
+        assert!(out.contains("comms - Write me a snake game"), "{out}");
+    }
+
+    #[test]
+    fn top_status_shows_model_and_effort() {
+        let mut app = sample_app();
+        let out = render_to_string(&app, 80, 20);
+        assert!(out.contains("test-model"), "{out}");
+        assert!(out.contains("default"), "{out}");
+
+        app.effort_level = Some("high".to_string());
+        let out = render_to_string(&app, 80, 20);
+        assert!(out.contains("high"), "{out}");
+    }
+
+    #[test]
+    fn top_status_shows_temperature_at_the_end() {
+        let mut app = sample_app();
+        let out = render_to_string(&app, 80, 20);
+        assert!(out.contains("temp default"), "{out}");
+
+        app.temperature = Some(1.2);
+        let out = render_to_string(&app, 80, 20);
+        assert!(out.contains("temp 1.2"), "{out}");
+    }
+
+    #[test]
+    fn bottom_status_shows_the_verbose_indicator() {
+        let mut app = sample_app();
+        assert!(!app.verbose);
+        let out = render_to_string(&app, 80, 20);
+        assert!(out.contains("quiet"), "{out}");
+
+        app.verbose = true;
+        let out = render_to_string(&app, 80, 20);
+        assert!(out.contains("verbose"), "{out}");
+    }
+
+    #[test]
     fn a_short_conversation_sits_at_the_bottom_of_the_pane() {
         let out = render_to_string(&sample_app(), 60, 20);
         let rows: Vec<&str> = out.lines().collect();
-        // The transcript pane is everything above the 3-row input box and
-        // 1-row status bar; its last content row is just inside the border.
-        let last_content = rows.len() - 1 - 3 - 1 - 1;
+        // Below the transcript pane's own bottom border: the top status
+        // row, the gap row above the input, the 3-row input box, and the
+        // bottom status row — its last content row is just inside the
+        // border above all of that.
+        let last_content = rows.len() - 1 - 1 - 3 - 1 - 1 - 1;
         assert!(
             rows[last_content].contains("hi there"),
             "newest message should be flush with the bottom of the pane, got:\n{out}"
         );
-        // ...and the space is above it, not below.
+        // ...and the space is above it, not below. Row 0 is the transcript
+        // pane's own top border, so its first content row is row 1.
         assert!(
             rows[2].trim_matches(|c| c == '│' || c == ' ').is_empty(),
             "expected blank space above the conversation, got:\n{out}"
@@ -700,6 +809,26 @@ mod tests {
         let out = render_to_string(&app, 70, 12);
         assert!(out.contains("read_file"), "{out}");
         assert!(out.contains('✓'), "{out}");
+    }
+
+    #[test]
+    fn approval_status_pretty_prints_each_gate_like_the_cli_does() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript.push(TranscriptItem::ApprovalStatus {
+            approval: crate::config::ApprovalSettings {
+                read_disk: false,
+                write_disk: true,
+                terminal: true,
+            },
+            changed: false,
+        });
+        let out = render_to_string(&app, 70, 12);
+        assert!(out.contains("Approval is:"), "{out}");
+        assert!(out.contains("Read from disk:"), "{out}");
+        assert!(out.contains("Write to disk:"), "{out}");
+        assert!(out.contains("Terminal commands:"), "{out}");
+        assert!(out.contains("✗ Auto"), "{out}");
+        assert!(out.contains("✓ Ask"), "{out}");
     }
 
     #[test]

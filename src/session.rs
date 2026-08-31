@@ -7,16 +7,38 @@
 //! loops and any future GUI can share the same bookkeeping instead of each
 //! reimplementing "append, persist, name the session".
 
+use crate::agent::AGENT_CHAT_SYSTEM_PROMPT;
 use crate::client::ChatMessage;
-use crate::store::{self, SessionSummary, StoredMessage};
+use crate::config::ApprovalSettings;
+use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
 use anyhow::Result;
 use rusqlite::Connection;
 
 pub struct ChatSession {
     conn: Connection,
     id: String,
+    /// The session's current title. "Untitled" until [`Self::persist_pending`]
+    /// derives a real one from the first user message.
+    title: String,
     model: String,
+    /// `KIND_CHAT` or `KIND_AGENT_CHAT` — mutable via [`Self::set_agentic`],
+    /// unlike `store::create_session`'s `kind` param, which only sets the
+    /// starting mode.
+    kind: String,
     effort_level: Option<String>,
+    /// Whether this session's TUI view currently shows verbose tool detail.
+    /// Purely a display setting — the agent loop never reads it.
+    verbose: bool,
+    /// A `/max-iterations`-style override of the tool-calling cap per turn,
+    /// while in agent mode. `None` means "use the configured default".
+    max_iterations: Option<usize>,
+    /// A `/temperature`-style override of the sampling temperature.
+    /// `None` means "use the configured default".
+    temperature: Option<f32>,
+    /// This session's current tool-approval gates, always concrete (unlike
+    /// `effort_level`/`max_iterations` there's no "unset, defer to config"
+    /// state once a turn actually needs to check them).
+    approval: ApprovalSettings,
     messages: Vec<ChatMessage>,
     /// Whether the session has been given a title derived from a user
     /// message yet. Sessions start as "Untitled".
@@ -26,6 +48,14 @@ pub struct ChatSession {
     saved_len: usize,
 }
 
+/// Whether the agent-chat system prompt is already present, so turning
+/// agent mode on doesn't seed a duplicate.
+fn has_agent_system_prompt(messages: &[ChatMessage]) -> bool {
+    messages
+        .iter()
+        .any(|m| m.role == "system" && m.content.as_deref() == Some(AGENT_CHAT_SYSTEM_PROMPT))
+}
+
 impl ChatSession {
     /// Starts a new session, registering it in the database.
     pub fn create(
@@ -33,13 +63,20 @@ impl ChatSession {
         model: String,
         kind: &str,
         effort_level: Option<String>,
+        approval: ApprovalSettings,
     ) -> Result<Self> {
-        let id = store::create_session(&conn, &model, kind)?;
+        let id = store::create_session(&conn, &model, kind, &approval)?;
         Ok(ChatSession {
             conn,
             id,
+            title: "Untitled".to_string(),
             model,
+            kind: kind.to_string(),
             effort_level,
+            verbose: false,
+            max_iterations: None,
+            temperature: None,
+            approval,
             messages: Vec::new(),
             title_set: false,
             saved_len: 0,
@@ -74,8 +111,14 @@ impl ChatSession {
             ChatSession {
                 conn,
                 id: summary.id.clone(),
+                title: summary.title.clone(),
                 model,
+                kind: summary.kind.clone(),
                 effort_level,
+                verbose: summary.verbose,
+                max_iterations: summary.max_iterations.map(|n| n as usize),
+                temperature: summary.temperature.map(|n| n as f32),
+                approval: summary.approval.clone(),
                 messages,
                 title_set,
                 saved_len,
@@ -93,6 +136,130 @@ impl ChatSession {
         }
         store::set_session_model(&self.conn, &self.id, &model)?;
         self.model = model;
+        Ok(())
+    }
+
+    /// Switches between plain and agent (tool-calling) mode and records it,
+    /// so the switch sticks on resume and in `sessions list`. Turning agent
+    /// mode on seeds the agent system prompt if this session doesn't
+    /// already have one (a session that started plain won't); turning it
+    /// off deliberately leaves prior history — including that prompt —
+    /// alone, since no tools are offered either way once it's off.
+    pub fn set_agentic(&mut self, agentic: bool) -> Result<()> {
+        let kind = if agentic { KIND_AGENT_CHAT } else { KIND_CHAT };
+        if self.kind == kind {
+            return Ok(());
+        }
+        store::set_session_kind(&self.conn, &self.id, kind)?;
+        self.kind = kind.to_string();
+
+        if agentic && !has_agent_system_prompt(&self.messages) {
+            self.push_and_persist(ChatMessage {
+                role: "system".to_string(),
+                content: Some(AGENT_CHAT_SYSTEM_PROMPT.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Whether this session is currently in agent (tool-calling) mode.
+    pub fn is_agentic(&self) -> bool {
+        self.kind == KIND_AGENT_CHAT
+    }
+
+    /// Switches the reasoning effort for subsequent turns and records it.
+    /// `None` clears the override, falling back to whatever the configured
+    /// default is next time the session is opened.
+    pub fn set_effort_level(&mut self, effort_level: Option<String>) -> Result<()> {
+        if self.effort_level == effort_level {
+            return Ok(());
+        }
+        store::set_session_effort_level(&self.conn, &self.id, effort_level.as_deref())?;
+        self.effort_level = effort_level;
+        Ok(())
+    }
+
+    /// Toggles whether this session's TUI view shows verbose tool detail,
+    /// and records it so it's remembered on resume.
+    pub fn set_verbose(&mut self, verbose: bool) -> Result<()> {
+        if self.verbose == verbose {
+            return Ok(());
+        }
+        store::set_session_verbose(&self.conn, &self.id, verbose)?;
+        self.verbose = verbose;
+        Ok(())
+    }
+
+    /// Whether this session's TUI view currently shows verbose tool detail.
+    pub fn verbose(&self) -> bool {
+        self.verbose
+    }
+
+    /// Switches the tool-calling iteration cap per turn (agent mode only)
+    /// and records it. `None` clears the override, falling back to the
+    /// configured default.
+    pub fn set_max_iterations(&mut self, max_iterations: Option<usize>) -> Result<()> {
+        if self.max_iterations == max_iterations {
+            return Ok(());
+        }
+        store::set_session_max_iterations(&self.conn, &self.id, max_iterations.map(|n| n as i64))?;
+        self.max_iterations = max_iterations;
+        Ok(())
+    }
+
+    /// This session's `/max-iterations` override, if one is set.
+    pub fn max_iterations(&self) -> Option<usize> {
+        self.max_iterations
+    }
+
+    /// Switches the sampling temperature for subsequent turns and records
+    /// it. `None` clears the override, falling back to the configured
+    /// default.
+    pub fn set_temperature(&mut self, temperature: Option<f32>) -> Result<()> {
+        if self.temperature == temperature {
+            return Ok(());
+        }
+        store::set_session_temperature(&self.conn, &self.id, temperature.map(|n| n as f64))?;
+        self.temperature = temperature;
+        Ok(())
+    }
+
+    /// This session's `/temperature` override, if one is set.
+    pub fn temperature(&self) -> Option<f32> {
+        self.temperature
+    }
+
+    /// Switches this session's tool-approval gates and records them.
+    pub fn set_approval(&mut self, approval: ApprovalSettings) -> Result<()> {
+        if self.approval == approval {
+            return Ok(());
+        }
+        store::set_session_approval(&self.conn, &self.id, &approval)?;
+        self.approval = approval;
+        Ok(())
+    }
+
+    /// This session's current tool-approval gates.
+    pub fn approval(&self) -> &ApprovalSettings {
+        &self.approval
+    }
+
+    /// The session's current title — "Untitled" until the first user
+    /// message names it.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Sets the title explicitly — naming a new session up front, or
+    /// renaming an existing one. Marks it as no longer eligible for the
+    /// usual derive-from-first-message step, so a later `persist_pending`
+    /// won't silently overwrite a name that was actually chosen.
+    pub fn set_title(&mut self, title: String) -> Result<()> {
+        store::set_session_title(&self.conn, &self.id, &title)?;
+        self.title = title;
+        self.title_set = true;
         Ok(())
     }
 
@@ -116,7 +283,6 @@ impl ChatSession {
     /// The effort level new turns are recorded with. Callers that already
     /// hold the config value don't need this; one handed a session alone
     /// does.
-    #[allow(dead_code)]
     pub fn effort_level(&self) -> Option<&str> {
         self.effort_level.as_deref()
     }
@@ -187,7 +353,10 @@ impl ChatSession {
         if !self.title_set && self.messages.iter().any(|m| m.role == "user") {
             let title = store::derive_title(&self.messages);
             match store::set_session_title(&self.conn, &self.id, &title) {
-                Ok(()) => self.title_set = true,
+                Ok(()) => {
+                    self.title = title;
+                    self.title_set = true;
+                }
                 Err(e) => {
                     first_error.get_or_insert(e);
                 }
@@ -237,12 +406,19 @@ mod tests {
         conn.execute_batch(
             "
             CREATE TABLE sessions (
-                id          TEXT PRIMARY KEY,
-                title       TEXT NOT NULL,
-                model       TEXT NOT NULL,
-                kind        TEXT NOT NULL,
-                created_at  INTEGER NOT NULL,
-                updated_at  INTEGER NOT NULL
+                id              TEXT PRIMARY KEY,
+                title           TEXT NOT NULL,
+                model           TEXT NOT NULL,
+                kind            TEXT NOT NULL,
+                effort_level    TEXT,
+                verbose         INTEGER NOT NULL DEFAULT 0,
+                max_iterations  INTEGER,
+                temperature     REAL,
+                approval_read      INTEGER NOT NULL DEFAULT 1,
+                approval_write     INTEGER NOT NULL DEFAULT 1,
+                approval_terminal  INTEGER NOT NULL DEFAULT 1,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL
             );
             CREATE TABLE messages (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -263,6 +439,7 @@ mod tests {
             "test-model".to_string(),
             KIND_CHAT,
             Some("high".to_string()),
+            ApprovalSettings::default(),
         )
         .unwrap()
     }
@@ -348,6 +525,193 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.model, "second-model");
+    }
+
+    fn count_agent_system_prompts(session: &ChatSession) -> usize {
+        session
+            .messages()
+            .iter()
+            .filter(|m| {
+                m.role == "system" && m.content.as_deref() == Some(AGENT_CHAT_SYSTEM_PROMPT)
+            })
+            .count()
+    }
+
+    #[test]
+    fn set_agentic_persists_the_kind_and_seeds_the_system_prompt_once() {
+        let mut session = memory_session();
+        assert!(!session.is_agentic());
+
+        session.set_agentic(true).unwrap();
+        assert!(session.is_agentic());
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.kind, crate::store::KIND_AGENT_CHAT);
+        assert_eq!(count_agent_system_prompts(&session), 1);
+
+        // Turning it on again (already on) must not seed a second copy.
+        session.set_agentic(true).unwrap();
+        assert_eq!(count_agent_system_prompts(&session), 1);
+    }
+
+    #[test]
+    fn set_agentic_off_leaves_prior_history_alone() {
+        let mut session = memory_session();
+        session.set_agentic(true).unwrap();
+        session.push_user("hello".to_string());
+        session.persist_pending().unwrap();
+        let messages_before = session.messages().len();
+
+        session.set_agentic(false).unwrap();
+        assert!(!session.is_agentic());
+        // The system prompt from turning agentic on stays; nothing is
+        // stripped from history on the way back to plain mode.
+        assert_eq!(session.messages().len(), messages_before);
+
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.kind, crate::store::KIND_CHAT);
+    }
+
+    #[test]
+    fn set_effort_level_persists_and_clears() {
+        let mut session = memory_session();
+        assert_eq!(session.effort_level(), Some("high"));
+
+        session.set_effort_level(Some("low".to_string())).unwrap();
+        assert_eq!(session.effort_level(), Some("low"));
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.effort_level, Some("low".to_string()));
+
+        session.set_effort_level(None).unwrap();
+        assert_eq!(session.effort_level(), None);
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.effort_level, None);
+    }
+
+    #[test]
+    fn set_verbose_persists_so_a_later_resume_picks_it_up() {
+        let mut session = memory_session();
+        assert!(!session.verbose());
+
+        session.set_verbose(true).unwrap();
+        assert!(session.verbose());
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert!(summary.verbose);
+    }
+
+    #[test]
+    fn set_max_iterations_persists_and_clears() {
+        let mut session = memory_session();
+        assert_eq!(session.max_iterations(), None);
+
+        session.set_max_iterations(Some(30)).unwrap();
+        assert_eq!(session.max_iterations(), Some(30));
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.max_iterations, Some(30));
+
+        session.set_max_iterations(None).unwrap();
+        assert_eq!(session.max_iterations(), None);
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.max_iterations, None);
+    }
+
+    #[test]
+    fn set_temperature_persists_and_clears() {
+        let mut session = memory_session();
+        assert_eq!(session.temperature(), None);
+
+        session.set_temperature(Some(1.5)).unwrap();
+        assert_eq!(session.temperature(), Some(1.5));
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.temperature, Some(1.5));
+
+        session.set_temperature(None).unwrap();
+        assert_eq!(session.temperature(), None);
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.temperature, None);
+    }
+
+    #[test]
+    fn set_approval_persists_and_updates_the_summary() {
+        let mut session = memory_session();
+        assert_eq!(*session.approval(), ApprovalSettings::default());
+
+        let custom = ApprovalSettings {
+            read_disk: true,
+            write_disk: false,
+            terminal: false,
+        };
+        session.set_approval(custom.clone()).unwrap();
+        assert_eq!(*session.approval(), custom);
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.approval, custom);
+    }
+
+    #[test]
+    fn title_tracks_live_once_derived_from_the_first_message() {
+        let mut session = memory_session();
+        assert_eq!(session.title(), "Untitled");
+
+        session.push_user("Write me a snake game".to_string());
+        session.persist_pending().unwrap();
+        assert_eq!(session.title(), "Write me a snake game");
+    }
+
+    #[test]
+    fn set_title_persists_and_blocks_later_auto_derivation() {
+        let mut session = memory_session();
+        session.set_title("My chosen title".to_string()).unwrap();
+        assert_eq!(session.title(), "My chosen title");
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.title, "My chosen title");
+
+        // A later user message must not clobber the chosen title.
+        session.push_user("hello".to_string());
+        session.persist_pending().unwrap();
+        assert_eq!(session.title(), "My chosen title");
+    }
+
+    #[test]
+    fn resume_picks_up_the_persisted_title_verbose_max_iterations_and_temperature() {
+        let mut session = memory_session();
+        session.push_user("hello".to_string());
+        session.persist_pending().unwrap();
+        session.set_verbose(true).unwrap();
+        session.set_max_iterations(Some(30)).unwrap();
+        session.set_temperature(Some(1.5)).unwrap();
+
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        let ChatSession { conn, .. } = session;
+
+        let (resumed, _) =
+            ChatSession::resume(conn, &summary, summary.model.clone(), None).unwrap();
+        assert_eq!(resumed.title(), "hello");
+        assert!(resumed.verbose());
+        assert_eq!(resumed.max_iterations(), Some(30));
+        assert_eq!(resumed.temperature(), Some(1.5));
     }
 
     #[test]

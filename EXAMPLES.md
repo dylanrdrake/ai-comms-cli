@@ -125,7 +125,7 @@ comms agent "Create an implementation of the A* pathfinding algorithm in Rust" -
 ### Adaptive routing (default)
 
 ```bash
-comms agent "Generate Rust boilerplate code for a web API" -m orcarouter/auto
+comms agent "Generate Rust boilerplate code for a web API" -m openrouter/auto
 ```
 
 ## Interactive Chat
@@ -133,23 +133,23 @@ comms agent "Generate Rust boilerplate code for a web API" -m orcarouter/auto
 ### Have a Rust programming conversation
 
 ```bash
-comms chat
-# You: What's the best way to handle errors in Rust?
-# Assistant: [response about Result and ?]
-# You: Can you show me an example?
-# Assistant: [code example]
-# You: exit
+comms session
+# ❯ What's the best way to handle errors in Rust?
+# [response about Result and ?]
+# ❯ Can you show me an example?
+# [code example]
+# ❯ exit
 ```
 
 ### Get design advice
 
 ```bash
-comms chat
-# You: Should I use a trait or a struct for this?
-# Assistant: [design discussion]
-# You: What about performance?
-# Assistant: [performance analysis]
-# You: exit
+comms session
+# ❯ Should I use a trait or a struct for this?
+# [design discussion]
+# ❯ What about performance?
+# [performance analysis]
+# ❯ exit
 ```
 
 ## Advanced Scenarios
@@ -219,36 +219,47 @@ comms agent "Create parallel.rs with a multi-threaded or async implementation fo
 ### Iterate on a project across multiple prompts
 
 ```bash
-comms agent-chat
-You: Create a Cargo project for a CLI todo app with add/list/done commands
-You: Now add a --priority flag to the add subcommand
-You: Read src/main.rs back to me and suggest one refactor
+comms session
+❯ /agent
+❯ Create a Cargo project for a CLI todo app with add/list/done commands
+❯ Now add a --priority flag to the add subcommand
+❯ Read src/main.rs back to me and suggest one refactor
 # Type exit to quit
 ```
 
-Each prompt is answered with the full agent tool loop (reading/writing files, running commands), and the whole conversation — including tool results — stays in context for the next prompt, so you can build on prior turns instead of restating everything in one `comms agent` call.
+Every new session starts in plain ask mode; `/agent` turns on tool-calling
+(reading/writing files, running commands) for the rest of it, `/ask` turns it
+back off. Each prompt in agent mode is answered with the full agent tool
+loop, and the whole conversation — including tool results — stays in context
+for the next prompt, so you can build on prior turns instead of restating
+everything in one `comms agent` call.
 
 ### Resume a saved session later
 
 ```bash
 comms sessions list
-#   a1b2c3d4  [agent_chat]  orcarouter/auto  Create a Cargo project for a CLI todo app...
+#   a1b2c3d4  [agent_chat]  openrouter/auto  Create a Cargo project for a CLI todo app...
 
-comms agent-chat --resume a1b2c3d4
+comms session --resume a1b2c3d4
 # prints the prior transcript, then drops you back into the prompt
 ```
 
 Don't remember the id? Leave `--resume` bare and pick from a list instead:
 
 ```bash
-comms agent-chat --resume
+comms session --resume
 # Select a session to resume:
 #   1. a1b2c3d4  Create a Cargo project for a CLI todo app...
 #   2. f9e8d7c6  Refactor the auth middleware
 # Session number: 1
 ```
 
-`chat` and `agent-chat` sessions are saved automatically as you go, so this works even if you closed the terminal without typing `exit`. See the [Session Persistence](README.md#session-persistence) section of the README for details.
+A resumed session picks up in whichever mode (ask or agent) it was last in
+— that's just session state now, not a separate command. `session` and `tui`
+conversations are saved automatically as you go, so this works even if you
+closed the terminal without typing `exit`. See the [Session
+Persistence](README.md#session-persistence) section of the README for
+details.
 
 ## Tips & Tricks
 
@@ -266,6 +277,27 @@ comms agent "Complex multi-file project setup" --max-iterations 30
 
 # Or raise the persistent default so every agent call gets more room
 comms max-iterations 30
+
+# Or, inside a session, just for that one session
+comms session
+❯ /max-iterations 30
+```
+
+### Skip approval prompts for a trusted task
+
+```bash
+# Auto-approve everything for a one-off agent call (use with caution)
+comms approval all off
+comms agent "Refactor the whole src/ directory"
+comms approval all on
+
+# Or, inside a session, just for that one session
+comms session
+❯ /agent
+❯ /approval all off
+
+# Check what a session's gates are currently set to
+❯ /approval
 ```
 
 ### Set a reasoning effort level
@@ -281,20 +313,24 @@ comms effort-level low
 
 Once set, response labels show the effort level alongside the model, e.g. `anthropic/claude-opus-4.5 (high):`, so it's clear which effort level produced the output.
 
+### Set a sampling temperature
+
+```bash
+# Override for a single call
+comms agent "Complex multi-file project setup" --temperature 0.3
+
+# Or raise the persistent default so every call is more consistent
+comms temperature 0.3
+
+# Or, inside a session, just for that one session (/temp also works)
+comms session
+❯ /temp 1.2
+```
+
 ### Chain operations
 
 ```bash
 comms agent "List files in src/, then read src/main.rs, then create a refactored version"
-```
-
-### Experiment with temperature
-
-```bash
-# More consistent (default)
-comms agent "Generate function" -m orcarouter/auto -t 0.5
-
-# More creative
-comms agent "Generate function" -m orcarouter/auto -t 1.5
 ```
 
 ## Workflow Examples

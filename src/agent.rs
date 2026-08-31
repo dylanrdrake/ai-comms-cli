@@ -33,12 +33,18 @@ fn requires_approval(tool_name: &str, approval: &ApprovalSettings) -> bool {
     }
 }
 
+// Every parameter here is a distinct, independently-overridable request
+// setting (model, iteration cap, temperature, approval gates, effort) —
+// bundling them into a struct wouldn't simplify anything, just move the
+// same list one level out.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent(
     client: &Client,
     ui: &mut impl AgentUi,
     task: &str,
     model: &str,
     max_iterations: usize,
+    temperature: f32,
     approval: &ApprovalSettings,
     effort_level: Option<String>,
 ) -> Result<Option<String>> {
@@ -55,6 +61,7 @@ pub async fn run_agent(
         &mut messages,
         model,
         max_iterations,
+        temperature,
         approval,
         effort_level,
     )
@@ -73,11 +80,18 @@ async fn request_turn(
     ui: &mut impl AgentUi,
     messages: Vec<ChatMessage>,
     model: &str,
+    temperature: f32,
     tools: Option<Vec<serde_json::Value>>,
     effort_level: Option<String>,
 ) -> Result<ChatMessage> {
     if client.streaming_enabled() {
-        let stream = client.chat_stream(model.to_string(), messages, 0.7, tools, effort_level);
+        let stream = client.chat_stream(
+            model.to_string(),
+            messages,
+            temperature,
+            tools,
+            effort_level,
+        );
         pin_mut!(stream);
 
         let mut assembled = None;
@@ -93,7 +107,13 @@ async fn request_turn(
         assembled.ok_or_else(|| anyhow::anyhow!("Response stream ended without a message"))
     } else {
         let response = client
-            .chat(model.to_string(), messages, 0.7, tools, effort_level)
+            .chat(
+                model.to_string(),
+                messages,
+                temperature,
+                tools,
+                effort_level,
+            )
             .await?;
         response
             .choices
@@ -113,6 +133,7 @@ pub async fn run_chat_turn(
     ui: &mut impl AgentUi,
     messages: &mut Vec<ChatMessage>,
     model: &str,
+    temperature: f32,
     effort_level: Option<String>,
 ) -> Result<Option<String>> {
     ui.event(AgentEvent::RequestStarted).await;
@@ -121,6 +142,7 @@ pub async fn run_chat_turn(
         ui,
         messages.clone(),
         model,
+        temperature,
         None,
         effort_level.clone(),
     )
@@ -154,12 +176,15 @@ pub async fn run_chat_turn(
 /// Progress is reported to `ui` rather than printed, and any tool needing
 /// permission is put to `ui` as an [`ApprovalRequest`], so the same loop
 /// drives the CLI, a GUI, or a test harness unchanged.
+// See `run_agent`'s note on why this isn't bundled into a params struct.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_turn(
     client: &Client,
     ui: &mut impl AgentUi,
     messages: &mut Vec<ChatMessage>,
     model: &str,
     max_iterations: usize,
+    temperature: f32,
     approval: &ApprovalSettings,
     effort_level: Option<String>,
 ) -> Result<Option<String>> {
@@ -179,6 +204,7 @@ pub async fn run_agent_turn(
             ui,
             messages.clone(),
             model,
+            temperature,
             Some(tool_definitions.clone()),
             effort_level.clone(),
         )

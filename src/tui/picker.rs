@@ -46,8 +46,7 @@ impl SessionRow {
 /// A row on the launch screen.
 #[derive(Debug, Clone)]
 pub enum LaunchItem {
-    NewChat,
-    NewAgentChat,
+    NewSession,
     Resume(SessionRow),
     BrowseAll,
 }
@@ -55,8 +54,7 @@ pub enum LaunchItem {
 /// What choosing a row means to the caller.
 #[derive(Debug, Clone)]
 pub enum Activation {
-    NewChat,
-    NewAgentChat,
+    NewSession,
     Resume(SessionRow),
     BrowseAll,
     Delete(SessionRow),
@@ -71,13 +69,16 @@ pub struct Picker {
     /// Set while a delete is awaiting y/n confirmation, since dropping a
     /// saved conversation shouldn't be one keystroke away.
     pub confirming_delete: Option<SessionRow>,
+    /// Set while a rename is in progress: the row being renamed, and the
+    /// text typed so far (pre-filled with its current title).
+    pub renaming: Option<(SessionRow, String)>,
 }
 
 impl Picker {
     /// The launch screen: start something new, jump back into recent work,
     /// or go browse everything.
     pub fn launch(recent: Vec<SessionRow>) -> Self {
-        let mut items = vec![LaunchItem::NewChat, LaunchItem::NewAgentChat];
+        let mut items = vec![LaunchItem::NewSession];
         items.extend(
             recent
                 .into_iter()
@@ -89,6 +90,7 @@ impl Picker {
             items,
             selected: 0,
             confirming_delete: None,
+            renaming: None,
         }
     }
 
@@ -98,6 +100,7 @@ impl Picker {
             items: all.into_iter().map(LaunchItem::Resume).collect(),
             selected: 0,
             confirming_delete: None,
+            renaming: None,
         }
     }
 
@@ -123,8 +126,7 @@ impl Picker {
     /// What the currently selected row does when chosen.
     pub fn activate(&self) -> Option<Activation> {
         match self.items.get(self.selected)? {
-            LaunchItem::NewChat => Some(Activation::NewChat),
-            LaunchItem::NewAgentChat => Some(Activation::NewAgentChat),
+            LaunchItem::NewSession => Some(Activation::NewSession),
             LaunchItem::BrowseAll => Some(Activation::BrowseAll),
             LaunchItem::Resume(row) => Some(Activation::Resume(row.clone())),
         }
@@ -152,6 +154,60 @@ impl Picker {
             self.selected = self.items.len().saturating_sub(1);
         }
     }
+
+    /// Begins renaming the selected session, pre-filling the input with its
+    /// current title so it can be edited rather than retyped from scratch.
+    /// Only meaningful on a session row.
+    pub fn begin_rename(&mut self) {
+        if let Some(row) = self.selected_session() {
+            self.renaming = Some((row.clone(), row.title.clone()));
+        }
+    }
+
+    pub fn rename_insert_char(&mut self, c: char) {
+        if let Some((_, input)) = &mut self.renaming {
+            input.push(c);
+        }
+    }
+
+    pub fn rename_backspace(&mut self) {
+        if let Some((_, input)) = &mut self.renaming {
+            input.pop();
+        }
+    }
+
+    /// Cancels an in-progress rename without saving anything.
+    pub fn cancel_rename(&mut self) {
+        self.renaming = None;
+    }
+
+    /// Confirms the rename, returning the session id and its new title to
+    /// persist. A blank (post-trim) title isn't meaningful, so it's
+    /// rejected rather than saved — the rename stays open for another try
+    /// instead of silently discarding it on a stray Enter.
+    pub fn confirm_rename(&mut self) -> Option<(String, String)> {
+        let (row, input) = self.renaming.as_ref()?;
+        let title = input.trim().to_string();
+        if title.is_empty() {
+            return None;
+        }
+        let id = row.id.clone();
+        self.renaming = None;
+        Some((id, title))
+    }
+
+    /// Reflects a persisted rename in the row itself, so the list shows it
+    /// without a reload.
+    pub fn apply_rename(&mut self, id: &str, title: String) {
+        for item in &mut self.items {
+            if let LaunchItem::Resume(row) = item {
+                if row.id == id {
+                    row.title = title;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str) {
@@ -169,17 +225,10 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str) {
 
         let mut spans = vec![Span::styled(marker, Style::new().cyan().bold())];
         match item {
-            LaunchItem::NewChat => {
-                spans.push(Span::styled("New chat", base.green()));
+            LaunchItem::NewSession => {
+                spans.push(Span::styled("New session", base.green()));
                 spans.push(Span::styled(
-                    "  plain conversation",
-                    Style::new().dark_gray(),
-                ));
-            }
-            LaunchItem::NewAgentChat => {
-                spans.push(Span::styled("New agent chat", base.green()));
-                spans.push(Span::styled(
-                    "  with tools (read/write files, run commands)",
+                    "  starts in ask mode; /agent enables tools",
                     Style::new().dark_gray(),
                 ));
             }
@@ -217,10 +266,16 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str) {
         )));
     }
 
-    // A pending delete takes over the hint line, so the question is right
-    // where the answer gets typed.
-    let footer = match &picker.confirming_delete {
-        Some(row) => Line::from(vec![
+    // A pending delete or rename takes over the hint line, so the question
+    // (or the text being typed) is right where the answer goes.
+    let footer = if let Some((_, input)) = &picker.renaming {
+        Line::from(vec![
+            Span::styled(" rename to: ", Style::new().yellow().bold()),
+            Span::raw(input.clone()),
+            Span::styled("▏", Style::new().yellow()),
+        ])
+    } else if let Some(row) = &picker.confirming_delete {
+        Line::from(vec![
             Span::styled(
                 format!(
                     " delete session {} ({})? ",
@@ -230,8 +285,9 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str) {
                 Style::new().red().bold(),
             ),
             Span::styled("y / n", Style::new().red()),
-        ]),
-        None => Line::from(Span::styled(format!(" {hint}"), Style::new().dark_gray())),
+        ])
+    } else {
+        Line::from(Span::styled(format!(" {hint}"), Style::new().dark_gray()))
     };
 
     frame.render_widget(
@@ -243,6 +299,38 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str) {
         areas[0],
     );
     frame.render_widget(Paragraph::new(footer), areas[1]);
+}
+
+/// The prompt shown before a new session is created, so it starts with a
+/// real name instead of "Untitled". Leaving it blank falls back to the
+/// usual behavior: derived from the first message once there is one.
+pub fn draw_naming(frame: &mut Frame, input: &str) {
+    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
+
+    let lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  Session title  ", Style::new().dark_gray()),
+            Span::raw(input.to_string()),
+            Span::styled("▏", Style::new().yellow()),
+        ]),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(" comms ", Style::new().bold())),
+        ),
+        areas[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Enter continue (blank uses the default) · Esc cancel",
+            Style::new().dark_gray(),
+        ))),
+        areas[1],
+    );
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -288,10 +376,9 @@ mod tests {
     }
 
     #[test]
-    fn launch_offers_both_new_modes_and_a_browse_entry() {
+    fn launch_offers_a_new_session_and_a_browse_entry() {
         let picker = Picker::launch(vec![]);
-        assert!(matches!(picker.items[0], LaunchItem::NewChat));
-        assert!(matches!(picker.items[1], LaunchItem::NewAgentChat));
+        assert!(matches!(picker.items[0], LaunchItem::NewSession));
         assert!(matches!(picker.items.last(), Some(LaunchItem::BrowseAll)));
     }
 
@@ -323,9 +410,7 @@ mod tests {
     #[test]
     fn activating_each_row_type() {
         let mut picker = Picker::launch(vec![row("abcd1234", "agent_chat", "t")]);
-        assert!(matches!(picker.activate(), Some(Activation::NewChat)));
-        picker.move_down();
-        assert!(matches!(picker.activate(), Some(Activation::NewAgentChat)));
+        assert!(matches!(picker.activate(), Some(Activation::NewSession)));
         picker.move_down();
         match picker.activate() {
             Some(Activation::Resume(r)) => assert!(r.is_agentic()),
@@ -364,6 +449,66 @@ mod tests {
         let mut picker = Picker::launch(vec![row("abcd1234", "chat", "t")]);
         picker.begin_delete();
         assert!(picker.confirming_delete.is_none());
+    }
+
+    #[test]
+    fn rename_is_prefilled_and_editable() {
+        let mut picker = Picker::sessions(vec![row("abcd1234", "chat", "old title")]);
+        picker.begin_rename();
+        let (row, input) = picker.renaming.as_ref().unwrap();
+        assert_eq!(row.id, picker.selected_session().unwrap().id);
+        assert_eq!(input, "old title");
+
+        picker.rename_backspace();
+        picker.rename_backspace();
+        for c in "le".chars() {
+            picker.rename_insert_char(c);
+        }
+        assert_eq!(picker.renaming.as_ref().unwrap().1, "old title");
+    }
+
+    #[test]
+    fn confirming_a_rename_updates_the_row_and_clears_the_state() {
+        let mut picker = Picker::sessions(vec![row("abcd1234", "chat", "old title")]);
+        let id = picker.selected_session().unwrap().id.clone();
+        picker.begin_rename();
+        for c in " v2".chars() {
+            picker.rename_insert_char(c);
+        }
+
+        let confirmed = picker.confirm_rename();
+        assert_eq!(confirmed, Some((id.clone(), "old title v2".to_string())));
+        assert!(picker.renaming.is_none());
+
+        picker.apply_rename(&id, "old title v2".to_string());
+        assert_eq!(picker.selected_session().unwrap().title, "old title v2");
+    }
+
+    #[test]
+    fn a_blank_rename_is_rejected_and_stays_open() {
+        let mut picker = Picker::sessions(vec![row("abcd1234", "chat", "t")]);
+        picker.begin_rename();
+        picker.rename_backspace();
+        assert_eq!(picker.confirm_rename(), None);
+        // Still editable, not silently dropped.
+        assert!(picker.renaming.is_some());
+    }
+
+    #[test]
+    fn cancelling_a_rename_leaves_the_title_alone() {
+        let mut picker = Picker::sessions(vec![row("abcd1234", "chat", "old title")]);
+        picker.begin_rename();
+        picker.rename_insert_char('!');
+        picker.cancel_rename();
+        assert!(picker.renaming.is_none());
+        assert_eq!(picker.selected_session().unwrap().title, "old title");
+    }
+
+    #[test]
+    fn rename_is_a_no_op_on_a_non_session_row() {
+        let mut picker = Picker::launch(vec![row("abcd1234", "chat", "t")]);
+        picker.begin_rename();
+        assert!(picker.renaming.is_none());
     }
 
     #[test]

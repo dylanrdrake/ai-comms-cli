@@ -26,8 +26,9 @@ use crate::ui::{parse_yes_no, response_label};
 use anyhow::Result;
 use app::{App, Focus, TranscriptItem};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream, KeyCode,
-    KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::{execute, terminal};
 use futures_util::StreamExt;
@@ -51,17 +52,18 @@ pub struct Context {
     pub model_override: Option<String>,
     pub effort_level: Option<String>,
     pub max_iterations: usize,
+    pub temperature: f32,
     pub approval: ApprovalSettings,
-    /// Mirrors the plain CLI's `-v`: shows tool call arguments and results.
-    pub verbose: bool,
 }
 
 /// Where the TUI opens.
 pub enum Start {
     /// The launch screen (bare `comms tui`).
     Launch,
-    /// Straight into a new conversation (`--chat` / `--agent`).
-    New { agentic: bool },
+    /// Straight into a new session (`--session`), starting in ask mode —
+    /// same as choosing "New session" on the launch screen, minus the
+    /// naming prompt.
+    New,
     /// Straight into a saved session (`--resume`).
     Resume(Box<SessionSummary>),
 }
@@ -69,6 +71,11 @@ pub enum Start {
 enum Screen {
     Launch(Picker),
     Sessions(Picker),
+    /// Naming a new session before it's created — reached by choosing "New
+    /// session" on the launch screen.
+    NameSession {
+        input: String,
+    },
     Chat(Box<Chat>),
 }
 
@@ -81,7 +88,7 @@ struct Chat {
 pub async fn run(context: Context, start: Start) -> Result<()> {
     let mut screen = match start {
         Start::Launch => Screen::Launch(Picker::launch(load_sessions()?)),
-        Start::New { agentic } => Screen::Chat(Box::new(open_new(&context, agentic)?)),
+        Start::New => Screen::Chat(Box::new(open_new(&context, false, None)?)),
         Start::Resume(summary) => Screen::Chat(Box::new(open_resumed(&context, &summary)?)),
     };
 
@@ -107,15 +114,23 @@ fn load_sessions() -> Result<Vec<SessionRow>> {
 /// Each conversation gets its own database handle, so sessions can be
 /// opened and closed over the life of the TUI without threading one
 /// connection through every screen.
-fn open_new(context: &Context, agentic: bool) -> Result<Chat> {
+fn open_new(context: &Context, agentic: bool, title: Option<String>) -> Result<Chat> {
     let kind = if agentic { KIND_AGENT_CHAT } else { KIND_CHAT };
     let model = context
         .model_override
         .clone()
         .unwrap_or_else(|| context.default_model.clone());
 
-    let mut session =
-        ChatSession::create(store::open_db()?, model, kind, context.effort_level.clone())?;
+    let mut session = ChatSession::create(
+        store::open_db()?,
+        model,
+        kind,
+        context.effort_level.clone(),
+        context.approval.clone(),
+    )?;
+    if let Some(title) = title {
+        session.set_title(title)?;
+    }
     if agentic {
         session.push_and_persist(ChatMessage {
             role: "system".to_string(),
@@ -129,18 +144,28 @@ fn open_new(context: &Context, agentic: bool) -> Result<Chat> {
 }
 
 fn open_resumed(context: &Context, summary: &SessionSummary) -> Result<Chat> {
-    let model = context
-        .model_override
+    // Prefer this session's own persisted effort — a real `/effort` switch
+    // — over the general configured default, the same way its model does.
+    let effort_level = summary
+        .effort_level
         .clone()
-        .unwrap_or_else(|| summary.model.clone());
+        .or_else(|| context.effort_level.clone());
     let (session, history) = ChatSession::resume(
         store::open_db()?,
         summary,
-        model,
-        context.effort_level.clone(),
+        summary.model.clone(),
+        effort_level,
     )?;
     let agentic = summary.kind == KIND_AGENT_CHAT;
-    Ok(start_chat(context, session, history, agentic))
+    let mut chat = start_chat(context, session, history, agentic);
+    // A resumed session keeps its own saved settings; `-m` (like any other
+    // override flag) only ever applies to a brand new one.
+    if context.model_override.is_some() {
+        chat.app.transcript.push(TranscriptItem::Notice(
+            "Ignoring --model: resumed sessions keep their saved model".to_string(),
+        ));
+    }
+    Ok(chat)
 }
 
 fn open_row(context: &Context, row: &SessionRow) -> Result<Chat> {
@@ -158,18 +183,22 @@ fn start_chat(
 ) -> Chat {
     let mut app = App::new(
         session.model().to_string(),
-        context.effort_level.clone(),
+        session.effort_level().map(str::to_string),
         session.short_id().to_string(),
     );
     app.agentic = agentic;
-    app.verbose = context.verbose;
+    app.verbose = session.verbose();
+    app.max_iterations = session.max_iterations();
+    app.temperature = session.temperature();
+    app.approval = session.approval().clone();
+    app.title = session.title().to_string();
     seed_transcript(&mut app, &history);
 
     let conversation = Conversation::spawn(
         Arc::clone(&context.client),
         session,
         context.max_iterations,
-        context.approval.clone(),
+        context.temperature,
         agentic,
     );
     Chat { app, conversation }
@@ -222,7 +251,14 @@ fn enter() -> Result<Tui> {
     // Without this, a terminal delivers a paste as plain keystrokes, and
     // any embedded newline reads as a real Enter — submitting each pasted
     // line as its own message instead of landing in the input box as text.
-    execute!(stdout, terminal::EnterAlternateScreen, EnableBracketedPaste)?;
+    // Mouse capture is what lets the scroll wheel move the transcript
+    // instead of the terminal's own (unrelated) native scrollback.
+    execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
 
     // A panic while in raw mode would otherwise leave the terminal unusable
     // with no echo and no cursor, so restore first, then panic normally.
@@ -232,6 +268,7 @@ fn enter() -> Result<Tui> {
         let _ = execute!(
             io::stdout(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             terminal::LeaveAlternateScreen
         );
         previous(info);
@@ -245,6 +282,7 @@ fn leave(terminal: &mut Tui) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         terminal::LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -275,8 +313,9 @@ fn draw(terminal: &mut Tui, screen: &Screen, tick: usize) -> Result<()> {
             frame,
             p,
             "sessions",
-            "↑/↓ move · Enter resume · d delete · Esc back · q quit",
+            "↑/↓ move · Enter resume · r rename · d delete · Esc back · q quit",
         ),
+        Screen::NameSession { input } => picker::draw_naming(frame, input),
         Screen::Chat(chat) => render::draw(frame, &chat.app, tick),
     })?;
     Ok(())
@@ -310,6 +349,12 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
                 dirty = true;
             }
             Wake::Key(TermEvent::Resize(_, _)) => dirty = true,
+            Wake::Key(TermEvent::Mouse(mouse)) => {
+                if let Screen::Chat(chat) = screen {
+                    handle_mouse_scroll(&mut chat.app, mouse);
+                    dirty = true;
+                }
+            }
             Wake::Key(_) => {}
             Wake::Conversation(Some(event)) => {
                 if let Screen::Chat(chat) = screen {
@@ -344,6 +389,7 @@ async fn handle_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> Re
 
     match screen {
         Screen::Launch(_) | Screen::Sessions(_) => handle_picker_key(context, screen, key).await,
+        Screen::NameSession { .. } => handle_naming_key(context, screen, key),
         Screen::Chat(chat) => {
             if handle_chat_key(&mut chat.app, &chat.conversation, key) {
                 // Leaving the conversation: stop its worker before the
@@ -369,6 +415,24 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
         unreachable!("picker screens only")
     };
 
+    // A pending rename swallows everything until it's answered.
+    if p.renaming.is_some() {
+        match key.code {
+            KeyCode::Esc => p.cancel_rename(),
+            KeyCode::Enter => {
+                if let Some((id, title)) = p.confirm_rename() {
+                    let conn = store::open_db()?;
+                    store::set_session_title(&conn, &id, &title)?;
+                    p.apply_rename(&id, title);
+                }
+            }
+            KeyCode::Backspace => p.rename_backspace(),
+            KeyCode::Char(c) => p.rename_insert_char(c),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
     // A pending delete swallows everything until it's answered.
     if p.confirming_delete.is_some() {
         let action = match key.code {
@@ -387,6 +451,7 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Up | KeyCode::Char('k') => p.move_up(),
         KeyCode::Down | KeyCode::Char('j') => p.move_down(),
+        KeyCode::Char('r') if is_sessions => p.begin_rename(),
         KeyCode::Char('d') if is_sessions => p.begin_delete(),
         KeyCode::Esc if is_sessions => {
             *screen = Screen::Launch(Picker::launch(load_sessions()?));
@@ -396,9 +461,10 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
                 return Ok(false);
             };
             match activation {
-                Activation::NewChat => *screen = Screen::Chat(Box::new(open_new(context, false)?)),
-                Activation::NewAgentChat => {
-                    *screen = Screen::Chat(Box::new(open_new(context, true)?))
+                Activation::NewSession => {
+                    *screen = Screen::NameSession {
+                        input: String::new(),
+                    }
                 }
                 Activation::Resume(row) => {
                     *screen = Screen::Chat(Box::new(open_row(context, &row)?))
@@ -413,6 +479,49 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
         _ => {}
     }
     Ok(false)
+}
+
+/// Handles a keypress on the new-session naming prompt. Returns whether the
+/// TUI should exit (always `false` — quitting from here isn't supported,
+/// same as any other picker screen).
+fn handle_naming_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> Result<bool> {
+    let Screen::NameSession { input } = screen else {
+        unreachable!("naming screen only")
+    };
+
+    match key.code {
+        KeyCode::Esc => *screen = Screen::Launch(Picker::launch(load_sessions()?)),
+        KeyCode::Enter => {
+            let title = input.trim();
+            let title = (!title.is_empty()).then(|| title.to_string());
+            *screen = Screen::Chat(Box::new(open_new(context, false, title)?));
+        }
+        KeyCode::Backspace => {
+            input.pop();
+        }
+        KeyCode::Char(c) => input.push(c),
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// How many transcript lines one wheel notch moves — a finer step than
+/// PageUp/PageDown's 5, since a notch is closer to a nudge than a page.
+const MOUSE_SCROLL_STEP: u16 = 3;
+
+/// Scrolls the transcript with the wheel, the mouse counterpart to
+/// PageUp/PageDown. Left `app.scroll_back` untouched (and the input box
+/// alone) for any other mouse event — clicks aren't wired to anything yet.
+fn handle_mouse_scroll(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_back = app.scroll_back.saturating_add(MOUSE_SCROLL_STEP);
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_back = app.scroll_back.saturating_sub(MOUSE_SCROLL_STEP);
+        }
+        _ => {}
+    }
 }
 
 /// Handles a keypress in the conversation. Returns whether to leave it and
@@ -461,6 +570,30 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                     app::Submission::ShowModel => {
                         conversation.send(Command::SetModel(app.model.clone()))
                     }
+                    app::Submission::SetAgentic(agentic) => {
+                        conversation.send(Command::SetAgentic(agentic))
+                    }
+                    app::Submission::SetEffort(effort_level) => {
+                        conversation.send(Command::SetEffort(effort_level))
+                    }
+                    app::Submission::ToggleVerbose => conversation.send(Command::ToggleVerbose),
+                    app::Submission::SetMaxIterations(max_iterations) => {
+                        conversation.send(Command::SetMaxIterations(max_iterations))
+                    }
+                    app::Submission::SetTemperature(temperature) => {
+                        conversation.send(Command::SetTemperature(temperature))
+                    }
+                    app::Submission::SetApproval { category, enabled } => {
+                        conversation.send(Command::SetApproval { category, enabled })
+                    }
+                    // Purely a read of state the UI already holds — no need
+                    // to round-trip through the worker.
+                    app::Submission::ShowApproval => {
+                        app.transcript.push(TranscriptItem::ApprovalStatus {
+                            approval: app.approval.clone(),
+                            changed: false,
+                        });
+                    }
                 }
             }
         }
@@ -481,4 +614,50 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
         _ => {}
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn wheel_scrolls_the_transcript_by_a_wheel_step() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        assert_eq!(app.scroll_back, 0);
+
+        handle_mouse_scroll(&mut app, mouse(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll_back, MOUSE_SCROLL_STEP);
+
+        handle_mouse_scroll(&mut app, mouse(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll_back, MOUSE_SCROLL_STEP * 2);
+
+        handle_mouse_scroll(&mut app, mouse(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll_back, MOUSE_SCROLL_STEP);
+    }
+
+    #[test]
+    fn wheel_does_not_scroll_past_the_newest_message() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        handle_mouse_scroll(&mut app, mouse(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll_back, 0, "can't scroll below the newest content");
+    }
+
+    #[test]
+    fn other_mouse_events_are_ignored() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        handle_mouse_scroll(
+            &mut app,
+            mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left)),
+        );
+        assert_eq!(app.scroll_back, 0);
+    }
 }

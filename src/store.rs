@@ -1,5 +1,5 @@
 use crate::client::{ChatMessage, ToolCall};
-use crate::config::get_config_dir;
+use crate::config::{get_config_dir, ApprovalSettings};
 use crate::crypto;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -25,6 +25,21 @@ pub struct SessionSummary {
     pub title: String,
     pub model: String,
     pub kind: String,
+    /// The reasoning effort this session is currently set to, if it's ever
+    /// been changed from whatever the global default was at creation.
+    pub effort_level: Option<String>,
+    /// Whether this session's TUI view currently shows verbose tool detail.
+    pub verbose: bool,
+    /// The max tool-calling iterations per turn this session is currently
+    /// set to, if it's ever been changed from the configured default.
+    pub max_iterations: Option<i64>,
+    /// The sampling temperature this session is currently set to, if it's
+    /// ever been changed from the configured default.
+    pub temperature: Option<f64>,
+    /// This session's current tool-approval settings — a snapshot of the
+    /// configured default taken when it was created, mutable from inside
+    /// it with `/approval`.
+    pub approval: ApprovalSettings,
     /// Not surfaced by the CLI, but kept for sorting and display.
     #[allow(dead_code)]
     pub created_at: i64,
@@ -50,12 +65,19 @@ pub fn open_db() -> Result<Connection> {
         PRAGMA foreign_keys = ON;
 
         CREATE TABLE IF NOT EXISTS sessions (
-            id          TEXT PRIMARY KEY,
-            title       TEXT NOT NULL,
-            model       TEXT NOT NULL,
-            kind        TEXT NOT NULL,
-            created_at  INTEGER NOT NULL,
-            updated_at  INTEGER NOT NULL
+            id              TEXT PRIMARY KEY,
+            title           TEXT NOT NULL,
+            model           TEXT NOT NULL,
+            kind            TEXT NOT NULL,
+            effort_level    TEXT,
+            verbose         INTEGER NOT NULL DEFAULT 0,
+            max_iterations  INTEGER,
+            temperature     REAL,
+            approval_read      INTEGER NOT NULL DEFAULT 1,
+            approval_write     INTEGER NOT NULL DEFAULT 1,
+            approval_terminal  INTEGER NOT NULL DEFAULT 1,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS messages (
@@ -78,6 +100,31 @@ pub fn open_db() -> Result<Connection> {
     // them; back them onto any database created before this change.
     ensure_column(&conn, "messages", "model", "TEXT")?;
     ensure_column(&conn, "messages", "effort_level", "TEXT")?;
+
+    // Likewise for sessions gaining per-session effort/verbose/max-iterations
+    // overrides, so those can be switched mid-conversation and remembered.
+    ensure_column(&conn, "sessions", "effort_level", "TEXT")?;
+    ensure_column(&conn, "sessions", "verbose", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(&conn, "sessions", "max_iterations", "INTEGER")?;
+    ensure_column(&conn, "sessions", "temperature", "REAL")?;
+    ensure_column(
+        &conn,
+        "sessions",
+        "approval_read",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        &conn,
+        "sessions",
+        "approval_write",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        &conn,
+        "sessions",
+        "approval_terminal",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
 
     Ok(conn)
 }
@@ -123,14 +170,28 @@ pub fn derive_title(messages: &[ChatMessage]) -> String {
 }
 
 /// Creates a new session row and returns its id.
-pub fn create_session(conn: &Connection, model: &str, kind: &str) -> Result<String> {
+pub fn create_session(
+    conn: &Connection,
+    model: &str,
+    kind: &str,
+    approval: &ApprovalSettings,
+) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
     let ts = now();
     let title = crypto::encrypt("Untitled")?;
 
     conn.execute(
-        "INSERT INTO sessions (id, title, model, kind, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-        params![id, title, model, kind, ts],
+        "INSERT INTO sessions (id, title, model, kind, approval_read, approval_write, approval_terminal, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        params![
+            id,
+            title,
+            model,
+            kind,
+            approval.read_disk,
+            approval.write_disk,
+            approval.terminal,
+            ts
+        ],
     )?;
 
     Ok(id)
@@ -153,6 +214,87 @@ pub fn set_session_model(conn: &Connection, session_id: &str, model: &str) -> Re
     conn.execute(
         "UPDATE sessions SET model = ?1 WHERE id = ?2",
         params![model, session_id],
+    )?;
+    Ok(())
+}
+
+/// Records a session's current kind (`KIND_CHAT` / `KIND_AGENT_CHAT`), so
+/// switching between plain and agent mode mid-session sticks on resume and
+/// in `sessions list`, the same way [`set_session_model`] does for models.
+pub fn set_session_kind(conn: &Connection, session_id: &str, kind: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET kind = ?1 WHERE id = ?2",
+        params![kind, session_id],
+    )?;
+    Ok(())
+}
+
+/// Records a `/effort`-style override for this session's reasoning effort.
+/// `None` clears it back to following the configured default.
+pub fn set_session_effort_level(
+    conn: &Connection,
+    session_id: &str,
+    effort_level: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET effort_level = ?1 WHERE id = ?2",
+        params![effort_level, session_id],
+    )?;
+    Ok(())
+}
+
+/// Records a `/verbose`-style toggle for this session's TUI view.
+pub fn set_session_verbose(conn: &Connection, session_id: &str, verbose: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET verbose = ?1 WHERE id = ?2",
+        params![verbose, session_id],
+    )?;
+    Ok(())
+}
+
+/// Records a `/max-iterations`-style override for this session's tool-loop
+/// cap. `None` clears it back to following the configured default.
+pub fn set_session_max_iterations(
+    conn: &Connection,
+    session_id: &str,
+    max_iterations: Option<i64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET max_iterations = ?1 WHERE id = ?2",
+        params![max_iterations, session_id],
+    )?;
+    Ok(())
+}
+
+/// Records a `/temperature`-style override for this session's sampling
+/// temperature. `None` clears it back to following the configured default.
+pub fn set_session_temperature(
+    conn: &Connection,
+    session_id: &str,
+    temperature: Option<f64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET temperature = ?1 WHERE id = ?2",
+        params![temperature, session_id],
+    )?;
+    Ok(())
+}
+
+/// Records an `/approval`-style override for this session's tool-approval
+/// gates.
+pub fn set_session_approval(
+    conn: &Connection,
+    session_id: &str,
+    approval: &ApprovalSettings,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET approval_read = ?1, approval_write = ?2, approval_terminal = ?3 WHERE id = ?4",
+        params![
+            approval.read_disk,
+            approval.write_disk,
+            approval.terminal,
+            session_id
+        ],
     )?;
     Ok(())
 }
@@ -203,7 +345,9 @@ pub fn append_message(
 /// Lists all sessions, most recently updated first.
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, model, kind, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
+        "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
+         approval_read, approval_write, approval_terminal, created_at, updated_at \
+         FROM sessions ORDER BY updated_at DESC",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -212,8 +356,17 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
             title: row.get(1)?,
             model: row.get(2)?,
             kind: row.get(3)?,
-            created_at: row.get(4)?,
-            updated_at: row.get(5)?,
+            effort_level: row.get(4)?,
+            verbose: row.get(5)?,
+            max_iterations: row.get(6)?,
+            temperature: row.get(7)?,
+            approval: ApprovalSettings {
+                read_disk: row.get(8)?,
+                write_disk: row.get(9)?,
+                terminal: row.get(10)?,
+            },
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
         })
     })?;
 
@@ -229,7 +382,9 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
 /// Fetches a single session's summary by id (or id prefix, if unambiguous).
 pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<SessionSummary>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, model, kind, created_at, updated_at FROM sessions WHERE id = ?1 OR id LIKE ?2",
+        "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
+         approval_read, approval_write, approval_terminal, created_at, updated_at \
+         FROM sessions WHERE id = ?1 OR id LIKE ?2",
     )?;
 
     let pattern = format!("{}%", id_or_prefix);
@@ -242,8 +397,17 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
             title: crypto::decrypt(&title)?,
             model: row.get(2)?,
             kind: row.get(3)?,
-            created_at: row.get(4)?,
-            updated_at: row.get(5)?,
+            effort_level: row.get(4)?,
+            verbose: row.get(5)?,
+            max_iterations: row.get(6)?,
+            temperature: row.get(7)?,
+            approval: ApprovalSettings {
+                read_disk: row.get(8)?,
+                write_disk: row.get(9)?,
+                terminal: row.get(10)?,
+            },
+            created_at: row.get(11)?,
+            updated_at: row.get(12)?,
         }))
     } else {
         Ok(None)
@@ -327,12 +491,19 @@ mod tests {
         conn.execute_batch(
             "
             CREATE TABLE sessions (
-                id          TEXT PRIMARY KEY,
-                title       TEXT NOT NULL,
-                model       TEXT NOT NULL,
-                kind        TEXT NOT NULL,
-                created_at  INTEGER NOT NULL,
-                updated_at  INTEGER NOT NULL
+                id              TEXT PRIMARY KEY,
+                title           TEXT NOT NULL,
+                model           TEXT NOT NULL,
+                kind            TEXT NOT NULL,
+                effort_level    TEXT,
+                verbose         INTEGER NOT NULL DEFAULT 0,
+                max_iterations  INTEGER,
+                temperature     REAL,
+                approval_read      INTEGER NOT NULL DEFAULT 1,
+                approval_write     INTEGER NOT NULL DEFAULT 1,
+                approval_terminal  INTEGER NOT NULL DEFAULT 1,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL
             );
             CREATE TABLE messages (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -392,7 +563,13 @@ mod tests {
     #[test]
     fn create_and_load_session_roundtrip() {
         let conn = memory_db();
-        let id = create_session(&conn, "orcarouter/auto", KIND_CHAT).unwrap();
+        let id = create_session(
+            &conn,
+            "orcarouter/auto",
+            KIND_CHAT,
+            &ApprovalSettings::default(),
+        )
+        .unwrap();
 
         let messages = vec![
             ChatMessage {
@@ -424,9 +601,16 @@ mod tests {
     #[test]
     fn list_sessions_orders_by_updated_desc() {
         let conn = memory_db();
-        let id1 = create_session(&conn, "model-a", KIND_CHAT).unwrap();
+        let id1 =
+            create_session(&conn, "model-a", KIND_CHAT, &ApprovalSettings::default()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let id2 = create_session(&conn, "model-b", KIND_AGENT_CHAT).unwrap();
+        let id2 = create_session(
+            &conn,
+            "model-b",
+            KIND_AGENT_CHAT,
+            &ApprovalSettings::default(),
+        )
+        .unwrap();
 
         let sessions = list_sessions(&conn).unwrap();
         assert_eq!(sessions.len(), 2);
@@ -437,7 +621,7 @@ mod tests {
     #[test]
     fn find_session_by_prefix() {
         let conn = memory_db();
-        let id = create_session(&conn, "model-a", KIND_CHAT).unwrap();
+        let id = create_session(&conn, "model-a", KIND_CHAT, &ApprovalSettings::default()).unwrap();
         let prefix = &id[..8];
 
         let found = find_session(&conn, prefix).unwrap();
@@ -445,10 +629,114 @@ mod tests {
     }
 
     #[test]
+    fn set_session_kind_switches_the_stored_kind() {
+        let conn = memory_db();
+        let id = create_session(&conn, "model-a", KIND_CHAT, &ApprovalSettings::default()).unwrap();
+
+        set_session_kind(&conn, &id, KIND_AGENT_CHAT).unwrap();
+        assert_eq!(
+            find_session(&conn, &id).unwrap().unwrap().kind,
+            KIND_AGENT_CHAT
+        );
+
+        set_session_kind(&conn, &id, KIND_CHAT).unwrap();
+        assert_eq!(find_session(&conn, &id).unwrap().unwrap().kind, KIND_CHAT);
+    }
+
+    #[test]
+    fn new_sessions_default_to_no_overrides() {
+        let conn = memory_db();
+        let id = create_session(&conn, "model-a", KIND_CHAT, &ApprovalSettings::default()).unwrap();
+        let summary = find_session(&conn, &id).unwrap().unwrap();
+        assert_eq!(summary.effort_level, None);
+        assert!(!summary.verbose);
+        assert_eq!(summary.max_iterations, None);
+        assert_eq!(summary.temperature, None);
+        assert_eq!(summary.approval, ApprovalSettings::default());
+    }
+
+    #[test]
+    fn set_session_effort_level_switches_and_clears() {
+        let conn = memory_db();
+        let id = create_session(&conn, "model-a", KIND_CHAT, &ApprovalSettings::default()).unwrap();
+
+        set_session_effort_level(&conn, &id, Some("high")).unwrap();
+        assert_eq!(
+            find_session(&conn, &id).unwrap().unwrap().effort_level,
+            Some("high".to_string())
+        );
+
+        set_session_effort_level(&conn, &id, None).unwrap();
+        assert_eq!(
+            find_session(&conn, &id).unwrap().unwrap().effort_level,
+            None
+        );
+    }
+
+    #[test]
+    fn set_session_verbose_switches_the_flag() {
+        let conn = memory_db();
+        let id = create_session(&conn, "model-a", KIND_CHAT, &ApprovalSettings::default()).unwrap();
+
+        set_session_verbose(&conn, &id, true).unwrap();
+        assert!(find_session(&conn, &id).unwrap().unwrap().verbose);
+
+        set_session_verbose(&conn, &id, false).unwrap();
+        assert!(!find_session(&conn, &id).unwrap().unwrap().verbose);
+    }
+
+    #[test]
+    fn set_session_max_iterations_switches_and_clears() {
+        let conn = memory_db();
+        let id = create_session(&conn, "model-a", KIND_CHAT, &ApprovalSettings::default()).unwrap();
+
+        set_session_max_iterations(&conn, &id, Some(30)).unwrap();
+        assert_eq!(
+            find_session(&conn, &id).unwrap().unwrap().max_iterations,
+            Some(30)
+        );
+
+        set_session_max_iterations(&conn, &id, None).unwrap();
+        assert_eq!(
+            find_session(&conn, &id).unwrap().unwrap().max_iterations,
+            None
+        );
+    }
+
+    #[test]
+    fn set_session_temperature_switches_and_clears() {
+        let conn = memory_db();
+        let id = create_session(&conn, "model-a", KIND_CHAT, &ApprovalSettings::default()).unwrap();
+
+        set_session_temperature(&conn, &id, Some(1.2)).unwrap();
+        assert_eq!(
+            find_session(&conn, &id).unwrap().unwrap().temperature,
+            Some(1.2)
+        );
+
+        set_session_temperature(&conn, &id, None).unwrap();
+        assert_eq!(find_session(&conn, &id).unwrap().unwrap().temperature, None);
+    }
+
+    #[test]
+    fn set_session_approval_updates_the_stored_gates() {
+        let conn = memory_db();
+        let id = create_session(&conn, "model-a", KIND_CHAT, &ApprovalSettings::default()).unwrap();
+
+        let custom = ApprovalSettings {
+            read_disk: true,
+            write_disk: false,
+            terminal: false,
+        };
+        set_session_approval(&conn, &id, &custom).unwrap();
+        assert_eq!(find_session(&conn, &id).unwrap().unwrap().approval, custom);
+    }
+
+    #[test]
     fn delete_session_removes_messages_via_cascade() {
         let conn = memory_db();
         conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
-        let id = create_session(&conn, "model-a", KIND_CHAT).unwrap();
+        let id = create_session(&conn, "model-a", KIND_CHAT, &ApprovalSettings::default()).unwrap();
         append_message(
             &conn,
             &id,

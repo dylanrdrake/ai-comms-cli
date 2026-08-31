@@ -4,7 +4,9 @@
 //! transition, so the interesting behavior (how a stream becomes a transcript
 //! block, what happens to input while busy) is testable without a terminal.
 
+use crate::config::ApprovalSettings;
 use crate::conversation::Event;
+pub use crate::ui::{classify, Submission};
 use crate::ui::{AgentEvent, ApprovalRequest};
 
 /// One rendered block of the conversation.
@@ -38,6 +40,17 @@ pub enum TranscriptItem {
     },
     Error(String),
     Notice(String),
+    /// This session's approval gates, pretty-printed the same way `comms
+    /// approval` shows them in the CLI rather than packed into one
+    /// `Notice` line. Shown both after `/approval <category> <on|off>`
+    /// changes something and after a bare `/approval` query.
+    ApprovalStatus {
+        approval: ApprovalSettings,
+        /// Whether this reflects a just-made change, so the header reads
+        /// "set to" instead of "is" — the same distinction every other
+        /// setting's `Notice` makes.
+        changed: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,36 +70,6 @@ pub enum Focus {
     Approval,
 }
 
-/// What a submitted line turned out to be.
-///
-/// Only recognized commands are intercepted — anything else is a message,
-/// including text that merely starts with a slash, since paths like
-/// `/etc/hosts` are common enough in a coding tool that swallowing them
-/// would be worse than letting a mistyped command reach the model.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Submission {
-    Message(String),
-    SetModel(String),
-    ShowModel,
-}
-
-pub fn classify(text: &str) -> Submission {
-    let trimmed = text.trim();
-    match trimmed.strip_prefix("/model") {
-        // "/models-are-great" is a message, not a malformed command.
-        Some(rest) if rest.is_empty() => Submission::ShowModel,
-        Some(rest) if rest.starts_with(char::is_whitespace) => {
-            let name = rest.trim();
-            if name.is_empty() {
-                Submission::ShowModel
-            } else {
-                Submission::SetModel(name.to_string())
-            }
-        }
-        _ => Submission::Message(text.to_string()),
-    }
-}
-
 pub struct App {
     pub transcript: Vec<TranscriptItem>,
     pub input: String,
@@ -101,14 +84,30 @@ pub struct App {
     pub scroll_back: u16,
     /// The model subsequent turns will use. Changes with `/model`.
     pub model: String,
+    /// Changes with `/effort`; `None` means "use the configured default".
     pub effort_level: Option<String>,
+    /// Not shown in the UI, but sessions are worth keeping uniquely
+    /// identifiable regardless.
+    #[allow(dead_code)]
     pub session_id: String,
+    /// The session's current title, shown in the header. "Untitled" until
+    /// the first user message names it.
+    pub title: String,
     /// Whether this conversation runs the tool loop, shown in the status bar
     /// so the mode is never ambiguous once you're inside a session.
     pub agentic: bool,
     /// Mirrors the plain CLI's `-v`: gates whether tool call arguments and
-    /// results are shown, not just that a tool ran.
+    /// results are shown, not just that a tool ran. Toggled with `/verbose`.
     pub verbose: bool,
+    /// Changes with `/max-iterations`; `None` means "use the configured
+    /// default". Only takes effect in agent mode.
+    pub max_iterations: Option<usize>,
+    /// Changes with `/temperature`; `None` means "use the configured
+    /// default".
+    pub temperature: Option<f32>,
+    /// Changes with `/approval`. Not shown in the status bar, but folded
+    /// here so a `Notice` can report what it actually ended up as.
+    pub approval: ApprovalSettings,
     /// Previously submitted lines, oldest first, that Up/Down recall into
     /// the input box — the TUI's equivalent of the plain CLI's readline
     /// history. Seeded from a resumed session's past turns.
@@ -135,8 +134,12 @@ impl App {
             model,
             effort_level,
             session_id,
+            title: "Untitled".to_string(),
             agentic: false,
             verbose: false,
+            max_iterations: None,
+            temperature: None,
+            approval: ApprovalSettings::default(),
             input_history: Vec::new(),
             history_cursor: None,
             draft: String::new(),
@@ -204,6 +207,76 @@ impl App {
                     format!("Model is {label}")
                 }));
             }
+            Event::AgenticChanged { agentic } => {
+                let changed = agentic != self.agentic;
+                self.agentic = agentic;
+                let label = if agentic {
+                    "agent mode (tools enabled)"
+                } else {
+                    "ask mode (no tools)"
+                };
+                self.transcript.push(TranscriptItem::Notice(if changed {
+                    format!("Switched to {label}")
+                } else {
+                    format!("Already in {label}")
+                }));
+            }
+            Event::EffortChanged { effort_level } => {
+                let changed = effort_level != self.effort_level;
+                self.effort_level = effort_level;
+                let label = self.effort_level.as_deref().unwrap_or("default");
+                self.transcript.push(TranscriptItem::Notice(if changed {
+                    format!("Effort set to {label}")
+                } else {
+                    format!("Effort is {label}")
+                }));
+            }
+            Event::VerboseChanged { verbose } => {
+                self.verbose = verbose;
+                self.transcript.push(TranscriptItem::Notice(
+                    if verbose {
+                        "Verbose mode on"
+                    } else {
+                        "Verbose mode off"
+                    }
+                    .to_string(),
+                ));
+            }
+            Event::MaxIterationsChanged { max_iterations } => {
+                let changed = max_iterations != self.max_iterations;
+                self.max_iterations = max_iterations;
+                let label = self
+                    .max_iterations
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                self.transcript.push(TranscriptItem::Notice(if changed {
+                    format!("Max iterations set to {label}")
+                } else {
+                    format!("Max iterations is {label}")
+                }));
+            }
+            Event::TemperatureChanged { temperature } => {
+                let changed = temperature != self.temperature;
+                self.temperature = temperature;
+                let label = self
+                    .temperature
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "default".to_string());
+                self.transcript.push(TranscriptItem::Notice(if changed {
+                    format!("Temperature set to {label}")
+                } else {
+                    format!("Temperature is {label}")
+                }));
+            }
+            Event::ApprovalSettingsChanged { approval } => {
+                let changed = approval != self.approval;
+                self.approval = approval.clone();
+                self.transcript
+                    .push(TranscriptItem::ApprovalStatus { approval, changed });
+            }
+            // Purely cosmetic — the header re-renders with whatever this
+            // is next frame, with no need to call it out in the transcript.
+            Event::TitleChanged { title } => self.title = title,
             Event::Agent(event) => self.apply_agent(event),
         }
     }
@@ -668,37 +741,6 @@ mod tests {
 
     // --- input editing ---------------------------------------------------
 
-    // --- /model command -------------------------------------------------
-
-    #[test]
-    fn classify_recognizes_the_model_command() {
-        assert_eq!(
-            classify("/model anthropic/claude-opus-4.5"),
-            Submission::SetModel("anthropic/claude-opus-4.5".to_string())
-        );
-        assert_eq!(classify("/model"), Submission::ShowModel);
-        assert_eq!(classify("  /model   "), Submission::ShowModel);
-    }
-
-    #[test]
-    fn classify_leaves_ordinary_text_and_paths_alone() {
-        assert_eq!(
-            classify("what does /etc/hosts do?"),
-            Submission::Message("what does /etc/hosts do?".to_string())
-        );
-        // A leading slash that isn't a command must still reach the model,
-        // since paths are common input in a coding tool.
-        assert_eq!(
-            classify("/usr/bin/env"),
-            Submission::Message("/usr/bin/env".to_string())
-        );
-        // Not the command, just a word starting with it.
-        assert_eq!(
-            classify("/modelling is fun"),
-            Submission::Message("/modelling is fun".to_string())
-        );
-    }
-
     #[test]
     fn model_changed_updates_the_label_and_notes_it() {
         let mut a = app();
@@ -727,6 +769,172 @@ mod tests {
             a.transcript.last(),
             Some(&TranscriptItem::Notice("Model is test-model".to_string()))
         );
+    }
+
+    #[test]
+    fn agentic_changed_updates_the_flag_and_notes_it() {
+        let mut a = app();
+        assert!(!a.agentic);
+
+        a.apply(Event::AgenticChanged { agentic: true });
+        assert!(a.agentic);
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice(
+                "Switched to agent mode (tools enabled)".to_string()
+            ))
+        );
+
+        // Repeating the same mode reports rather than claiming a change.
+        a.apply(Event::AgenticChanged { agentic: true });
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice(
+                "Already in agent mode (tools enabled)".to_string()
+            ))
+        );
+
+        a.apply(Event::AgenticChanged { agentic: false });
+        assert!(!a.agentic);
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice(
+                "Switched to ask mode (no tools)".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn effort_changed_updates_the_field_and_notes_it() {
+        let mut a = app();
+        assert_eq!(a.effort_level, None);
+
+        a.apply(Event::EffortChanged {
+            effort_level: Some("high".to_string()),
+        });
+        assert_eq!(a.effort_level, Some("high".to_string()));
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice("Effort set to high".to_string()))
+        );
+
+        a.apply(Event::EffortChanged {
+            effort_level: Some("high".to_string()),
+        });
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice("Effort is high".to_string()))
+        );
+
+        a.apply(Event::EffortChanged { effort_level: None });
+        assert_eq!(a.effort_level, None);
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice("Effort set to default".to_string()))
+        );
+    }
+
+    #[test]
+    fn temperature_changed_updates_the_field_and_notes_it() {
+        let mut a = app();
+        assert_eq!(a.temperature, None);
+
+        a.apply(Event::TemperatureChanged {
+            temperature: Some(1.5),
+        });
+        assert_eq!(a.temperature, Some(1.5));
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice(
+                "Temperature set to 1.5".to_string()
+            ))
+        );
+
+        a.apply(Event::TemperatureChanged {
+            temperature: Some(1.5),
+        });
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice("Temperature is 1.5".to_string()))
+        );
+
+        a.apply(Event::TemperatureChanged { temperature: None });
+        assert_eq!(a.temperature, None);
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice(
+                "Temperature set to default".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn verbose_changed_updates_the_flag_and_notes_it() {
+        let mut a = app();
+        assert!(!a.verbose);
+
+        a.apply(Event::VerboseChanged { verbose: true });
+        assert!(a.verbose);
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice("Verbose mode on".to_string()))
+        );
+
+        a.apply(Event::VerboseChanged { verbose: false });
+        assert!(!a.verbose);
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Notice("Verbose mode off".to_string()))
+        );
+    }
+
+    #[test]
+    fn approval_changed_updates_the_field_and_notes_it() {
+        let mut a = app();
+        assert_eq!(a.approval, ApprovalSettings::default());
+
+        let updated = ApprovalSettings {
+            read_disk: false,
+            write_disk: true,
+            terminal: true,
+        };
+        a.apply(Event::ApprovalSettingsChanged {
+            approval: updated.clone(),
+        });
+        assert_eq!(a.approval, updated);
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::ApprovalStatus {
+                approval: updated.clone(),
+                changed: true,
+            })
+        );
+
+        // Repeating the same settings reports rather than claiming a change.
+        a.apply(Event::ApprovalSettingsChanged {
+            approval: updated.clone(),
+        });
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::ApprovalStatus {
+                approval: updated,
+                changed: false,
+            })
+        );
+    }
+
+    #[test]
+    fn title_changed_updates_silently() {
+        let mut a = app();
+        assert_eq!(a.title, "Untitled");
+        let before = a.transcript.len();
+
+        a.apply(Event::TitleChanged {
+            title: "Write me a snake game".to_string(),
+        });
+        assert_eq!(a.title, "Write me a snake game");
+        // Purely cosmetic — nothing is added to the transcript for it.
+        assert_eq!(a.transcript.len(), before);
     }
 
     #[test]

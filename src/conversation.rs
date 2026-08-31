@@ -34,6 +34,27 @@ pub enum Command {
     /// Switch the model for subsequent turns. A turn already running keeps
     /// the model it started with.
     SetModel(String),
+    /// Switch between plain and agent (tool-calling) mode for subsequent
+    /// turns. A turn already running keeps the mode it started with.
+    SetAgentic(bool),
+    /// Switch the reasoning effort for subsequent turns. `None` clears the
+    /// override. A turn already running keeps the effort it started with.
+    SetEffort(Option<String>),
+    /// Toggle verbose tool detail in the TUI view. Purely a display
+    /// setting; the agent loop never sees it.
+    ToggleVerbose,
+    /// Switch the tool-calling iteration cap per turn (agent mode only).
+    /// `None` clears the override. A turn already running keeps the cap it
+    /// started with.
+    SetMaxIterations(Option<usize>),
+    /// Switch one tool-approval gate (`"read"`/`"write"`/`"terminal"`/`"all"`)
+    /// for subsequent turns. A turn already running keeps the gates it
+    /// started with.
+    SetApproval { category: String, enabled: bool },
+    /// Switch the sampling temperature for subsequent turns. `None` clears
+    /// the override. A turn already running keeps the temperature it
+    /// started with.
+    SetTemperature(Option<f32>),
 }
 
 /// What the conversation reports back. Agent progress is forwarded verbatim
@@ -62,6 +83,27 @@ pub enum Event {
         model: String,
         effort_level: Option<String>,
     },
+    /// Agent (tool-calling) mode was turned on or off (or a change failed).
+    /// Front ends re-label from here rather than assuming the command
+    /// succeeded.
+    AgenticChanged { agentic: bool },
+    /// The reasoning effort changed (or a change failed). Front ends
+    /// re-label from here rather than assuming the command succeeded.
+    EffortChanged { effort_level: Option<String> },
+    /// Verbose tool detail was turned on or off.
+    VerboseChanged { verbose: bool },
+    /// The tool-calling iteration cap changed (or a change failed). Front
+    /// ends re-label from here rather than assuming the command succeeded.
+    MaxIterationsChanged { max_iterations: Option<usize> },
+    /// A tool-approval gate changed (or a change failed). Front ends
+    /// re-label from here rather than assuming the command succeeded.
+    ApprovalSettingsChanged { approval: ApprovalSettings },
+    /// The sampling temperature changed (or a change failed). Front ends
+    /// re-label from here rather than assuming the command succeeded.
+    TemperatureChanged { temperature: Option<f32> },
+    /// The session's title changed — set once a session goes from
+    /// "Untitled" to a title derived from its first user message.
+    TitleChanged { title: String },
 }
 
 /// Handle to a running conversation worker.
@@ -78,7 +120,7 @@ impl Conversation {
         client: Arc<Client>,
         session: ChatSession,
         max_iterations: usize,
-        approval: ApprovalSettings,
+        temperature: f32,
         agentic: bool,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -88,7 +130,7 @@ impl Conversation {
             client,
             session,
             max_iterations,
-            approval,
+            temperature,
             agentic,
             events: event_tx,
         };
@@ -121,8 +163,12 @@ impl Conversation {
 struct Worker {
     client: Arc<Client>,
     session: ChatSession,
+    /// The configured default iteration cap, used when the session has no
+    /// `/max-iterations` override of its own.
     max_iterations: usize,
-    approval: ApprovalSettings,
+    /// The configured default sampling temperature, used when the session
+    /// has no `/temperature` override of its own.
+    temperature: f32,
     /// Whether turns run the tool-calling loop (`agent-chat`) or are a plain
     /// exchange (`chat`).
     agentic: bool,
@@ -154,6 +200,14 @@ impl Worker {
                     }
                 }
                 Command::SetModel(model) => self.set_model(model),
+                Command::SetAgentic(agentic) => self.set_agentic(agentic),
+                Command::SetEffort(effort_level) => self.set_effort(effort_level),
+                Command::ToggleVerbose => self.toggle_verbose(),
+                Command::SetMaxIterations(max_iterations) => {
+                    self.set_max_iterations(max_iterations)
+                }
+                Command::SetApproval { category, enabled } => self.set_approval(&category, enabled),
+                Command::SetTemperature(temperature) => self.set_temperature(temperature),
                 // Only meaningful while a turn is running, where they're
                 // handled inline by `run_turn`.
                 Command::Approve(_) | Command::Cancel => {}
@@ -187,8 +241,9 @@ impl Worker {
         let mut messages = self.session.messages().to_vec();
         let model = self.session.model().to_string();
         let effort_level = self.session.effort_level().map(|s| s.to_string());
-        let max_iterations = self.max_iterations;
-        let approval = self.approval.clone();
+        let max_iterations = self.session.max_iterations().unwrap_or(self.max_iterations);
+        let temperature = self.session.temperature().unwrap_or(self.temperature);
+        let approval = self.session.approval().clone();
         let agentic = self.agentic;
 
         let mut turn = tokio::spawn(async move {
@@ -200,12 +255,21 @@ impl Worker {
                     &mut messages,
                     &model,
                     max_iterations,
+                    temperature,
                     &approval,
                     effort_level,
                 )
                 .await
             } else {
-                agent::run_chat_turn(&client, &mut ui, &mut messages, &model, effort_level).await
+                agent::run_chat_turn(
+                    &client,
+                    &mut ui,
+                    &mut messages,
+                    &model,
+                    temperature,
+                    effort_level,
+                )
+                .await
             };
             (result, messages)
         });
@@ -266,8 +330,20 @@ impl Worker {
                             let _ = self.events.send(Event::Queued { pending: queue.len() });
                         }
                         // Applies from the next turn on; the running one
-                        // already captured its model.
+                        // already captured its model/mode/effort.
                         Some(Command::SetModel(model)) => self.set_model(model),
+                        Some(Command::SetAgentic(agentic)) => self.set_agentic(agentic),
+                        Some(Command::SetEffort(effort_level)) => self.set_effort(effort_level),
+                        Some(Command::ToggleVerbose) => self.toggle_verbose(),
+                        Some(Command::SetMaxIterations(max_iterations)) => {
+                            self.set_max_iterations(max_iterations)
+                        }
+                        Some(Command::SetApproval { category, enabled }) => {
+                            self.set_approval(&category, enabled)
+                        }
+                        Some(Command::SetTemperature(temperature)) => {
+                            self.set_temperature(temperature)
+                        }
                     }
                 }
             }
@@ -312,6 +388,93 @@ impl Worker {
         });
     }
 
+    /// Switches agent (tool-calling) mode and tells the front end what it
+    /// ended up as, so the display can't drift from what the next turn will
+    /// actually use.
+    fn set_agentic(&mut self, agentic: bool) {
+        if let Err(e) = self.session.set_agentic(agentic) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to switch mode: {e}"),
+            }));
+        }
+        self.agentic = self.session.is_agentic();
+        let _ = self.events.send(Event::AgenticChanged {
+            agentic: self.agentic,
+        });
+    }
+
+    /// Switches reasoning effort and tells the front end what it ended up
+    /// as, so the display can't drift from what the next turn will
+    /// actually use.
+    fn set_effort(&mut self, effort_level: Option<String>) {
+        if let Err(e) = self.session.set_effort_level(effort_level) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to switch effort: {e}"),
+            }));
+        }
+        let _ = self.events.send(Event::EffortChanged {
+            effort_level: self.session.effort_level().map(str::to_string),
+        });
+    }
+
+    /// Flips verbose tool detail against the session's own confirmed
+    /// state, rather than trusting whatever the front end last rendered,
+    /// so repeated toggles can't drift out of sync with it.
+    fn toggle_verbose(&mut self) {
+        let verbose = !self.session.verbose();
+        if let Err(e) = self.session.set_verbose(verbose) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to toggle verbose: {e}"),
+            }));
+        }
+        let _ = self.events.send(Event::VerboseChanged {
+            verbose: self.session.verbose(),
+        });
+    }
+
+    /// Switches the tool-calling iteration cap and tells the front end what
+    /// it ended up as, so the display can't drift from what the next turn
+    /// will actually use.
+    fn set_max_iterations(&mut self, max_iterations: Option<usize>) {
+        if let Err(e) = self.session.set_max_iterations(max_iterations) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to switch max iterations: {e}"),
+            }));
+        }
+        let _ = self.events.send(Event::MaxIterationsChanged {
+            max_iterations: self.session.max_iterations(),
+        });
+    }
+
+    /// Switches the sampling temperature and tells the front end what it
+    /// ended up as, so the display can't drift from what the next turn
+    /// will actually use.
+    fn set_temperature(&mut self, temperature: Option<f32>) {
+        if let Err(e) = self.session.set_temperature(temperature) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to switch temperature: {e}"),
+            }));
+        }
+        let _ = self.events.send(Event::TemperatureChanged {
+            temperature: self.session.temperature(),
+        });
+    }
+
+    /// Switches one tool-approval gate and tells the front end what the
+    /// session's gates ended up as, so the display can't drift from what
+    /// the next turn will actually use.
+    fn set_approval(&mut self, category: &str, enabled: bool) {
+        let approval = self.session.approval().with_category(category, enabled);
+        if let Err(e) = self.session.set_approval(approval) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to switch approval: {e}"),
+            }));
+        }
+        let _ = self.events.send(Event::ApprovalSettingsChanged {
+            approval: self.session.approval().clone(),
+        });
+    }
+
     /// Writes whatever the session has accumulated. Called after every turn
     /// including a cancelled one, so an interrupted exchange still keeps the
     /// user's message rather than losing it if the app then exits.
@@ -321,6 +484,9 @@ impl Worker {
                 message: format!("Failed to save message: {e}"),
             }));
         }
+        let _ = self.events.send(Event::TitleChanged {
+            title: self.session.title().to_string(),
+        });
     }
 }
 

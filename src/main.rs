@@ -28,7 +28,7 @@ use session::ChatSession;
 use spinner::Spinner;
 use store::{KIND_AGENT_CHAT, KIND_CHAT};
 use terminal_ui::TerminalAgentUi;
-use ui::response_label;
+use ui::{parse_bool, response_label};
 
 #[derive(Parser)]
 #[command(name = "comms")]
@@ -58,7 +58,7 @@ enum Commands {
         /// Model to set as the default (omit to show the current default)
         name: Option<String>,
 
-        /// Clear the stored default model (falls back to orcarouter/auto)
+        /// Clear the stored default model (falls back to openrouter/auto)
         #[arg(long)]
         clear: bool,
     },
@@ -68,7 +68,7 @@ enum Commands {
         /// Base URL to use, e.g. https://openrouter.ai/api/v1 (omit to show the current value)
         url: Option<String>,
 
-        /// Clear the stored endpoint (falls back to the OrcaRouter default)
+        /// Clear the stored endpoint (falls back to the OpenRouter default)
         #[arg(long)]
         clear: bool,
     },
@@ -78,7 +78,7 @@ enum Commands {
         /// Style to set: flat, nested, or none (omit to show the current value)
         value: Option<String>,
 
-        /// Clear the stored effort style (falls back to "flat")
+        /// Clear the stored effort style (falls back to "nested")
         #[arg(long)]
         clear: bool,
     },
@@ -99,6 +99,12 @@ enum Commands {
     MaxIterations {
         /// Value to set as the default (omit to show the current default)
         value: Option<usize>,
+    },
+
+    /// View or set the persistent default sampling temperature
+    Temperature {
+        /// Value to set as the default (omit to show the current default)
+        value: Option<f32>,
     },
 
     /// View or set whether responses stream in as they're generated
@@ -127,20 +133,29 @@ enum Commands {
         /// Model to use (overrides the persistent default for this call)
         #[arg(short, long)]
         model: Option<String>,
-
-        /// Temperature (0-2)
-        #[arg(short, long, default_value_t = 0.7)]
-        temperature: f32,
     },
 
-    /// Interactive chat session
-    Chat {
-        /// Model to use (overrides the persistent default for this call)
+    /// Interactive session — starts in plain ask mode; /agent turns on
+    /// tools (read/write files, run commands) from inside it. Also /model,
+    /// /effort, and /verbose. Same experience as `tui`, minus the screen.
+    Session {
+        /// Model to use for a new session (overrides the persistent
+        /// default; ignored when resuming, which keeps its saved model)
         #[arg(short, long)]
         model: Option<String>,
 
+        /// Maximum number of tool-calling iterations per turn while in
+        /// agent mode (overrides the persistent default for this call)
+        #[arg(long)]
+        max_iterations: Option<usize>,
+
+        /// Sampling temperature for this session (overrides the persistent
+        /// default for this call)
+        #[arg(long)]
+        temperature: Option<f32>,
+
         /// Resume a saved session by id (or unique id prefix); pass with no
-        /// value to pick from a list of your saved chat sessions
+        /// value to pick from a list of all your saved sessions
         #[arg(long, num_args = 0..=1, default_missing_value = PICK_SESSION_SENTINEL)]
         resume: Option<String>,
     },
@@ -161,42 +176,23 @@ enum Commands {
         /// Maximum number of iterations (overrides the persistent default for this call)
         #[arg(long)]
         max_iterations: Option<usize>,
-    },
 
-    /// Interactive agentic chat session (tools + persistent conversation context)
-    AgentChat {
-        /// Model to use (overrides the persistent default for this call)
-        #[arg(short, long)]
-        model: Option<String>,
-
-        /// Show detailed agent iterations
-        #[arg(short, long)]
-        verbose: bool,
-
-        /// Maximum number of iterations per turn (overrides the persistent default for this call)
+        /// Sampling temperature (overrides the persistent default for this call)
         #[arg(long)]
-        max_iterations: Option<usize>,
-
-        /// Resume a saved session by id (or unique id prefix); pass with no
-        /// value to pick from a list of your saved agent-chat sessions
-        #[arg(long, num_args = 0..=1, default_missing_value = PICK_SESSION_SENTINEL)]
-        resume: Option<String>,
+        temperature: Option<f32>,
     },
 
     /// Full-screen terminal UI: streaming replies, an always-live input box,
     /// and inline tool approval. With no flags, opens the launch screen.
     Tui {
-        /// Skip the launch screen and start a new plain chat
-        #[arg(short, long, conflicts_with_all = ["agent", "resume"])]
-        chat: bool,
-
-        /// Skip the launch screen and start a new agent chat (tools enabled)
-        #[arg(short, long, conflicts_with_all = ["chat", "resume"])]
-        agent: bool,
+        /// Skip the launch screen and start a new session (starts in ask
+        /// mode; /agent enables tools from inside it)
+        #[arg(short, long, conflicts_with = "resume")]
+        session: bool,
 
         /// Skip the launch screen and resume a saved session by id (or
         /// unique id prefix)
-        #[arg(long, conflicts_with_all = ["chat", "agent"])]
+        #[arg(long, conflicts_with = "session")]
         resume: Option<String>,
 
         /// Model to use (overrides the persistent default for this call)
@@ -207,9 +203,9 @@ enum Commands {
         #[arg(long)]
         max_iterations: Option<usize>,
 
-        /// Show tool call arguments and results, like the plain CLI's -v
-        #[arg(short, long)]
-        verbose: bool,
+        /// Sampling temperature (overrides the persistent default for this call)
+        #[arg(long)]
+        temperature: Option<f32>,
     },
 
     /// Manage saved chat sessions
@@ -279,18 +275,7 @@ enum ApprovalCommands {
     },
 }
 
-fn parse_bool(s: &str) -> Result<bool, String> {
-    match s.to_lowercase().as_str() {
-        "true" | "on" | "yes" | "1" => Ok(true),
-        "false" | "off" | "no" | "0" => Ok(false),
-        _ => Err(format!(
-            "Invalid boolean value: '{}'. Use true/false, on/off, yes/no, or 1/0",
-            s
-        )),
-    }
-}
-
-const DEFAULT_MODEL: &str = "orcarouter/auto";
+const DEFAULT_MODEL: &str = "openrouter/auto";
 
 /// Sentinel value for `--resume` passed with no id, meaning "show a picker".
 /// Never collides with a real session id since those are lowercase-hex UUIDs
@@ -303,32 +288,31 @@ const PICK_SESSION_SENTINEL: &str = "pick";
 fn resolve_resume_target(
     conn: &rusqlite::Connection,
     id_or_prefix: &str,
-    kind: &str,
 ) -> Result<store::SessionSummary> {
     if id_or_prefix != PICK_SESSION_SENTINEL {
         return store::find_session(conn, id_or_prefix)?
             .ok_or_else(|| anyhow::anyhow!("No session found matching '{}'", id_or_prefix));
     }
 
-    let sessions: Vec<store::SessionSummary> = store::list_sessions(conn)?
-        .into_iter()
-        .filter(|s| s.kind == kind)
-        .collect();
-
+    let sessions = store::list_sessions(conn)?;
     if sessions.is_empty() {
-        anyhow::bail!(
-            "No saved {} sessions to resume",
-            if kind == KIND_CHAT {
-                "chat"
-            } else {
-                "agent-chat"
-            }
-        );
+        anyhow::bail!("No saved sessions to resume");
     }
 
     println!("{}\n", "Select a session to resume:".blue());
     for (i, s) in sessions.iter().enumerate() {
-        println!("  {}. {}  {}", i + 1, (&s.id[..8]).bright_black(), s.title);
+        let mode = if s.kind == KIND_AGENT_CHAT {
+            "agent"
+        } else {
+            "chat"
+        };
+        println!(
+            "  {}. {}  {:<6}{}",
+            i + 1,
+            (&s.id[..8]).bright_black(),
+            mode,
+            s.title
+        );
     }
 
     print!("\n{} ", "Session number:".blue());
@@ -357,12 +341,16 @@ fn resolve_max_iterations(config: &config::Config, cli_value: Option<usize>) -> 
     cli_value.unwrap_or(config.max_iterations)
 }
 
+fn resolve_temperature(config: &config::Config, cli_value: Option<f32>) -> f32 {
+    cli_value.unwrap_or(config.temperature)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => cmd_tui(false, false, None, None, None, false).await?,
+        None => cmd_tui(false, None, None, None, None).await?,
         Some(Commands::Login) => cmd_login().await?,
         Some(Commands::Logout) => cmd_logout().await?,
         Some(Commands::Status) => cmd_status().await?,
@@ -373,34 +361,30 @@ async fn main() -> Result<()> {
         Some(Commands::Headers { action }) => cmd_headers(action).await?,
         Some(Commands::Approval { action }) => cmd_approval(action).await?,
         Some(Commands::MaxIterations { value }) => cmd_max_iterations(value).await?,
+        Some(Commands::Temperature { value }) => cmd_temperature(value).await?,
         Some(Commands::Stream { value }) => cmd_stream(value).await?,
         Some(Commands::EffortLevel { value, clear }) => cmd_effort_level(value, clear).await?,
-        Some(Commands::Ask {
-            prompt,
+        Some(Commands::Ask { prompt, model }) => cmd_ask(&prompt, model).await?,
+        Some(Commands::Session {
             model,
+            max_iterations,
             temperature,
-        }) => cmd_ask(&prompt, model, temperature).await?,
-        Some(Commands::Chat { model, resume }) => cmd_chat(model, resume).await?,
+            resume,
+        }) => cmd_session(model, max_iterations, temperature, resume).await?,
         Some(Commands::Agent {
             task,
             model,
             verbose,
             max_iterations,
-        }) => cmd_agent(&task, model, verbose, max_iterations).await?,
-        Some(Commands::AgentChat {
-            model,
-            verbose,
-            max_iterations,
-            resume,
-        }) => cmd_agent_chat(model, verbose, max_iterations, resume).await?,
+            temperature,
+        }) => cmd_agent(&task, model, verbose, max_iterations, temperature).await?,
         Some(Commands::Tui {
-            chat,
-            agent,
+            session,
             resume,
             model,
             max_iterations,
-            verbose,
-        }) => cmd_tui(chat, agent, resume, model, max_iterations, verbose).await?,
+            temperature,
+        }) => cmd_tui(session, resume, model, max_iterations, temperature).await?,
         Some(Commands::Sessions { action }) => cmd_sessions(action).await?,
     }
 
@@ -408,6 +392,28 @@ async fn main() -> Result<()> {
 }
 
 async fn cmd_login() -> Result<()> {
+    let mut config = load_config()?;
+
+    // Pre-filled with the current endpoint (which is itself the configured
+    // default until `comms endpoint` changes it), so accepting it is just
+    // pressing Enter — only typing something else actually changes it.
+    let mut rl = DefaultEditor::new()?;
+    let endpoint = match rl.readline_with_initial("Endpoint URL: ", (&config.base_url, "")) {
+        Ok(line) => line,
+        Err(rustyline::error::ReadlineError::Interrupted)
+        | Err(rustyline::error::ReadlineError::Eof) => {
+            println!("{} Login cancelled", "✗".red());
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let endpoint = endpoint.trim().trim_end_matches('/').to_string();
+    if !endpoint.is_empty() && endpoint != config.base_url {
+        config.base_url = endpoint;
+        save_config(&config)?;
+        println!("{} Endpoint set to {}\n", "✓".green(), config.base_url);
+    }
+
     print!("{} ", "Enter your API key:".blue());
     io::stdout().flush()?;
 
@@ -455,6 +461,7 @@ async fn cmd_status() -> Result<()> {
         config.default_model.as_deref().unwrap_or(DEFAULT_MODEL)
     );
     println!("  Max iterations: {}", config.max_iterations);
+    println!("  Temperature: {}", config.temperature);
     println!(
         "  Effort level: {}",
         config
@@ -747,6 +754,27 @@ async fn cmd_max_iterations(value: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_temperature(value: Option<f32>) -> Result<()> {
+    let mut config = load_config()?;
+
+    match value {
+        Some(value) if !(0.0..=2.0).contains(&value) => {
+            eprintln!("{} temperature must be between 0 and 2", "✗".red());
+            std::process::exit(1);
+        }
+        Some(value) => {
+            config.temperature = value;
+            save_config(&config)?;
+            println!("{} Default temperature set to {}", "✓".green(), value);
+        }
+        None => {
+            println!("Current default temperature: {}", config.temperature);
+        }
+    }
+
+    Ok(())
+}
+
 async fn cmd_effort_level(value: Option<String>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
 
@@ -816,10 +844,11 @@ async fn cmd_models() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_ask(prompt: &str, model: Option<String>, temperature: f32) -> Result<()> {
+async fn cmd_ask(prompt: &str, model: Option<String>) -> Result<()> {
     let config = load_config()?;
     let model = resolve_model(&config, model);
     let effort_level = config.effort_level.clone();
+    let temperature = config.temperature;
     let client = Client::new(config)?;
 
     let messages = vec![ChatMessage {
@@ -854,29 +883,20 @@ async fn cmd_ask(prompt: &str, model: Option<String>, temperature: f32) -> Resul
 
 /// Prints a saved transcript's user/assistant turns (tool and system messages
 /// are omitted since they're internal bookkeeping, not conversation content).
-/// Each assistant turn is labeled with the model/effort that produced it
-/// when known, falling back to `default_label` for older rows recorded
-/// before that was tracked.
-fn print_transcript(messages: &[store::StoredMessage], default_label: &str) {
+/// No model label on replies, matching the TUI transcript — current model
+/// is `/model`'s job, not every reply's.
+fn print_transcript(messages: &[store::StoredMessage]) {
     for sm in messages {
         let m = &sm.message;
         match m.role.as_str() {
             "user" => {
                 if let Some(content) = &m.content {
-                    println!("{} {}", "You:".blue(), wrap::wrap(content));
+                    println!("{} {}", "❯".green().bold(), wrap::wrap(content));
                 }
             }
             "assistant" => {
                 if let Some(content) = &m.content {
-                    let label = match &sm.model {
-                        Some(model) => response_label(model, &sm.effort_level),
-                        None => default_label.to_string(),
-                    };
-                    println!(
-                        "\n{} {}\n",
-                        format!("{}:", label).cyan(),
-                        wrap::wrap(content)
-                    );
+                    println!("\n{}\n", wrap::wrap(content));
                 }
             }
             _ => {}
@@ -894,24 +914,138 @@ fn user_prompts(messages: &[store::StoredMessage]) -> Vec<String> {
         .collect()
 }
 
-async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
+/// Handles one non-message line — a `/model`, `/agent`, `/ask`, `/effort`,
+/// `/verbose`, `/max-iterations`, `/temperature`, or `/approval` command — updating the session (and
+/// `ui`'s live verbosity, which isn't session state) and printing a
+/// confirmation in the same "set to X" / "already X" style the TUI's status
+/// notices use, so the two front ends read the same way.
+fn apply_submission(
+    submission: ui::Submission,
+    session: &mut ChatSession,
+    ui: &mut TerminalAgentUi,
+) -> Result<()> {
+    match submission {
+        ui::Submission::Message(_) => unreachable!("handled by the caller"),
+        ui::Submission::SetModel(model) => {
+            let changed = model != session.model();
+            session.set_model(model)?;
+            println!(
+                "{} Model {} {}",
+                "✓".green(),
+                if changed { "set to" } else { "is" },
+                session.model()
+            );
+        }
+        ui::Submission::ShowModel => {
+            println!(
+                "Model: {}",
+                response_label(session.model(), &session.effort_level().map(String::from))
+            );
+        }
+        ui::Submission::SetAgentic(agentic) => {
+            let changed = agentic != session.is_agentic();
+            session.set_agentic(agentic)?;
+            let label = if agentic {
+                "agent mode (tools enabled)"
+            } else {
+                "ask mode (no tools)"
+            };
+            println!(
+                "{} {} {label}",
+                "✓".green(),
+                if changed { "Switched to" } else { "Already in" }
+            );
+        }
+        ui::Submission::SetEffort(effort_level) => {
+            let changed = effort_level != session.effort_level().map(String::from);
+            session.set_effort_level(effort_level)?;
+            let label = session.effort_level().unwrap_or("default").to_string();
+            println!(
+                "{} Effort {} {label}",
+                "✓".green(),
+                if changed { "set to" } else { "is" }
+            );
+        }
+        ui::Submission::ToggleVerbose => {
+            let verbose = !session.verbose();
+            session.set_verbose(verbose)?;
+            ui.set_verbose(verbose);
+            println!(
+                "{} Verbose mode {}",
+                "✓".green(),
+                if verbose { "on" } else { "off" }
+            );
+        }
+        ui::Submission::SetMaxIterations(max_iterations) => {
+            let changed = max_iterations != session.max_iterations();
+            session.set_max_iterations(max_iterations)?;
+            let label = session
+                .max_iterations()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "default".to_string());
+            println!(
+                "{} Max iterations {} {label}",
+                "✓".green(),
+                if changed { "set to" } else { "is" }
+            );
+        }
+        ui::Submission::SetTemperature(temperature) => {
+            let changed = temperature != session.temperature();
+            session.set_temperature(temperature)?;
+            let label = session
+                .temperature()
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "default".to_string());
+            println!(
+                "{} Temperature {} {label}",
+                "✓".green(),
+                if changed { "set to" } else { "is" }
+            );
+        }
+        ui::Submission::SetApproval { category, enabled } => {
+            let updated = session.approval().with_category(&category, enabled);
+            let changed = updated != *session.approval();
+            session.set_approval(updated)?;
+            println!(
+                "{} Approval {} {}",
+                "✓".green(),
+                if changed { "set to" } else { "is" },
+                format_approval(enabled)
+            );
+        }
+        ui::Submission::ShowApproval => {
+            println!("{}", "Approval Settings:".blue());
+            print_approval_status(session.approval());
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_session(
+    model: Option<String>,
+    max_iterations: Option<usize>,
+    temperature: Option<f32>,
+    resume: Option<String>,
+) -> Result<()> {
     let config = load_config()?;
     let conn = store::open_db()?;
-    let effort_level = config.effort_level.clone();
 
     let mut prior_prompts: Vec<String> = Vec::new();
     let mut session = match resume {
         Some(id_or_prefix) => {
-            let summary = resolve_resume_target(&conn, &id_or_prefix, KIND_CHAT)?;
-            if summary.kind != KIND_CHAT {
-                anyhow::bail!(
-                    "Session {} is a {} session, resume it with `comms agent-chat --resume {}` instead",
-                    summary.id,
-                    summary.kind,
-                    summary.id
+            let summary = resolve_resume_target(&conn, &id_or_prefix)?;
+            // A resumed session keeps its own saved settings; `-m` (like any
+            // other override flag) only ever applies to a brand new one.
+            if model.is_some() {
+                println!(
+                    "{} Ignoring --model: resumed sessions keep their saved model",
+                    "note:".bright_black()
                 );
             }
-            let model = model.unwrap_or_else(|| summary.model.clone());
+            let effort_level = summary
+                .effort_level
+                .clone()
+                .or_else(|| config.effort_level.clone());
             println!(
                 "{} Resuming session {} ({})\n",
                 "✓".green(),
@@ -919,20 +1053,33 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
                 summary.title
             );
             let (session, history) =
-                ChatSession::resume(conn, &summary, model, effort_level.clone())?;
-            print_transcript(&history, &response_label(session.model(), &effort_level));
+                ChatSession::resume(conn, &summary, summary.model.clone(), effort_level.clone())?;
+            print_transcript(&history);
             prior_prompts = user_prompts(&history);
             session
         }
+        // Every new session starts in plain ask mode, same as the TUI's
+        // "New session" — `/agent` turns tools on from inside it.
         None => {
             let model = resolve_model(&config, model);
-            ChatSession::create(conn, model, KIND_CHAT, effort_level.clone())?
+            ChatSession::create(
+                conn,
+                model,
+                KIND_CHAT,
+                config.effort_level.clone(),
+                config.approval.clone(),
+            )?
         }
     };
 
+    // Used only when the session has no `/max-iterations`/`/temperature`
+    // override of its own — read fresh each turn below, the same precedence
+    // the TUI uses.
+    let default_max_iterations = resolve_max_iterations(&config, max_iterations);
+    let default_temperature = resolve_temperature(&config, temperature);
     let client = Client::new(config)?;
 
-    println!("{}\n", "Starting chat session (type 'exit' to quit)".blue());
+    println!("{}\n", "Starting session (type 'exit' to quit)".blue());
 
     let mut rl = DefaultEditor::new()?;
     // So Up/Down can recall prompts from before this resume, not just what's
@@ -940,36 +1087,72 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
     for prompt in prior_prompts {
         let _ = rl.add_history_entry(prompt);
     }
-    // Plain chat has no tool calls, so nothing here ever prompts; verbose is
-    // off because there are no iterations to narrate.
-    let mut ui = TerminalAgentUi::new(false);
+    // No `-v` here (unlike `agent`) — matching the TUI, a session always
+    // starts quiet; `/verbose` is the only way to turn it on. No model
+    // label either, again matching the TUI transcript.
+    let mut ui = TerminalAgentUi::new(false, false);
 
     loop {
-        let readline = rl.readline(&format!("{} ", "You:".blue()));
+        let readline = rl.readline(&format!("{} ", "❯".green().bold()));
 
-        match readline {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                if line.to_lowercase() == "exit" {
-                    println!("{} Chat session ended", "✓".green());
-                    break;
-                }
+        let line = match readline {
+            Ok(line) => line,
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("{} Session ended", "✓".green());
+                break;
+            }
+            Err(e) => {
+                eprintln!("{} Error: {}", "✗".red(), e);
+                break;
+            }
+        };
 
-                session.push_user(line.clone());
+        if line.trim().is_empty() {
+            continue;
+        }
+        let _ = rl.add_history_entry(line.as_str());
+
+        if line.to_lowercase() == "exit" {
+            println!("{} Session ended", "✓".green());
+            break;
+        }
+
+        match ui::classify(&line) {
+            ui::Submission::Message(text) => {
+                session.push_user(text);
                 if let Err(e) = session.persist_pending() {
                     eprintln!("{} Failed to save message: {}", "✗".red(), e);
                 }
 
                 println!();
                 let model = session.model().to_string();
-                let turn = agent::run_chat_turn(
-                    &client,
-                    &mut ui,
-                    session.messages_mut(),
-                    &model,
-                    effort_level.clone(),
-                )
-                .await;
+                let effort_level = session.effort_level().map(str::to_string);
+                let temperature = session.temperature().unwrap_or(default_temperature);
+                let turn = if session.is_agentic() {
+                    let max_iterations = session.max_iterations().unwrap_or(default_max_iterations);
+                    let approval = session.approval().clone();
+                    agent::run_agent_turn(
+                        &client,
+                        &mut ui,
+                        session.messages_mut(),
+                        &model,
+                        max_iterations,
+                        temperature,
+                        &approval,
+                        effort_level,
+                    )
+                    .await
+                } else {
+                    agent::run_chat_turn(
+                        &client,
+                        &mut ui,
+                        session.messages_mut(),
+                        &model,
+                        temperature,
+                        effort_level,
+                    )
+                    .await
+                };
 
                 match turn {
                     // The reply itself is printed by the UI; this is the
@@ -983,19 +1166,16 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
                     eprintln!("{} Failed to save message: {}", "✗".red(), e);
                 }
             }
-            Err(rustyline::error::ReadlineError::Interrupted) => {
-                println!("{} Chat session ended", "✓".green());
-                break;
-            }
-            Err(e) => {
-                eprintln!("{} Error: {}", "✗".red(), e);
-                break;
+            submission => {
+                if let Err(e) = apply_submission(submission, &mut session, &mut ui) {
+                    println!("{} {}", "✗".red(), e);
+                }
             }
         }
     }
 
     println!(
-        "{} Session saved. Resume with: comms chat --resume {}",
+        "{} Session saved. Resume with: comms session --resume {}",
         "✓".green(),
         session.short_id()
     );
@@ -1008,23 +1188,28 @@ async fn cmd_agent(
     model: Option<String>,
     verbose: bool,
     max_iterations: Option<usize>,
+    temperature: Option<f32>,
 ) -> Result<()> {
     let config = load_config()?;
     let model = resolve_model(&config, model);
     let max_iterations = resolve_max_iterations(&config, max_iterations);
+    let temperature = resolve_temperature(&config, temperature);
     let approval = config.approval.clone();
     let effort_level = config.effort_level.clone();
     let client = Client::new(config)?;
 
     println!("{}\n", "Starting agent task...".blue());
 
-    let mut ui = TerminalAgentUi::new(verbose);
+    // Unlike `session`, a one-shot task has no other way to show which
+    // model answered, so it keeps the label `session`/`tui` dropped.
+    let mut ui = TerminalAgentUi::new(verbose, true);
     agent::run_agent(
         &client,
         &mut ui,
         task,
         &model,
         max_iterations,
+        temperature,
         &approval,
         effort_level,
     )
@@ -1033,140 +1218,12 @@ async fn cmd_agent(
     Ok(())
 }
 
-async fn cmd_agent_chat(
-    model: Option<String>,
-    verbose: bool,
-    max_iterations: Option<usize>,
-    resume: Option<String>,
-) -> Result<()> {
-    let config = load_config()?;
-    let conn = store::open_db()?;
-    let effort_level = config.effort_level.clone();
-
-    let mut prior_prompts: Vec<String> = Vec::new();
-    let mut session = match resume {
-        Some(id_or_prefix) => {
-            let summary = resolve_resume_target(&conn, &id_or_prefix, KIND_AGENT_CHAT)?;
-            if summary.kind != KIND_AGENT_CHAT {
-                anyhow::bail!(
-                    "Session {} is a {} session, resume it with `comms chat --resume {}` instead",
-                    summary.id,
-                    summary.kind,
-                    summary.id
-                );
-            }
-            let model = model.unwrap_or_else(|| summary.model.clone());
-            println!(
-                "{} Resuming session {} ({})\n",
-                "✓".green(),
-                summary.id,
-                summary.title
-            );
-            let (session, history) =
-                ChatSession::resume(conn, &summary, model, effort_level.clone())?;
-            print_transcript(&history, &response_label(session.model(), &effort_level));
-            prior_prompts = user_prompts(&history);
-            session
-        }
-        None => {
-            let model = resolve_model(&config, model);
-            let mut session =
-                ChatSession::create(conn, model, KIND_AGENT_CHAT, effort_level.clone())?;
-            session.push_and_persist(ChatMessage {
-                role: "system".to_string(),
-                content: Some(agent::AGENT_CHAT_SYSTEM_PROMPT.to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            })?;
-            session
-        }
-    };
-
-    let max_iterations = resolve_max_iterations(&config, max_iterations);
-    let approval = config.approval.clone();
-    let client = Client::new(config)?;
-
-    println!(
-        "{}\n",
-        "Starting agent chat session (type 'exit' to quit)".blue()
-    );
-
-    let mut rl = DefaultEditor::new()?;
-    // So Up/Down can recall prompts from before this resume, not just what's
-    // typed in the current sitting.
-    for prompt in prior_prompts {
-        let _ = rl.add_history_entry(prompt);
-    }
-    let mut ui = TerminalAgentUi::new(verbose);
-
-    loop {
-        let readline = rl.readline(&format!("{} ", "You:".blue()));
-
-        match readline {
-            Ok(line) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                let _ = rl.add_history_entry(line.as_str());
-
-                if line.to_lowercase() == "exit" {
-                    println!("{} Agent chat session ended", "✓".green());
-                    break;
-                }
-
-                session.push_user(line.clone());
-
-                println!();
-                let model = session.model().to_string();
-                if let Err(e) = agent::run_agent_turn(
-                    &client,
-                    &mut ui,
-                    session.messages_mut(),
-                    &model,
-                    max_iterations,
-                    &approval,
-                    effort_level.clone(),
-                )
-                .await
-                {
-                    println!("{} {}", "✗".red(), e);
-                }
-                println!();
-
-                // Persist the user message plus whatever the agent loop
-                // appended along the way (assistant/tool turns).
-                if let Err(e) = session.persist_pending() {
-                    eprintln!("{} Failed to save message: {}", "✗".red(), e);
-                }
-            }
-            Err(rustyline::error::ReadlineError::Interrupted) => {
-                println!("{} Agent chat session ended", "✓".green());
-                break;
-            }
-            Err(e) => {
-                eprintln!("{} Error: {}", "✗".red(), e);
-                break;
-            }
-        }
-    }
-
-    println!(
-        "{} Session saved. Resume with: comms agent-chat --resume {}",
-        "✓".green(),
-        session.short_id()
-    );
-
-    Ok(())
-}
-
 async fn cmd_tui(
-    chat: bool,
-    agent: bool,
+    session: bool,
     resume: Option<String>,
     model: Option<String>,
     max_iterations: Option<usize>,
-    verbose: bool,
+    temperature: Option<f32>,
 ) -> Result<()> {
     let config = load_config()?;
 
@@ -1178,10 +1235,8 @@ async fn cmd_tui(
         let summary = store::find_session(&conn, &id_or_prefix)?
             .ok_or_else(|| anyhow::anyhow!("No session found matching '{}'", id_or_prefix))?;
         tui::Start::Resume(Box::new(summary))
-    } else if chat {
-        tui::Start::New { agentic: false }
-    } else if agent {
-        tui::Start::New { agentic: true }
+    } else if session {
+        tui::Start::New
     } else {
         tui::Start::Launch
     };
@@ -1191,9 +1246,9 @@ async fn cmd_tui(
         model_override: model,
         effort_level: config.effort_level.clone(),
         max_iterations: resolve_max_iterations(&config, max_iterations),
+        temperature: resolve_temperature(&config, temperature),
         approval: config.approval.clone(),
         client: Arc::new(Client::new(config)?),
-        verbose,
     };
 
     tui::run(context, start).await
@@ -1233,7 +1288,7 @@ async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
                 summary.kind,
                 summary.model
             );
-            print_transcript(&messages, &summary.model);
+            print_transcript(&messages);
         }
         SessionCommands::Delete { id } => {
             let summary = store::find_session(&conn, &id)?

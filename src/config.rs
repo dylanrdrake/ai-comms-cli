@@ -8,7 +8,7 @@ use std::path::PathBuf;
 const KEYRING_SERVICE: &str = "ai-comms-cli";
 const KEYRING_USERNAME: &str = "api_key";
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ApprovalSettings {
     #[serde(default = "default_true")]
     pub read_disk: bool,
@@ -32,6 +32,28 @@ impl Default for ApprovalSettings {
     }
 }
 
+impl ApprovalSettings {
+    /// Returns a copy with `category` (`"read"`/`"write"`/`"terminal"`/`"all"`)
+    /// switched to `enabled`. Shared by `comms approval`'s global-default
+    /// commands and a session's `/approval` override, so both parse the
+    /// same category words the same way.
+    pub fn with_category(&self, category: &str, enabled: bool) -> Self {
+        let mut updated = self.clone();
+        match category {
+            "read" => updated.read_disk = enabled,
+            "write" => updated.write_disk = enabled,
+            "terminal" => updated.terminal = enabled,
+            "all" => {
+                updated.read_disk = enabled;
+                updated.write_disk = enabled;
+                updated.terminal = enabled;
+            }
+            _ => {}
+        }
+        updated
+    }
+}
+
 pub const VALID_EFFORT_LEVELS: [&str; 3] = ["low", "medium", "high"];
 
 /// How `effort_level` is sent to the provider:
@@ -39,7 +61,7 @@ pub const VALID_EFFORT_LEVELS: [&str; 3] = ["low", "medium", "high"];
 /// - `nested`: `reasoning: { "effort": "<level>" }` (OpenRouter's shape)
 /// - `none`: don't send an effort field at all (providers that reject unknown fields)
 pub const VALID_EFFORT_STYLES: [&str; 3] = ["flat", "nested", "none"];
-pub const DEFAULT_EFFORT_STYLE: &str = "flat";
+pub const DEFAULT_EFFORT_STYLE: &str = "nested";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -56,10 +78,12 @@ pub struct Config {
     pub approval: ApprovalSettings,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
     #[serde(default)]
     pub effort_level: Option<String>,
     /// How to serialize `effort_level` for the current `base_url`'s provider.
-    /// `None` falls back to `DEFAULT_EFFORT_STYLE` ("flat").
+    /// `None` falls back to `DEFAULT_EFFORT_STYLE` ("nested").
     #[serde(default)]
     pub effort_style: Option<String>,
     /// Extra HTTP headers sent with every API request, for providers that
@@ -75,11 +99,15 @@ pub struct Config {
 }
 
 pub fn default_base_url() -> String {
-    "https://api.orcarouter.ai/v1".to_string()
+    "https://openrouter.ai/api/v1".to_string()
 }
 
 pub fn default_max_iterations() -> usize {
     20
+}
+
+pub fn default_temperature() -> f32 {
+    0.7
 }
 
 impl Default for Config {
@@ -90,6 +118,7 @@ impl Default for Config {
             default_model: None,
             approval: ApprovalSettings::default(),
             max_iterations: default_max_iterations(),
+            temperature: default_temperature(),
             effort_level: None,
             effort_style: None,
             extra_headers: HashMap::new(),
