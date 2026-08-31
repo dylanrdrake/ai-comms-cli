@@ -21,15 +21,6 @@ impl ChatMessage {
     }
 }
 
-/// Formats a model name with its effort level for display, e.g.
-/// "orcarouter/auto (high)", or just the model name when no effort is set.
-pub fn response_label(model: &str, effort_level: &Option<String>) -> String {
-    match effort_level {
-        Some(effort) => format!("{} ({})", model, effort),
-        None => model.to_string(),
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ToolCall {
     pub id: String,

@@ -2,7 +2,6 @@ mod agent;
 mod client;
 mod config;
 mod crypto;
-mod interactive_chat;
 mod spinner;
 mod store;
 mod tools;
@@ -13,9 +12,8 @@ use clap::{Parser, Subcommand};
 use colored::*;
 use rustyline::DefaultEditor;
 use std::io::{self, Write};
-use std::sync::Arc;
 
-use client::{response_label, ChatMessage, Client};
+use client::{ChatMessage, Client};
 use config::{
     clear_api_key, get_api_key, get_config_path, load_config, save_config, set_api_key,
     ApprovalSettings, VALID_EFFORT_LEVELS, VALID_EFFORT_STYLES,
@@ -312,6 +310,13 @@ fn resolve_model(config: &config::Config, cli_model: Option<String>) -> String {
 
 fn resolve_max_iterations(config: &config::Config, cli_value: Option<usize>) -> usize {
     cli_value.unwrap_or(config.max_iterations)
+}
+
+fn response_label(model: &str, effort_level: &Option<String>) -> String {
+    match effort_level {
+        Some(effort) => format!("{} ({})", model, effort),
+        None => model.to_string(),
+    }
 }
 
 #[tokio::main]
@@ -810,7 +815,7 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
     let config = load_config()?;
     let conn = store::open_db()?;
 
-    let (session_id, model, messages) = match resume {
+    let (session_id, model, mut messages) = match resume {
         Some(id_or_prefix) => {
             let summary = resolve_resume_target(&conn, &id_or_prefix, KIND_CHAT)?;
             if summary.kind != KIND_CHAT {
@@ -841,19 +846,114 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
     };
 
     let effort_level = config.effort_level.clone();
-    let client = Arc::new(Client::new(config)?);
-    let title_set = messages.iter().any(|m| m.role == "user");
+    let client = Client::new(config)?;
 
-    interactive_chat::run(
-        client,
-        &conn,
-        session_id,
-        model,
-        effort_level,
-        messages,
-        title_set,
-    )
-    .await
+    println!("{}\n", "Starting chat session (type 'exit' to quit)".blue());
+
+    let mut rl = DefaultEditor::new()?;
+    let mut title_set = messages.iter().any(|m| m.role == "user");
+
+    loop {
+        let readline = rl.readline(&format!("{} ", "You:".blue()));
+
+        match readline {
+            Ok(line) => {
+                if line.to_lowercase() == "exit" {
+                    println!("{} Chat session ended", "✓".green());
+                    break;
+                }
+
+                let seq = messages.len();
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(line.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+                if let Err(e) = store::append_message(
+                    &conn,
+                    &session_id,
+                    seq,
+                    &messages[seq],
+                    &model,
+                    effort_level.as_deref(),
+                ) {
+                    eprintln!("{} Failed to save message: {}", "✗".red(), e);
+                }
+                if !title_set {
+                    let title = store::derive_title(&messages);
+                    if let Err(e) = store::set_session_title(&conn, &session_id, &title) {
+                        eprintln!("{} Failed to save session title: {}", "✗".red(), e);
+                    }
+                    title_set = true;
+                }
+
+                println!();
+                let spinner = Spinner::start("Thinking...");
+                let result = client
+                    .chat(
+                        model.clone(),
+                        messages.clone(),
+                        0.7,
+                        None,
+                        effort_level.clone(),
+                    )
+                    .await;
+                spinner.stop().await;
+
+                match result {
+                    Ok(response) => {
+                        let choice = &response.choices[0];
+                        if choice.message.has_visible_content() {
+                            let content = choice.message.content.as_deref().unwrap();
+                            println!(
+                                "{} {}\n",
+                                format!("{}:", response_label(&model, &effort_level)).cyan(),
+                                wrap::wrap(content)
+                            );
+                            let seq = messages.len();
+                            let assistant_message = ChatMessage {
+                                role: "assistant".to_string(),
+                                content: Some(content.to_string()),
+                                tool_calls: None,
+                                tool_call_id: None,
+                            };
+                            messages.push(assistant_message.clone());
+                            if let Err(e) = store::append_message(
+                                &conn,
+                                &session_id,
+                                seq,
+                                &assistant_message,
+                                &model,
+                                effort_level.as_deref(),
+                            ) {
+                                eprintln!("{} Failed to save message: {}", "✗".red(), e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("{} {}\n", "✗".red(), e);
+                    }
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("{} Chat session ended", "✓".green());
+                break;
+            }
+            Err(e) => {
+                eprintln!("{} Error: {}", "✗".red(), e);
+                break;
+            }
+        }
+    }
+
+    println!(
+        "{} Session saved. Resume with: comms chat --resume {}",
+        "✓".green(),
+        &session_id[..8]
+    );
+
+    Ok(())
 }
 
 async fn cmd_agent(

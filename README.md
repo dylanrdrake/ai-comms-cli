@@ -193,24 +193,9 @@ comms ask "Write a poem" -t 1.5
 #### `chat`
 Start an interactive multi-turn conversation. The session is saved automatically as you go (see [Session Persistence](#session-persistence)), so you can pick it back up later.
 
-The prompt stays live the whole time — you're never blocked waiting for a response, so you can keep typing as soon as you hit enter. What happens to what you type next depends on whether a response is still in flight when you send it:
-
-| You type... | Nothing in flight | A response is in flight |
-|---|---|---|
-| a plain message | sent right away | queued, sent automatically once the current response finishes |
-| `/steer <message>` | sent right away (the `/steer` prefix is stripped either way) | the in-flight response is cancelled immediately and `<message>` is sent in its place |
-
 ```bash
 comms chat
 # Type exit to quit
-
-# At the prompt, typing a follow-up while the model is still responding
-# queues it — it's sent once the current response finishes:
-[model] You: also check for edge cases
-
-# Prefixing a message with /steer instead cancels the in-flight response
-# and sends this one right away:
-[model] You: /steer actually, focus on error handling instead
 
 # Resume a previous session by id (or a unique prefix of it)
 comms chat --resume a1b2c3d4
@@ -346,8 +331,6 @@ Each session gets an id (a UUID) and a title derived from your first message. Us
 - `comms chat --resume <id>` / `comms agent-chat --resume <id>` to continue a saved session
 - `comms chat --resume` / `comms agent-chat --resume` with no id to pick one from a numbered list of your saved sessions of that kind
 
-Each message also records the model and effort level that produced it, so `sessions show` (and the transcript printed when resuming) labels every reply with what actually generated it — accurate even if you resumed with a different `--model` or changed the effort level partway through a session. Older messages saved before this was tracked just fall back to the session's stored model.
-
 Any unique prefix of a session's id works wherever a full id is expected. Resuming a `chat` session with `agent-chat --resume` (or vice versa) is rejected, since the two modes carry different system prompts and tool history.
 
 ## Examples
@@ -429,7 +412,7 @@ sudo dnf groupinstall "Development Tools"
 
 - File operations are restricted to your current working directory and home directory
 - API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.comms/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `comms` command, and the field is stripped from the file afterward
-- `chat`/`agent-chat` history (session titles, message content, and tool calls/results) is encrypted at rest in `~/.comms/chats.db` with AES-256-GCM. The encryption key is generated on first use and stored in your OS keychain, the same way the API key is — so the data is unreadable without access to that keychain. `role`, `tool_call_id`, model, and timestamps are left unencrypted since they aren't sensitive. Older, pre-encryption databases are migrated transparently: legacy plaintext rows are read as-is and re-encrypted the next time they're written
+- `chat`/`agent-chat` history (including tool calls and their results) is stored unencrypted in `~/.comms/chats.db` — add it to `.gitignore` and avoid pasting secrets into a session if you plan to keep or share the database file
 
 ## Development
 

@@ -8,7 +8,7 @@ can we connect to openrouter too or other "model aggregators"? — done (single 
 
 Websearch
 
-1. response formatting, especially newlines. Keep prompt input active while thinking with prompt queue if another is sent while thinking with the option to steer, make sure the chat history keeps track of the model and effort level of each message so each response message shows which model and effort level was used to generate it. Display the currently selected model and effort level somewhere near the new persistent prompt input field. — done: `chat` word-wraps output and spaces out turns consistently; each message records the model/effort that produced it and `sessions show`/resume label replies accordingly; the `chat` prompt stays live while a response is pending (input and the request run concurrently), a message typed mid-response is queued and sent once it finishes, and prefixing one with `/steer` cancels the in-flight request and sends it immediately instead; the prompt itself now shows `[model (effort)] You:`. Not yet extended to `agent-chat` — its turns can run tool calls with side effects, so cancelling mid-turn isn't safe without more thought.
+1. response formatting, especially newlines. Keep prompt input active while thinking with prompt queue if another is sent while thinking with the option to steer
 
 3. display intermediate actions whilte thinking
 
