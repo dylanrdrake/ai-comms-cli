@@ -22,6 +22,17 @@ const VERSION_PREFIX: &str = "v1:";
 /// encrypted with a key that gets overwritten and lost).
 static KEY_CACHE: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
+/// Seeds the in-process key cache with a fixed key so tests never touch the
+/// OS keychain (which requires D-Bus `org.freedesktop.secrets` on Linux and
+/// isn't available in CI).
+#[cfg(test)]
+pub fn seed_test_key() {
+    let mut cache = KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.is_none() {
+        *cache = Some([0xAB; 32]);
+    }
+}
+
 fn keyring_entry() -> Result<Entry> {
     Ok(Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)?)
 }
@@ -128,6 +139,7 @@ mod tests {
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
+        seed_test_key();
         let plaintext = "hello, this is sensitive chat content";
         let encrypted = encrypt(plaintext).unwrap();
         assert!(encrypted.starts_with(VERSION_PREFIX));
@@ -149,6 +161,7 @@ mod tests {
 
     #[test]
     fn encrypting_the_same_plaintext_twice_yields_different_ciphertext() {
+        seed_test_key();
         let a = encrypt("same content").unwrap();
         let b = encrypt("same content").unwrap();
         assert_ne!(a, b, "nonces should differ between calls");

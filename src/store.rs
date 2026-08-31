@@ -322,6 +322,7 @@ mod tests {
     use super::*;
 
     fn memory_db() -> Connection {
+        crate::crypto::seed_test_key();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "

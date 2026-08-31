@@ -232,6 +232,7 @@ mod tests {
     /// An in-memory database with the same schema `store::open_db` builds,
     /// so sessions can be exercised without touching the real one.
     fn memory_session() -> ChatSession {
+        crate::crypto::seed_test_key();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "

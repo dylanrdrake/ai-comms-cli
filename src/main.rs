@@ -36,7 +36,7 @@ use ui::response_label;
 #[command(version = "0.1.0")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -358,44 +358,45 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Login => cmd_login().await?,
-        Commands::Logout => cmd_logout().await?,
-        Commands::Status => cmd_status().await?,
-        Commands::Models => cmd_models().await?,
-        Commands::Model { name, clear } => cmd_model(name, clear).await?,
-        Commands::Endpoint { url, clear } => cmd_endpoint(url, clear).await?,
-        Commands::EffortStyle { value, clear } => cmd_effort_style(value, clear).await?,
-        Commands::Headers { action } => cmd_headers(action).await?,
-        Commands::Approval { action } => cmd_approval(action).await?,
-        Commands::MaxIterations { value } => cmd_max_iterations(value).await?,
-        Commands::Stream { value } => cmd_stream(value).await?,
-        Commands::EffortLevel { value, clear } => cmd_effort_level(value, clear).await?,
-        Commands::Ask {
+        None => cmd_tui(false, false, None, None, None).await?,
+        Some(Commands::Login) => cmd_login().await?,
+        Some(Commands::Logout) => cmd_logout().await?,
+        Some(Commands::Status) => cmd_status().await?,
+        Some(Commands::Models) => cmd_models().await?,
+        Some(Commands::Model { name, clear }) => cmd_model(name, clear).await?,
+        Some(Commands::Endpoint { url, clear }) => cmd_endpoint(url, clear).await?,
+        Some(Commands::EffortStyle { value, clear }) => cmd_effort_style(value, clear).await?,
+        Some(Commands::Headers { action }) => cmd_headers(action).await?,
+        Some(Commands::Approval { action }) => cmd_approval(action).await?,
+        Some(Commands::MaxIterations { value }) => cmd_max_iterations(value).await?,
+        Some(Commands::Stream { value }) => cmd_stream(value).await?,
+        Some(Commands::EffortLevel { value, clear }) => cmd_effort_level(value, clear).await?,
+        Some(Commands::Ask {
             prompt,
             model,
             temperature,
-        } => cmd_ask(&prompt, model, temperature).await?,
-        Commands::Chat { model, resume } => cmd_chat(model, resume).await?,
-        Commands::Agent {
+        }) => cmd_ask(&prompt, model, temperature).await?,
+        Some(Commands::Chat { model, resume }) => cmd_chat(model, resume).await?,
+        Some(Commands::Agent {
             task,
             model,
             verbose,
             max_iterations,
-        } => cmd_agent(&task, model, verbose, max_iterations).await?,
-        Commands::AgentChat {
+        }) => cmd_agent(&task, model, verbose, max_iterations).await?,
+        Some(Commands::AgentChat {
             model,
             verbose,
             max_iterations,
             resume,
-        } => cmd_agent_chat(model, verbose, max_iterations, resume).await?,
-        Commands::Tui {
+        }) => cmd_agent_chat(model, verbose, max_iterations, resume).await?,
+        Some(Commands::Tui {
             chat,
             agent,
             resume,
             model,
             max_iterations,
-        } => cmd_tui(chat, agent, resume, model, max_iterations).await?,
-        Commands::Sessions { action } => cmd_sessions(action).await?,
+        }) => cmd_tui(chat, agent, resume, model, max_iterations).await?,
+        Some(Commands::Sessions { action }) => cmd_sessions(action).await?,
     }
 
     Ok(())

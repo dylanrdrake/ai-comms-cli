@@ -32,7 +32,7 @@ async-stream = "0.3"
 # `unstable-rendered-line-info` exposes Paragraph::line_count, the only way to
 # measure wrapped height with ratatui's own wrapper. Estimating it separately
 # drifts from the real layout and scrolls the transcript off its own content.
-ratatui = { version = "0.30", features = [
+ratatui = { version = "0.30.2", features = [
     "crossterm_0_29",
     "unstable-rendered-line-info",
 ] }
