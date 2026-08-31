@@ -22,11 +22,12 @@ use crate::config::ApprovalSettings;
 use crate::conversation::{Command, Conversation};
 use crate::session::ChatSession;
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
-use crate::ui::response_label;
+use crate::ui::{parse_yes_no, response_label};
 use anyhow::Result;
 use app::{App, Focus, TranscriptItem};
 use crossterm::event::{
-    Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream, KeyCode,
+    KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::{execute, terminal};
 use futures_util::StreamExt;
@@ -51,6 +52,8 @@ pub struct Context {
     pub effort_level: Option<String>,
     pub max_iterations: usize,
     pub approval: ApprovalSettings,
+    /// Mirrors the plain CLI's `-v`: shows tool call arguments and results.
+    pub verbose: bool,
 }
 
 /// Where the TUI opens.
@@ -159,6 +162,7 @@ fn start_chat(
         session.short_id().to_string(),
     );
     app.agentic = agentic;
+    app.verbose = context.verbose;
     seed_transcript(&mut app, &history);
 
     let conversation = Conversation::spawn(
@@ -180,6 +184,9 @@ fn seed_transcript(app: &mut App, history: &[StoredMessage]) {
             "user" => {
                 if let Some(text) = &message.content {
                     app.transcript.push(TranscriptItem::User(text.clone()));
+                    // So Up/Down can recall prompts from before this resume,
+                    // not just what's typed in the current sitting.
+                    app.input_history.push(text.clone());
                 }
             }
             "assistant" => {
@@ -212,14 +219,21 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 fn enter() -> Result<Tui> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen)?;
+    // Without this, a terminal delivers a paste as plain keystrokes, and
+    // any embedded newline reads as a real Enter — submitting each pasted
+    // line as its own message instead of landing in the input box as text.
+    execute!(stdout, terminal::EnterAlternateScreen, EnableBracketedPaste)?;
 
     // A panic while in raw mode would otherwise leave the terminal unusable
     // with no echo and no cursor, so restore first, then panic normally.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            terminal::LeaveAlternateScreen
+        );
         previous(info);
     }));
 
@@ -228,7 +242,11 @@ fn enter() -> Result<Tui> {
 
 fn leave(terminal: &mut Tui) -> Result<()> {
     terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), terminal::LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        terminal::LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -283,6 +301,12 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
         match wake {
             Wake::Key(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
                 quit = handle_key(context, screen, key).await?;
+                dirty = true;
+            }
+            Wake::Key(TermEvent::Paste(text)) => {
+                if let Screen::Chat(chat) = screen {
+                    chat.app.paste(&text);
+                }
                 dirty = true;
             }
             Wake::Key(TermEvent::Resize(_, _)) => dirty = true,
@@ -396,15 +420,16 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
 fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) -> bool {
     if app.focus == Focus::Approval {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                conversation.send(Command::Approve(true));
-                app.approval_answered(true);
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                conversation.send(Command::Approve(false));
-                app.approval_answered(false);
+            KeyCode::Enter => {
+                let allowed = parse_yes_no(&app.take_approval_answer());
+                conversation.send(Command::Approve(allowed));
+                app.approval_answered(allowed);
             }
             KeyCode::Esc => conversation.send(Command::Cancel),
+            KeyCode::Backspace => app.backspace(),
+            KeyCode::Left => app.move_left(),
+            KeyCode::Right => app.move_right(),
+            KeyCode::Char(c) => app.insert_char(c),
             _ => {}
         }
         return false;
@@ -447,6 +472,8 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
         KeyCode::Backspace => app.backspace(),
         KeyCode::Left => app.move_left(),
         KeyCode::Right => app.move_right(),
+        KeyCode::Up => app.history_up(),
+        KeyCode::Down => app.history_down(),
         KeyCode::PageUp => app.scroll_back = app.scroll_back.saturating_add(5),
         KeyCode::PageDown => app.scroll_back = app.scroll_back.saturating_sub(5),
         KeyCode::End => app.scroll_back = 0,

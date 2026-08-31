@@ -1,8 +1,9 @@
 //! Drawing the TUI. Pure presentation over [`App`] — no state changes here.
 
 use super::app::{App, Focus, ToolStatus, TranscriptItem};
+use crate::ui::{json_fields, summarize, ApprovalRequest};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 /// Spinner frames, reused from the CLI's so both front ends feel the same.
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -12,10 +13,18 @@ const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const MAX_INPUT_ROWS: u16 = 10;
 
 pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
-    // The message box grows with what's typed instead of staying at one row,
-    // so multi-line input is visible while writing it.
+    // The message box grows with what's in it instead of staying at one
+    // row — normally what's been typed, or, while a tool call is waiting on
+    // a decision, the approval prompt that takes over the same box instead
+    // of floating a separate modal over the conversation.
     let input_width = frame.area().width.saturating_sub(2);
-    let input_rows = (input_lines(&app.input, input_width).len() as u16)
+    let content_rows = match &app.pending_approval {
+        // The typed-answer line plus the blank line under it, ahead of the
+        // tool/argument detail — see `draw_approval`.
+        Some(request) => approval_lines(request).len() as u16 + 2,
+        None => input_lines(&app.input, input_width).len() as u16,
+    };
+    let input_rows = content_rows
         .clamp(1, MAX_INPUT_ROWS)
         // Never take so much that the conversation has nowhere to go.
         .min(frame.area().height.saturating_sub(5).max(1));
@@ -30,10 +39,6 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
     draw_transcript(frame, areas[0], app);
     draw_input(frame, areas[1], app);
     draw_status(frame, areas[2], app, tick);
-
-    if app.pending_approval.is_some() {
-        draw_approval(frame, frame.area(), app);
-    }
 }
 
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
@@ -84,19 +89,35 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
                     ToolStatus::Denied => ("✗", Style::new().red()),
                     ToolStatus::Done { .. } => ("✓", Style::new().green()),
                 };
-                lines.push(Line::from(vec![
+                let mut header = vec![
                     Span::styled(format!("  {marker} "), style),
                     Span::styled(name.clone(), Style::new().bold()),
-                    Span::styled(
-                        format!("  {}", summarize(arguments, 60)),
+                ];
+                // The file or command a call is acting on identifies it well
+                // enough to show even without -v; the rest of its arguments
+                // (and its result) are the detail that gates behind verbose.
+                if let Some(detail) = crate::ui::primary_argument(arguments) {
+                    header.push(Span::styled(
+                        format!("  {}", summarize(&detail, 60)),
                         Style::new().dark_gray(),
-                    ),
-                ]));
-                if let ToolStatus::Done { result } = status {
-                    lines.push(Line::from(Span::styled(
-                        format!("     {}", summarize(result, 80)),
-                        Style::new().dark_gray(),
-                    )));
+                    ));
+                }
+                lines.push(Line::from(header));
+                if app.verbose {
+                    for (key, shown) in json_fields(arguments) {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("     {key}  "), Style::new().dark_gray()),
+                            Span::raw(shown),
+                        ]));
+                    }
+                    if let ToolStatus::Done { result } = status {
+                        for (key, shown) in json_fields(result) {
+                            lines.push(Line::from(vec![
+                                Span::styled(format!("     {key}  "), Style::new().dark_gray()),
+                                Span::raw(shown),
+                            ]));
+                        }
+                    }
                 }
                 lines.push(Line::raw(""));
             }
@@ -184,9 +205,12 @@ fn scroll_hint(app: &App, max_offset: u16) -> Line<'static> {
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
-    let (title, style) = if app.focus == Focus::Approval {
-        (" allow this? y / n ", Style::new().yellow())
-    } else if app.busy {
+    if let Some(request) = &app.pending_approval {
+        draw_approval(frame, area, app, request);
+        return;
+    }
+
+    let (title, style) = if app.busy {
         (" message (queues while busy) ", Style::new().dark_gray())
     } else {
         (" message ", Style::new().dark_gray())
@@ -309,81 +333,62 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_approval(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(request) = &app.pending_approval else {
-        return;
-    };
-
+/// Takes over the input box — rather than floating a modal over the
+/// conversation — since typing is already redirected to y/n/esc during
+/// approval and the box is otherwise sitting idle.
+/// Answered by typing rather than a raw keypress, so the box works like the
+/// ordinary input it's replacing: type, edit, Enter to submit. The typed
+/// line comes first and never wraps in practice (a "y"/"no"/"yes" answer is
+/// short), which keeps its cursor position exact regardless of how many
+/// argument lines follow and might themselves wrap.
+fn draw_approval(frame: &mut Frame, area: Rect, app: &App, request: &ApprovalRequest) {
     let category = match request.category {
         "read" => "Read from disk",
         "write" => "Write to disk",
         "terminal" => "Terminal command",
         _ => "Unknown action",
     };
+    let title = format!(" {category} — type y or yes to allow, Enter to deny, Esc to cancel ");
 
+    let prompt = "allow?  ";
     let mut lines = vec![
-        Line::from(Span::styled(category, Style::new().yellow().bold())),
-        Line::raw(""),
         Line::from(vec![
-            Span::styled("tool  ", Style::new().dark_gray()),
-            Span::styled(request.tool_name.clone(), Style::new().bold()),
+            Span::styled(prompt, Style::new().yellow().bold()),
+            Span::raw(app.input.clone()),
         ]),
+        Line::raw(""),
     ];
+    lines.extend(approval_lines(request));
 
-    // Show arguments field by field, matching how the CLI presents them.
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&request.arguments) {
-        if let Some(object) = value.as_object() {
-            for (key, value) in object {
-                let shown = value
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| value.to_string());
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{key}  "), Style::new().dark_gray()),
-                    Span::raw(summarize(&shown, 100)),
-                ]));
-            }
-        }
-    }
+    let paragraph = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().yellow())
+                .title(Span::styled(title, Style::new().yellow().bold())),
+        );
+    frame.render_widget(paragraph, area);
 
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("y", Style::new().green().bold()),
-        Span::raw(" allow    "),
-        Span::styled("n", Style::new().red().bold()),
-        Span::raw(" deny    "),
-        Span::styled("Esc", Style::new().bold()),
-        Span::raw(" cancel turn"),
-    ]));
-
-    let popup = centered(area, 70, lines.len() as u16 + 2);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::new().yellow())
-                    .title(Span::styled(
-                        " approval needed ",
-                        Style::new().yellow().bold(),
-                    )),
-            ),
-        popup,
-    );
+    let col = prompt.chars().count() as u16 + app.input[..app.cursor].chars().count() as u16;
+    frame.set_cursor_position((area.x + 1 + col, area.y + 1));
 }
 
-/// A box of at most `width`x`height`, centered, clamped to what fits.
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width.saturating_sub(2));
-    let height = height.min(area.height.saturating_sub(2));
-    Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
+/// The tool and its arguments, field by field — matching how the CLI
+/// presents an approval prompt and how a verbose tool-call notice presents
+/// its arguments.
+fn approval_lines(request: &ApprovalRequest) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled("tool  ", Style::new().dark_gray()),
+        Span::styled(request.tool_name.clone(), Style::new().bold()),
+    ])];
+    for (key, shown) in json_fields(&request.arguments) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{key}  "), Style::new().dark_gray()),
+            Span::raw(shown),
+        ]));
     }
+    lines
 }
 
 /// Renders markdown to styled rows.
@@ -485,21 +490,6 @@ fn push_block(
             }
         }
         lines.push(Line::from(spans));
-    }
-}
-
-/// One-line preview of a possibly long/multi-line value.
-fn summarize(text: &str, max: usize) -> String {
-    let flat: String = text
-        .chars()
-        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
-        .collect();
-    let flat = flat.trim();
-    if flat.chars().count() > max {
-        let kept: String = flat.chars().take(max).collect();
-        format!("{kept}…")
-    } else {
-        flat.to_string()
     }
 }
 
@@ -627,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_modal_shows_tool_and_arguments() {
+    fn approval_takes_over_the_input_box_instead_of_a_modal() {
         let mut app = sample_app();
         app.pending_approval = Some(ApprovalRequest {
             tool_name: "write_file".into(),
@@ -635,11 +625,30 @@ mod tests {
             arguments: r#"{"filepath":"/tmp/a.txt"}"#.into(),
         });
         let out = render_to_string(&app, 70, 20);
-        assert!(out.contains("approval needed"), "{out}");
         assert!(out.contains("Write to disk"), "{out}");
         assert!(out.contains("write_file"), "{out}");
         assert!(out.contains("/tmp/a.txt"), "{out}");
         assert!(out.contains("allow"), "{out}");
+        // No separate floating box — the same message box that would
+        // otherwise show "message" now shows the approval prompt.
+        assert!(!out.contains("message"), "{out}");
+    }
+
+    #[test]
+    fn approval_prompt_shows_what_was_typed_into_it() {
+        let mut app = sample_app();
+        app.pending_approval = Some(ApprovalRequest {
+            tool_name: "write_file".into(),
+            category: "write",
+            arguments: "{}".into(),
+        });
+        app.focus = Focus::Approval;
+        for c in "yes".chars() {
+            app.insert_char(c);
+        }
+        let out = render_to_string(&app, 70, 20);
+        assert!(out.contains("yes"), "{out}");
+        assert!(out.contains("Enter to deny"), "{out}");
     }
 
     #[test]
@@ -655,6 +664,48 @@ mod tests {
         let out = render_to_string(&app, 70, 12);
         assert!(out.contains("read_file"), "{out}");
         assert!(out.contains('✓'), "{out}");
+    }
+
+    #[test]
+    fn tool_call_arguments_and_result_only_show_when_verbose() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript.push(TranscriptItem::ToolCall {
+            name: "read_file".into(),
+            arguments: r#"{"filepath":"a.rs"}"#.into(),
+            status: ToolStatus::Done {
+                result: r#"{"success":true}"#.into(),
+            },
+        });
+
+        let out = render_to_string(&app, 70, 12);
+        assert!(out.contains("read_file"), "{out}");
+        assert!(!out.contains("filepath"), "{out}");
+        assert!(!out.contains("success"), "{out}");
+
+        app.verbose = true;
+        let out = render_to_string(&app, 70, 12);
+        assert!(out.contains("filepath"), "{out}");
+        assert!(out.contains("success"), "{out}");
+    }
+
+    #[test]
+    fn tool_call_shows_its_file_or_command_even_when_not_verbose() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript.push(TranscriptItem::ToolCall {
+            name: "write_file".into(),
+            arguments: r#"{"filepath":"src/main.rs","content":"fn main() {}"}"#.into(),
+            status: ToolStatus::Running,
+        });
+        app.transcript.push(TranscriptItem::ToolCall {
+            name: "run_terminal_command".into(),
+            arguments: r#"{"command":"cargo test"}"#.into(),
+            status: ToolStatus::Running,
+        });
+
+        let out = render_to_string(&app, 70, 16);
+        assert!(out.contains("src/main.rs"), "{out}");
+        assert!(!out.contains("fn main"), "{out}");
+        assert!(out.contains("cargo test"), "{out}");
     }
 
     #[test]
@@ -813,15 +864,5 @@ mod tests {
         // Truncating by byte index here would panic or corrupt the text.
         let text = "é".repeat(20);
         assert_eq!(summarize(&text, 3).chars().count(), 4); // 3 + ellipsis
-    }
-
-    #[test]
-    fn centered_box_fits_inside_small_areas() {
-        let area = Rect::new(0, 0, 20, 6);
-        let popup = centered(area, 70, 30);
-        assert!(popup.width <= area.width);
-        assert!(popup.height <= area.height);
-        assert!(popup.x + popup.width <= area.x + area.width);
-        assert!(popup.y + popup.height <= area.y + area.height);
     }
 }

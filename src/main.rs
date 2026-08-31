@@ -206,6 +206,10 @@ enum Commands {
         /// Maximum number of iterations per turn (agent mode only)
         #[arg(long)]
         max_iterations: Option<usize>,
+
+        /// Show tool call arguments and results, like the plain CLI's -v
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Manage saved chat sessions
@@ -358,7 +362,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => cmd_tui(false, false, None, None, None).await?,
+        None => cmd_tui(false, false, None, None, None, false).await?,
         Some(Commands::Login) => cmd_login().await?,
         Some(Commands::Logout) => cmd_logout().await?,
         Some(Commands::Status) => cmd_status().await?,
@@ -395,7 +399,8 @@ async fn main() -> Result<()> {
             resume,
             model,
             max_iterations,
-        }) => cmd_tui(chat, agent, resume, model, max_iterations).await?,
+            verbose,
+        }) => cmd_tui(chat, agent, resume, model, max_iterations, verbose).await?,
         Some(Commands::Sessions { action }) => cmd_sessions(action).await?,
     }
 
@@ -879,11 +884,22 @@ fn print_transcript(messages: &[store::StoredMessage], default_label: &str) {
     }
 }
 
+/// Pulls the user turns out of a resumed session's history, in order, so
+/// they can seed the readline history and stay recallable with Up/Down.
+fn user_prompts(messages: &[store::StoredMessage]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|sm| sm.message.role == "user")
+        .filter_map(|sm| sm.message.content.clone())
+        .collect()
+}
+
 async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
     let config = load_config()?;
     let conn = store::open_db()?;
     let effort_level = config.effort_level.clone();
 
+    let mut prior_prompts: Vec<String> = Vec::new();
     let mut session = match resume {
         Some(id_or_prefix) => {
             let summary = resolve_resume_target(&conn, &id_or_prefix, KIND_CHAT)?;
@@ -905,6 +921,7 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
             let (session, history) =
                 ChatSession::resume(conn, &summary, model, effort_level.clone())?;
             print_transcript(&history, &response_label(session.model(), &effort_level));
+            prior_prompts = user_prompts(&history);
             session
         }
         None => {
@@ -918,6 +935,11 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
     println!("{}\n", "Starting chat session (type 'exit' to quit)".blue());
 
     let mut rl = DefaultEditor::new()?;
+    // So Up/Down can recall prompts from before this resume, not just what's
+    // typed in the current sitting.
+    for prompt in prior_prompts {
+        let _ = rl.add_history_entry(prompt);
+    }
     // Plain chat has no tool calls, so nothing here ever prompts; verbose is
     // off because there are no iterations to narrate.
     let mut ui = TerminalAgentUi::new(false);
@@ -927,6 +949,7 @@ async fn cmd_chat(model: Option<String>, resume: Option<String>) -> Result<()> {
 
         match readline {
             Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
                 if line.to_lowercase() == "exit" {
                     println!("{} Chat session ended", "✓".green());
                     break;
@@ -1020,6 +1043,7 @@ async fn cmd_agent_chat(
     let conn = store::open_db()?;
     let effort_level = config.effort_level.clone();
 
+    let mut prior_prompts: Vec<String> = Vec::new();
     let mut session = match resume {
         Some(id_or_prefix) => {
             let summary = resolve_resume_target(&conn, &id_or_prefix, KIND_AGENT_CHAT)?;
@@ -1041,6 +1065,7 @@ async fn cmd_agent_chat(
             let (session, history) =
                 ChatSession::resume(conn, &summary, model, effort_level.clone())?;
             print_transcript(&history, &response_label(session.model(), &effort_level));
+            prior_prompts = user_prompts(&history);
             session
         }
         None => {
@@ -1067,6 +1092,11 @@ async fn cmd_agent_chat(
     );
 
     let mut rl = DefaultEditor::new()?;
+    // So Up/Down can recall prompts from before this resume, not just what's
+    // typed in the current sitting.
+    for prompt in prior_prompts {
+        let _ = rl.add_history_entry(prompt);
+    }
     let mut ui = TerminalAgentUi::new(verbose);
 
     loop {
@@ -1077,6 +1107,8 @@ async fn cmd_agent_chat(
                 if line.trim().is_empty() {
                     continue;
                 }
+
+                let _ = rl.add_history_entry(line.as_str());
 
                 if line.to_lowercase() == "exit" {
                     println!("{} Agent chat session ended", "✓".green());
@@ -1134,6 +1166,7 @@ async fn cmd_tui(
     resume: Option<String>,
     model: Option<String>,
     max_iterations: Option<usize>,
+    verbose: bool,
 ) -> Result<()> {
     let config = load_config()?;
 
@@ -1160,6 +1193,7 @@ async fn cmd_tui(
         max_iterations: resolve_max_iterations(&config, max_iterations),
         approval: config.approval.clone(),
         client: Arc::new(Client::new(config)?),
+        verbose,
     };
 
     tui::run(context, start).await

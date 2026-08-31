@@ -4,7 +4,10 @@
 //! it likes without touching the loop itself.
 
 use crate::spinner::Spinner;
-use crate::ui::{response_label, AgentEvent, AgentUi, ApprovalRequest};
+use crate::ui::{
+    json_fields, parse_yes_no, primary_argument, response_label, AgentEvent, AgentUi,
+    ApprovalRequest,
+};
 use crate::wrap;
 use anyhow::Result;
 use colored::*;
@@ -12,11 +15,20 @@ use std::future::Future;
 use std::io::{self, Write};
 
 pub struct TerminalAgentUi {
-    /// Mirrors the `-v` flag: gates the step-by-step iteration/tool logs.
-    /// Assistant text and denial notices are always shown.
+    /// Mirrors the `-v` flag: gates the full argument/result dump. The
+    /// marker-and-name notice below it — matching what the TUI always shows
+    /// — is not gated, so plain `agent`/`agent-chat` isn't silent about
+    /// tool calls the way it used to be.
     verbose: bool,
     /// Live only between `RequestStarted` and `RequestFinished`.
     spinner: Option<Spinner>,
+    /// The call's arguments, held from `ToolCallStarted` to whichever event
+    /// settles it, so the notice that settles it can still name the file
+    /// or command being acted on, and so `ToolCallCompleted` can tell a
+    /// denied call (already reported by `ToolCallDenied`) from one that
+    /// actually ran. Tool calls run one at a time, so there's never more
+    /// than one in flight to track.
+    pending_arguments: Option<String>,
 }
 
 impl TerminalAgentUi {
@@ -24,6 +36,7 @@ impl TerminalAgentUi {
         TerminalAgentUi {
             verbose,
             spinner: None,
+            pending_arguments: None,
         }
     }
 }
@@ -58,17 +71,28 @@ impl AgentUi for TerminalAgentUi {
                     println!("{} {}", label.cyan(), wrap::wrap(&text));
                 }
                 AgentEvent::ToolCallStarted { name, arguments } => {
+                    tool_notice("▸".yellow(), &name, &arguments);
                     if self.verbose {
-                        println!("{} {}", "→ Calling tool:".yellow(), name);
-                        println!("{} {}", "  Input:".bright_black(), arguments);
+                        print_fields(&json_fields(&arguments));
                     }
+                    self.pending_arguments = Some(arguments);
                 }
-                AgentEvent::ToolCallDenied { .. } => {
-                    println!("{} Tool execution denied by user", "✗".red());
+                AgentEvent::ToolCallDenied { name } => {
+                    // Consumes the pending call so the ToolCallCompleted
+                    // that always follows a denial knows not to report the
+                    // same call again as if it had succeeded.
+                    let arguments = self.pending_arguments.take().unwrap_or_default();
+                    tool_notice("✗".red(), &format!("{name} denied"), &arguments);
                 }
-                AgentEvent::ToolCallCompleted { result, .. } => {
+                AgentEvent::ToolCallCompleted { name, result } => {
+                    // Only the non-denied path reaches here with a pending
+                    // entry; a denial already reported itself and cleared it.
+                    if self.pending_arguments.take().is_none() {
+                        return;
+                    }
+                    println!("{} {}", "✓".green(), name.bold());
                     if self.verbose {
-                        println!("{} {}", "  Result:".bright_black(), result);
+                        print_fields(&json_fields(&result));
                     }
                 }
                 AgentEvent::Error { message } => {
@@ -134,37 +158,24 @@ impl TerminalAgentUi {
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
 
-        Ok(parse_approval_response(&input))
+        Ok(parse_yes_no(&input))
     }
 }
 
-/// Interprets a typed answer to the `Allow? [y/N]:` prompt. Anything other
-/// than an explicit yes denies the action.
-fn parse_approval_response(input: &str) -> bool {
-    let response = input.trim().to_lowercase();
-    response == "y" || response == "yes"
+/// Prints `marker name  detail`, where `detail` is the file path or command
+/// the call is acting on when its arguments have one — the same terse
+/// identification the TUI always shows for a tool call, regardless of `-v`.
+fn tool_notice(marker: ColoredString, name: &str, arguments: &str) {
+    match primary_argument(arguments) {
+        Some(detail) => println!("{marker} {}  {}", name.bold(), detail.bright_black()),
+        None => println!("{marker} {}", name.bold()),
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn approval_accepts_only_explicit_yes() {
-        assert!(parse_approval_response("y"));
-        assert!(parse_approval_response("yes"));
-        assert!(parse_approval_response("  YES  \n"));
-        assert!(parse_approval_response("Y\n"));
-    }
-
-    #[test]
-    fn approval_denies_everything_else() {
-        assert!(!parse_approval_response("n"));
-        assert!(!parse_approval_response("no"));
-        assert!(!parse_approval_response(""));
-        assert!(!parse_approval_response("\n"));
-        assert!(!parse_approval_response("maybe"));
-        // Fails closed: a stray answer is a denial, never an approval.
-        assert!(!parse_approval_response("yep"));
+/// The verbose-only per-field breakdown under a tool notice, matching the
+/// TUI's indentation for the same data.
+fn print_fields(fields: &[(String, String)]) {
+    for (key, shown) in fields {
+        println!("     {}  {}", key.bright_black(), shown);
     }
 }

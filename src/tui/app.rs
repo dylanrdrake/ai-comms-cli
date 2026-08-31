@@ -106,6 +106,19 @@ pub struct App {
     /// Whether this conversation runs the tool loop, shown in the status bar
     /// so the mode is never ambiguous once you're inside a session.
     pub agentic: bool,
+    /// Mirrors the plain CLI's `-v`: gates whether tool call arguments and
+    /// results are shown, not just that a tool ran.
+    pub verbose: bool,
+    /// Previously submitted lines, oldest first, that Up/Down recall into
+    /// the input box — the TUI's equivalent of the plain CLI's readline
+    /// history. Seeded from a resumed session's past turns.
+    pub input_history: Vec<String>,
+    /// Position within `input_history` while browsing it; `None` means the
+    /// box holds a fresh draft rather than a recalled entry.
+    history_cursor: Option<usize>,
+    /// What was being typed before Up was first pressed, restored once Down
+    /// walks back past the newest history entry.
+    draft: String,
 }
 
 impl App {
@@ -123,6 +136,10 @@ impl App {
             effort_level,
             session_id,
             agentic: false,
+            verbose: false,
+            input_history: Vec::new(),
+            history_cursor: None,
+            draft: String::new(),
         }
     }
 
@@ -311,6 +328,21 @@ impl App {
         self.cursor += c.len_utf8();
     }
 
+    /// Inserts a terminal paste at the cursor as literal text — including
+    /// any embedded newlines — rather than one character at a time. Plain
+    /// per-character delivery is what let a pasted newline be read as a
+    /// real Enter and submit each line as its own message; bracketed paste
+    /// (enabled around the event loop) is what routes it here instead.
+    /// Ignored while an approval prompt has focus, like ordinary typing.
+    pub fn paste(&mut self, text: &str) {
+        if self.focus != Focus::Input {
+            return;
+        }
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.input.insert_str(self.cursor, &normalized);
+        self.cursor += normalized.len();
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
@@ -347,7 +379,62 @@ impl App {
         }
         self.input.clear();
         self.cursor = 0;
+        self.history_cursor = None;
+        self.draft.clear();
+        // Skip a duplicate of the immediately preceding entry, matching
+        // ordinary shell history, so repeating a line doesn't pad it.
+        if self.input_history.last().map(String::as_str) != Some(text.as_str()) {
+            self.input_history.push(text.clone());
+        }
         Some(text)
+    }
+
+    /// Clears the input box and returns whatever was typed there, for an
+    /// approval prompt to interpret. Unlike [`Self::take_input`], a blank
+    /// answer is meaningful (it denies, matching a conventional `[y/N]:`
+    /// prompt) rather than swallowed as a stray Enter, and it isn't added to
+    /// prompt history — a "y" or "n" isn't a message worth recalling later.
+    pub fn take_approval_answer(&mut self) -> String {
+        let text = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        self.history_cursor = None;
+        self.draft.clear();
+        text
+    }
+
+    /// Recalls an older entry into the input box. The first press stashes
+    /// whatever was being typed so Down can return to it later.
+    pub fn history_up(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let next = match self.history_cursor {
+            None => {
+                self.draft = self.input.clone();
+                self.input_history.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_cursor = Some(next);
+        self.input = self.input_history[next].clone();
+        self.cursor = self.input.len();
+    }
+
+    /// Steps toward more recent history, restoring the stashed draft once
+    /// it walks past the newest entry.
+    pub fn history_down(&mut self) {
+        let Some(i) = self.history_cursor else {
+            return;
+        };
+        if i + 1 < self.input_history.len() {
+            self.history_cursor = Some(i + 1);
+            self.input = self.input_history[i + 1].clone();
+        } else {
+            self.history_cursor = None;
+            self.input = self.draft.clone();
+        }
+        self.cursor = self.input.len();
     }
 }
 
@@ -681,6 +768,97 @@ mod tests {
         assert_eq!(a.take_input(), Some("hi".to_string()));
         assert!(a.input.is_empty());
         assert_eq!(a.cursor, 0);
+    }
+
+    #[test]
+    fn history_up_and_down_walk_submitted_lines_and_restore_the_draft() {
+        let mut a = app();
+        for text in ["first", "second", "third"] {
+            for c in text.chars() {
+                a.insert_char(c);
+            }
+            a.take_input();
+        }
+
+        // Start a fresh, unsent draft before recalling anything.
+        for c in "unsent".chars() {
+            a.insert_char(c);
+        }
+
+        a.history_up();
+        assert_eq!(a.input, "third");
+        a.history_up();
+        assert_eq!(a.input, "second");
+        a.history_up();
+        assert_eq!(a.input, "first");
+        // Already at the oldest entry; another Up is a no-op.
+        a.history_up();
+        assert_eq!(a.input, "first");
+
+        a.history_down();
+        assert_eq!(a.input, "second");
+        a.history_down();
+        assert_eq!(a.input, "third");
+        // Past the newest entry, the stashed draft comes back.
+        a.history_down();
+        assert_eq!(a.input, "unsent");
+        // Down with nothing being browsed does nothing.
+        a.history_down();
+        assert_eq!(a.input, "unsent");
+    }
+
+    #[test]
+    fn take_input_skips_consecutive_duplicates_in_history() {
+        let mut a = app();
+        for _ in 0..2 {
+            for c in "repeat".chars() {
+                a.insert_char(c);
+            }
+            a.take_input();
+        }
+        assert_eq!(a.input_history, vec!["repeat".to_string()]);
+    }
+
+    #[test]
+    fn take_approval_answer_clears_input_without_touching_history() {
+        let mut a = app();
+        for c in "yes".chars() {
+            a.insert_char(c);
+        }
+        assert_eq!(a.take_approval_answer(), "yes");
+        assert!(a.input.is_empty());
+        assert_eq!(a.cursor, 0);
+        assert!(a.input_history.is_empty());
+    }
+
+    #[test]
+    fn take_approval_answer_returns_a_blank_answer_rather_than_none() {
+        let mut a = app();
+        assert_eq!(a.take_approval_answer(), "");
+    }
+
+    #[test]
+    fn paste_inserts_multiline_text_without_submitting() {
+        let mut a = app();
+        a.insert_char('x');
+        a.paste("line one\nline two\r\nline three\r");
+        assert_eq!(a.input, "xline one\nline two\nline three\n");
+        assert_eq!(a.cursor, a.input.len());
+        // Nothing was submitted — take_input still returns it all as one
+        // pending message, which is the whole point of routing a paste here
+        // instead of letting embedded newlines fall through as Enter.
+        assert_eq!(
+            a.take_input(),
+            Some("xline one\nline two\nline three".to_string())
+        );
+    }
+
+    #[test]
+    fn paste_is_ignored_while_an_approval_prompt_has_focus() {
+        let mut a = app();
+        a.focus = Focus::Approval;
+        a.paste("sneaky\nmessage");
+        assert_eq!(a.input, "");
     }
 
     #[test]
