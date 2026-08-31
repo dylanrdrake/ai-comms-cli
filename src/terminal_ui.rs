@@ -5,8 +5,8 @@
 
 use crate::spinner::Spinner;
 use crate::ui::{
-    json_fields, parse_yes_no, primary_argument, response_label, AgentEvent, AgentUi,
-    ApprovalRequest,
+    json_fields, parse_yes_no, primary_argument, response_label, tool_call_fields, AgentEvent,
+    AgentUi, ApprovalRequest,
 };
 use crate::wrap;
 use anyhow::Result;
@@ -73,7 +73,7 @@ impl AgentUi for TerminalAgentUi {
                 AgentEvent::ToolCallStarted { name, arguments } => {
                     tool_notice("▸".yellow(), &name, &arguments);
                     if self.verbose {
-                        print_fields(&json_fields(&arguments));
+                        print_fields(&tool_call_fields(&name, &arguments));
                     }
                     self.pending_arguments = Some(arguments);
                 }

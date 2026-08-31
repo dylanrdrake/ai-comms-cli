@@ -74,6 +74,20 @@ pub fn json_fields(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// [`json_fields`] for a tool call's arguments, plus a `working_dir` entry
+/// for a `run_terminal_command` call that didn't specify one — that means
+/// it runs in the current directory, which otherwise wouldn't show up in
+/// the notice at all.
+pub fn tool_call_fields(name: &str, arguments: &str) -> Vec<(String, String)> {
+    let mut fields = json_fields(arguments);
+    if name == "run_terminal_command" && !fields.iter().any(|(key, _)| key == "working_dir") {
+        if let Ok(cwd) = std::env::current_dir() {
+            fields.push(("working_dir".to_string(), cwd.display().to_string()));
+        }
+    }
+    fields
+}
+
 /// Interprets a typed answer to an approval prompt. Anything other than an
 /// explicit yes denies the action — a blank answer included, matching a
 /// conventional `[y/N]:` prompt's default. Shared so the CLI's stdin prompt
@@ -227,5 +241,40 @@ mod tests {
         );
         assert_eq!(primary_argument("not json"), None);
         assert_eq!(primary_argument("{}"), None);
+    }
+
+    #[test]
+    fn tool_call_fields_adds_the_default_working_dir_for_a_terminal_command() {
+        let fields = tool_call_fields("run_terminal_command", r#"{"command":"cargo test"}"#);
+        let working_dir = fields.iter().find(|(key, _)| key == "working_dir");
+        assert!(working_dir.is_some(), "{fields:?}");
+        assert_eq!(
+            working_dir.unwrap().1,
+            std::env::current_dir().unwrap().display().to_string()
+        );
+    }
+
+    #[test]
+    fn tool_call_fields_keeps_an_explicit_working_dir_as_is() {
+        let fields = tool_call_fields(
+            "run_terminal_command",
+            r#"{"command":"ls","working_dir":"/tmp"}"#,
+        );
+        assert_eq!(
+            fields,
+            vec![
+                ("command".to_string(), "ls".to_string()),
+                ("working_dir".to_string(), "/tmp".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_fields_leaves_other_tools_unchanged() {
+        let fields = tool_call_fields("write_file", r#"{"filepath":"a.rs","content":"x"}"#);
+        assert!(
+            !fields.iter().any(|(key, _)| key == "working_dir"),
+            "{fields:?}"
+        );
     }
 }

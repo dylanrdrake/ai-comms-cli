@@ -1,7 +1,7 @@
 //! Drawing the TUI. Pure presentation over [`App`] — no state changes here.
 
 use super::app::{App, Focus, ToolStatus, TranscriptItem};
-use crate::ui::{json_fields, summarize, ApprovalRequest};
+use crate::ui::{json_fields, summarize, tool_call_fields, ApprovalRequest};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
@@ -104,7 +104,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 }
                 lines.push(Line::from(header));
                 if app.verbose {
-                    for (key, shown) in json_fields(arguments) {
+                    for (key, shown) in tool_call_fields(name, arguments) {
                         lines.push(Line::from(vec![
                             Span::styled(format!("     {key}  "), Style::new().dark_gray()),
                             Span::raw(shown),
@@ -337,10 +337,14 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
 /// conversation — since typing is already redirected to y/n/esc during
 /// approval and the box is otherwise sitting idle.
 /// Answered by typing rather than a raw keypress, so the box works like the
-/// ordinary input it's replacing: type, edit, Enter to submit. The typed
-/// line comes first and never wraps in practice (a "y"/"no"/"yes" answer is
-/// short), which keeps its cursor position exact regardless of how many
-/// argument lines follow and might themselves wrap.
+/// ordinary input it's replacing: type, edit, Enter to submit. The tool's
+/// detail comes first and the prompt sits last, right above where you'd
+/// normally be typing a message — its row is computed from the detail's
+/// line count, which only stays exact if a field can't reflow onto a
+/// second row and silently push the prompt below the box's bottom edge.
+/// That's why this deliberately doesn't `.wrap(..)`: a field long enough to
+/// overflow the box just gets clipped at the edge instead, which loses
+/// characters but never the interactive prompt beneath it.
 fn draw_approval(frame: &mut Frame, area: Rect, app: &App, request: &ApprovalRequest) {
     let category = match request.category {
         "read" => "Read from disk",
@@ -350,28 +354,27 @@ fn draw_approval(frame: &mut Frame, area: Rect, app: &App, request: &ApprovalReq
     };
     let title = format!(" {category} — type y or yes to allow, Enter to deny, Esc to cancel ");
 
-    let prompt = "allow?  ";
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(prompt, Style::new().yellow().bold()),
-            Span::raw(app.input.clone()),
-        ]),
-        Line::raw(""),
-    ];
-    lines.extend(approval_lines(request));
+    let detail = approval_lines(request);
+    let prompt_row = detail.len() as u16 + 1;
 
-    let paragraph = Paragraph::new(Text::from(lines))
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::new().yellow())
-                .title(Span::styled(title, Style::new().yellow().bold())),
-        );
+    let mut lines = detail;
+    lines.push(Line::raw(""));
+    let prompt = "Allow?  ";
+    lines.push(Line::from(vec![
+        Span::styled(prompt, Style::new().yellow().bold()),
+        Span::raw(app.input.clone()),
+    ]));
+
+    let paragraph = Paragraph::new(Text::from(lines)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().yellow())
+            .title(Span::styled(title, Style::new().yellow().bold())),
+    );
     frame.render_widget(paragraph, area);
 
     let col = prompt.chars().count() as u16 + app.input[..app.cursor].chars().count() as u16;
-    frame.set_cursor_position((area.x + 1 + col, area.y + 1));
+    frame.set_cursor_position((area.x + 1 + col, area.y + 1 + prompt_row));
 }
 
 /// The tool and its arguments, field by field — matching how the CLI
@@ -649,6 +652,39 @@ mod tests {
         let out = render_to_string(&app, 70, 20);
         assert!(out.contains("yes"), "{out}");
         assert!(out.contains("Enter to deny"), "{out}");
+    }
+
+    #[test]
+    fn approval_box_puts_the_tool_detail_above_the_capitalized_prompt() {
+        let mut app = sample_app();
+        app.pending_approval = Some(ApprovalRequest {
+            tool_name: "write_file".into(),
+            category: "write",
+            arguments: r#"{"filepath":"/tmp/a.txt"}"#.into(),
+        });
+        let out = render_to_string(&app, 70, 20);
+        assert!(out.contains("Allow?"), "{out}");
+        let tool_at = out.find("write_file").expect("tool name shown");
+        let prompt_at = out.find("Allow?").expect("prompt shown");
+        assert!(tool_at < prompt_at, "{out}");
+    }
+
+    #[test]
+    fn approval_prompt_stays_visible_when_a_field_is_too_long_to_fit_one_row() {
+        // A `content` value long enough that, with wrapping, it would spill
+        // onto a second row the box's height wasn't sized for — pushing the
+        // "Allow?" prompt past the bottom edge where it silently disappears.
+        let mut app = sample_app();
+        app.pending_approval = Some(ApprovalRequest {
+            tool_name: "write_file".into(),
+            category: "write",
+            arguments: format!(
+                r#"{{"filepath":"/tmp/a.txt","content":"{}"}}"#,
+                "x".repeat(90)
+            ),
+        });
+        let out = render_to_string(&app, 80, 20);
+        assert!(out.contains("Allow?"), "{out}");
     }
 
     #[test]
