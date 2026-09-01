@@ -185,6 +185,64 @@ pub async fn execute_tool(name: &str, arguments: &str, sandbox: bool) -> Result<
     }
 }
 
+/// The directories a write may land in: the working directory and the user's
+/// home.
+///
+/// Both are canonicalized, because `path` is — and on Windows the two forms
+/// don't compare. `canonicalize` there returns an extended-length path
+/// (`\\?\D:\a\project`) while `current_dir` returns a plain one
+/// (`D:\a\project`), so a prefix test between them never matches and the
+/// sandbox refused *every* write, including the ones inside the working
+/// directory it was meant to allow.
+///
+/// A bound that won't canonicalize falls back to its raw form rather than
+/// being dropped: losing one would silently shrink what's allowed.
+fn sandbox_bounds() -> Vec<std::path::PathBuf> {
+    [std::env::current_dir().ok(), home::home_dir()]
+        .into_iter()
+        .flatten()
+        .map(|dir| dir.canonicalize().unwrap_or(dir))
+        .collect()
+}
+
+/// Resolves `filepath` to the absolute path a write would land on, without
+/// requiring it to exist and without creating anything.
+///
+/// Canonicalizes the closest ancestor that *does* exist and re-joins the
+/// rest, so `..` and symlinks are resolved as far as the filesystem can
+/// resolve them — the bound is about where a write lands, not how it was
+/// spelled. Creating nothing matters: `write_file` used to `create_dir_all`
+/// before it checked, so a refused write still left directories behind
+/// outside the sandbox.
+fn resolve_for_sandbox(filepath: &str) -> Result<std::path::PathBuf> {
+    let raw = Path::new(filepath);
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(raw)
+    };
+
+    let mut existing = absolute.as_path();
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            // Nothing on the path exists; judge it as spelled.
+            None => return Ok(absolute.clone()),
+        }
+    }
+    let canonical = existing
+        .canonicalize()
+        .unwrap_or_else(|_| existing.to_path_buf());
+    Ok(match absolute.strip_prefix(existing) {
+        // Nothing left to append: joining an empty component would add a
+        // trailing separator, and a regular file path with one on the end
+        // fails to `exists()` at all.
+        Ok(rest) if rest.as_os_str().is_empty() => canonical,
+        Ok(rest) => canonical.join(rest),
+        Err(_) => canonical,
+    })
+}
+
 /// The refusal to hand back when `path` is outside what the sandbox allows,
 /// or `None` when the write may go ahead.
 ///
@@ -198,9 +256,7 @@ fn sandbox_refusal(path: &Path, sandbox: bool) -> Option<serde_json::Value> {
     if !sandbox {
         return None;
     }
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let home = home::home_dir().unwrap_or_default();
-    if path.starts_with(&cwd) || path.starts_with(&home) {
+    if sandbox_bounds().iter().any(|bound| path.starts_with(bound)) {
         return None;
     }
     Some(json!({
@@ -235,15 +291,14 @@ fn write_file(
         .file_name()
         .ok_or_else(|| anyhow!("Invalid file path: {}", filepath))?;
 
-    // Create directories if needed, then canonicalize the (now-existing) parent
-    // so the security check below still resolves symlinks/`..` even though the
-    // target file itself may not exist yet.
-    fs::create_dir_all(parent)?;
-    let path = parent.canonicalize()?.join(file_name);
-
-    if let Some(refusal) = sandbox_refusal(&path, sandbox) {
+    // Judged before anything is created, so a refused write leaves nothing
+    // behind — not even the directories it would have needed.
+    if let Some(refusal) = sandbox_refusal(&resolve_for_sandbox(filepath)?, sandbox) {
         return Ok(refusal);
     }
+
+    fs::create_dir_all(parent)?;
+    let path = parent.canonicalize()?.join(file_name);
 
     if mode == "append" {
         let mut file = fs::OpenOptions::new()
@@ -320,20 +375,19 @@ fn replace_in_file(
     replace: &str,
     sandbox: bool,
 ) -> Result<serde_json::Value> {
-    let path = Path::new(filepath);
+    // The bound comes before the existence check, so a path outside the
+    // sandbox is refused on its own terms rather than reporting whether a
+    // file happens to be there.
+    let path = resolve_for_sandbox(filepath)?;
+    if let Some(refusal) = sandbox_refusal(&path, sandbox) {
+        return Ok(refusal);
+    }
 
     if !path.exists() {
         return Ok(json!({
             "success": false,
             "error": format!("File not found: {}", filepath)
         }));
-    }
-
-    // Canonicalized first: the check is about where a path *lands*, not how
-    // it's spelled, so `../../etc/hosts` has to resolve before it's judged.
-    let path = path.canonicalize()?;
-    if let Some(refusal) = sandbox_refusal(&path, sandbox) {
-        return Ok(refusal);
     }
 
     let mut content = fs::read_to_string(&path)?;
@@ -472,58 +526,70 @@ async fn run_terminal_command(
 mod tests {
     use super::*;
 
-    fn temp_file_outside_the_workspace(name: &str) -> std::path::PathBuf {
-        // `/tmp` is outside both the working directory and home, which is
-        // exactly the territory the sandbox exists to keep writes out of.
-        let path =
-            std::env::temp_dir().join(format!("comms-sandbox-test-{}-{name}", std::process::id()));
-        fs::write(&path, "before").unwrap();
-        path
+    /// A path that resolves outside both the working directory and home on
+    /// every platform, and exists nowhere.
+    ///
+    /// Deliberately not `std::env::temp_dir()`: on Windows that sits under
+    /// the user profile (`C:\\Users\\...\\AppData\\Local\\Temp`) — *inside*
+    /// the sandbox — so a test built on it would assert a refusal that
+    /// correctly never comes. A root-relative path lands on the current
+    /// drive's root instead, outside both bounds everywhere.
+    fn outside_the_sandbox() -> String {
+        format!("/comms-sandbox-should-never-exist-{}/x", std::process::id())
     }
 
     #[test]
     fn replace_in_file_refuses_to_write_outside_the_sandbox() {
         // The gap this closes: `replace_in_file` had no bound at all, so it
         // could rewrite any existing file the process could open, while
-        // `write_file` next to it was checked.
-        let path = temp_file_outside_the_workspace("refused");
-
-        let result = replace_in_file(path.to_str().unwrap(), "before", "after", true).unwrap();
+        // `write_file` beside it was checked.
+        let result = replace_in_file(&outside_the_sandbox(), "a", "b", true).unwrap();
 
         assert_eq!(result["success"], false);
         assert!(
             result["error"].as_str().unwrap().contains("Sandbox"),
             "{result}"
         );
-        // Refused before the write, not after it.
-        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
-        fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn replace_in_file_writes_outside_the_workspace_with_the_sandbox_off() {
-        // Turning it off is the whole point of the setting, so this is the
-        // other half of the contract, not an oversight.
-        let path = temp_file_outside_the_workspace("allowed");
+    fn the_bound_is_judged_before_whether_the_file_is_even_there() {
+        // With the sandbox off the same path gets past the bound and fails
+        // on its own terms, which is how this knows the refusal above came
+        // from the bound rather than from the file simply being missing.
+        let result = replace_in_file(&outside_the_sandbox(), "a", "b", false).unwrap();
 
-        let result = replace_in_file(path.to_str().unwrap(), "before", "after", false).unwrap();
+        assert_eq!(result["success"], false);
+        assert!(
+            result["error"].as_str().unwrap().contains("File not found"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn replace_in_file_rewrites_a_file_inside_the_workspace() {
+        let name = format!("comms-sandbox-test-{}-replace.txt", std::process::id());
+        fs::write(&name, "before").unwrap();
+
+        let result = replace_in_file(&name, "before", "after", true).unwrap();
 
         assert_eq!(result["success"], true, "{result}");
-        assert_eq!(fs::read_to_string(&path).unwrap(), "after");
-        fs::remove_file(&path).ok();
+        assert_eq!(fs::read_to_string(&name).unwrap(), "after");
+        fs::remove_file(&name).ok();
     }
 
     #[test]
     fn write_file_refuses_outside_the_sandbox_and_allows_inside_it() {
-        let outside =
-            std::env::temp_dir().join(format!("comms-sandbox-test-{}-write", std::process::id()));
-        let refused = write_file(outside.to_str().unwrap(), "x", "write", true).unwrap();
-        assert_eq!(refused["success"], false);
-        assert!(!outside.exists());
+        let outside = outside_the_sandbox();
+        let refused = write_file(&outside, "x", "write", true).unwrap();
+        assert_eq!(refused["success"], false, "{refused}");
+        // Refused before anything was created — not even the directory the
+        // write would have needed.
+        assert!(!Path::new(&outside).parent().unwrap().exists());
 
         // A relative path resolves against the working directory, which is
         // inside the bound.
-        let inside = format!("comms-sandbox-test-{}.txt", std::process::id());
+        let inside = format!("comms-sandbox-test-{}-write.txt", std::process::id());
         let allowed = write_file(&inside, "x", "write", true).unwrap();
         assert_eq!(allowed["success"], true, "{allowed}");
         fs::remove_file(&inside).ok();
@@ -532,9 +598,9 @@ mod tests {
     #[test]
     fn the_bound_is_where_a_path_lands_not_how_it_is_spelled() {
         // Canonicalization is what makes this true: a path that walks out of
-        // the workspace with `..` has to be judged on where it ends up.
+        // the workspace with `..` is judged on where it ends up.
         let escape = format!(
-            "{}/../../../../../../etc/comms-sandbox-should-never-exist",
+            "{}/../../../../../../comms-sandbox-should-never-exist",
             std::env::current_dir().unwrap().display()
         );
         let result = write_file(&escape, "x", "write", true).unwrap();
