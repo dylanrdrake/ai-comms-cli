@@ -23,7 +23,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// has stalled, not that the model is still thinking.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<String>,
@@ -31,6 +31,34 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Plain-text reasoning/thinking summary, when the model returned one.
+    /// Display-only: this is what `/verbose` shows the user, and it never
+    /// goes back to a provider. [`Self::reasoning_details`] is the channel
+    /// that has to round-trip, because it carries the signature
+    /// authenticating the same thinking; echoing this unsigned prose
+    /// alongside it would offer a second, less trustworthy copy of the same
+    /// content, so `skip_serializing` keeps it out of the wire format
+    /// rather than relying on it happening to be `None`.
+    ///
+    /// Being display-only is also why it outlives the rules that govern
+    /// `reasoning_details` — it's kept on a turn that called no tool, where
+    /// resending a thinking block would be invalid but showing one is
+    /// perfectly reasonable.
+    #[serde(skip_serializing)]
+    pub reasoning: Option<String>,
+    /// Provider-specific reasoning blocks (e.g. Anthropic's `thinking`
+    /// block plus its signature, as OpenRouter shapes it). Kept as opaque
+    /// JSON rather than a typed struct — OpenRouter requires the sequence
+    /// to round-trip back to it byte-for-byte unmodified on a follow-up
+    /// request that continues past a tool call, so parsing and
+    /// re-serializing our own shape risks silently corrupting it. A
+    /// reasoning model that pauses to call a tool needs this echoed back on
+    /// the next request or the provider can reject the continuation
+    /// outright (Anthropic's "prefill"/"must end with a user message"
+    /// error) — models that never return it simply never have this set, so
+    /// nothing changes for them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<serde_json::Value>>,
 }
 
 impl ChatMessage {
@@ -42,11 +70,58 @@ impl ChatMessage {
             .as_deref()
             .is_some_and(|c| !c.trim().is_empty())
     }
+
+    /// True if `tool_calls` is `Some` *and* actually has an entry in it.
+    /// Some providers send `tool_calls: []` rather than omitting the field
+    /// on a turn with no real tool call — treating that the same as `None`
+    /// matters wherever "did this turn call a tool" gates something, not
+    /// just whether the field happened to be present.
+    pub fn has_tool_calls(&self) -> bool {
+        self.tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+    }
+
+    /// This turn's thinking as displayable text, if the model returned any.
+    /// Prefers the provider's own prose summary and falls back to the text
+    /// carried inside the structured blocks, since a provider may populate
+    /// either channel — or, once a reply is reloaded from a session
+    /// recorded before the prose was stored, only the blocks.
+    pub fn thinking_text(&self) -> Option<String> {
+        if let Some(prose) = self.reasoning.as_deref() {
+            if !prose.trim().is_empty() {
+                return Some(prose.to_string());
+            }
+        }
+        let joined = self
+            .reasoning_details
+            .as_ref()?
+            .iter()
+            .filter_map(|detail| detail.get("text").and_then(serde_json::Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!joined.is_empty()).then_some(joined)
+    }
+}
+
+/// The discriminator every tool call carries. Only function calls exist in
+/// the OpenAI schema today, so this is always `"function"` — but it is
+/// *required*, and a provider that translates the request into another
+/// API's shape has to read it to know what kind of call it is.
+pub(crate) fn function_call_type() -> String {
+    "function".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ToolCall {
     pub id: String,
+    /// See [`function_call_type`]. Defaulted on the way in, so a provider
+    /// that omits it in a response — and, more to the point, a tool call
+    /// stored before this field existed — still deserializes; always
+    /// written on the way out.
+    #[serde(rename = "type", default = "function_call_type")]
+    pub call_type: String,
     pub function: FunctionCall,
 }
 
@@ -136,6 +211,10 @@ struct Delta {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCallDelta>>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_details: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +282,43 @@ struct StreamAccumulator {
     /// Keyed by the wire's `index` and ordered by it, so tool calls come out
     /// in the order the model asked for them regardless of chunk arrival.
     tool_calls: BTreeMap<u32, PartialToolCall>,
+    reasoning: String,
+    /// Keyed by each reasoning block's own `index` (OpenRouter streams a
+    /// block's `text`/`summary` incrementally across chunks, same shape as
+    /// `tool_calls` above), and merged with [`merge_reasoning_detail`].
+    reasoning_details: BTreeMap<u64, serde_json::Value>,
+}
+
+/// Folds one incoming reasoning-detail chunk into the block accumulated so
+/// far for its index. `text`/`summary` are appended (that's how OpenRouter
+/// streams a block's growing content); every other field — `signature`
+/// especially, which typically arrives once, later, and is `null` until
+/// then — is overwritten only when the new value isn't `null`, so a later
+/// chunk can't blank out something an earlier one already captured.
+fn merge_reasoning_detail(existing: &mut serde_json::Value, incoming: serde_json::Value) {
+    if !existing.is_object() || !incoming.is_object() {
+        *existing = incoming;
+        return;
+    }
+    let incoming_obj = match incoming {
+        serde_json::Value::Object(obj) => obj,
+        _ => unreachable!("checked above"),
+    };
+    let existing_obj = existing.as_object_mut().expect("checked above");
+    for (key, new_value) in incoming_obj {
+        let append_text = matches!(key.as_str(), "text" | "summary")
+            && new_value.is_string()
+            && matches!(existing_obj.get(&key), Some(serde_json::Value::String(_)));
+        if append_text {
+            if let (Some(serde_json::Value::String(old)), Some(added)) =
+                (existing_obj.get_mut(&key), new_value.as_str())
+            {
+                old.push_str(added);
+            }
+        } else if !new_value.is_null() {
+            existing_obj.insert(key, new_value);
+        }
+    }
 }
 
 impl StreamAccumulator {
@@ -217,6 +333,24 @@ impl StreamAccumulator {
                 if !content.is_empty() {
                     self.content.push_str(&content);
                     new_text.get_or_insert_with(String::new).push_str(&content);
+                }
+            }
+
+            if let Some(reasoning) = choice.delta.reasoning {
+                self.reasoning.push_str(&reasoning);
+            }
+            for detail in choice.delta.reasoning_details.unwrap_or_default() {
+                let index = detail
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                match self.reasoning_details.entry(index) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(detail);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut slot) => {
+                        merge_reasoning_detail(slot.get_mut(), detail);
+                    }
                 }
             }
 
@@ -255,6 +389,7 @@ impl StreamAccumulator {
             .into_values()
             .map(|partial| ToolCall {
                 id: partial.id,
+                call_type: function_call_type(),
                 function: FunctionCall {
                     name: partial.name,
                     arguments: partial.arguments,
@@ -277,6 +412,16 @@ impl StreamAccumulator {
                 Some(tool_calls)
             },
             tool_call_id: None,
+            reasoning: if self.reasoning.is_empty() {
+                None
+            } else {
+                Some(self.reasoning)
+            },
+            reasoning_details: if self.reasoning_details.is_empty() {
+                None
+            } else {
+                Some(self.reasoning_details.into_values().collect())
+            },
         }
     }
 }
@@ -289,6 +434,119 @@ pub struct ModelList {
 #[derive(Debug, Deserialize)]
 pub struct Model {
     pub id: String,
+}
+
+/// A compact, content-free description of an outgoing request, logged
+/// alongside an API error so a structural rejection ("must end with a user
+/// message", "the final block ... cannot be `thinking`") can be read
+/// against what actually went out. Deliberately carries no message text —
+/// just the role sequence and the fields the message-shape rules actually
+/// turn on:
+///
+/// `S U A(c2,r1,-) T U` — system; user; an assistant with 2 tool calls and
+/// 1 reasoning block, carrying no text content; a tool result; a user.
+///
+/// A reasoning count is suffixed with `!` when a block has neither a
+/// `signature` nor `data`, since an unsigned thinking block is rejected on
+/// its own terms rather than for where it sits — worth telling apart from a
+/// well-formed one at the same position.
+fn request_skeleton(request: &ChatRequest) -> String {
+    let roles: Vec<String> = request
+        .messages
+        .iter()
+        .map(|m| {
+            let mut s = match m.role.as_str() {
+                "system" => "S",
+                "user" => "U",
+                "assistant" => "A",
+                "tool" => "T",
+                _ => "?",
+            }
+            .to_string();
+
+            let mut marks = Vec::new();
+            let calls = m.tool_calls.as_ref().map_or(0, Vec::len);
+            if calls > 0 {
+                marks.push(format!("c{calls}"));
+            }
+            if let Some(details) = &m.reasoning_details {
+                let unsigned = details.iter().any(|d| {
+                    !["signature", "data"]
+                        .iter()
+                        .any(|key| d.get(key).is_some_and(|v| !v.is_null()))
+                });
+                marks.push(format!(
+                    "r{}{}",
+                    details.len(),
+                    if unsigned { "!" } else { "" }
+                ));
+            }
+            if !m.has_visible_content() {
+                marks.push("-".to_string());
+            }
+            if !marks.is_empty() {
+                s.push_str(&format!("({})", marks.join(",")));
+            }
+            s
+        })
+        .collect();
+
+    format!(
+        "model={} msgs={} tools={} stream={} [{}]",
+        request.model,
+        request.messages.len(),
+        request.tools.as_ref().map_or(0, Vec::len),
+        request.stream.unwrap_or(false),
+        roles.join(" ")
+    )
+}
+
+/// Serializes the outgoing body, but only when raw capture is switched on
+/// — the body is the whole conversation, so it is never built speculatively.
+fn capture_body(request: &ChatRequest) -> Option<String> {
+    if !crate::error_log::request_dumps_enabled() {
+        return None;
+    }
+    serde_json::to_string_pretty(request).ok()
+}
+
+/// Writes a captured body out and returns the ` | body: <path>` fragment
+/// pointing the log entry at it, or an empty string when capture is off.
+fn dump_note(body: Option<&str>) -> String {
+    body.and_then(crate::error_log::dump_failed_request)
+        .map(|path| format!(" | body: {}", path.display()))
+        .unwrap_or_default()
+}
+
+/// Drops `reasoning_details` from any message with no `tool_call` for it to
+/// lead into. A thinking block that nothing follows is the assistant
+/// message's final block, which Anthropic rejects outright — so this is
+/// about the shape of one message, not about how far back in the
+/// conversation thinking is allowed to live.
+///
+/// Only the structured blocks go: [`ChatMessage::reasoning`] is never sent
+/// to a provider, so nothing about it can make a request invalid, and
+/// keeping it is what lets `/verbose` still show the thinking behind a
+/// reply that called no tool.
+///
+/// `agent.rs`'s `drop_dangling_reasoning` already keeps a message from being
+/// stored that way, but it can't retroactively clean one written before that
+/// existed; sweeping the outgoing array catches those too, whatever the
+/// database holds.
+///
+/// A stricter version of this once scoped thinking to the turn in progress,
+/// stripping it from every turn the user had already spoken past. That was
+/// written chasing the wrong cause — the real one was tool calls going out
+/// without their `type` discriminator (see [`function_call_type`]) — and it
+/// asks for more than either Anthropic or OpenRouter do, both of which say
+/// to pass reasoning blocks back unmodified. Left at the narrower rule
+/// unless a mixed history turns out to need more.
+fn strip_dangling_reasoning(messages: &mut [ChatMessage]) {
+    for message in messages {
+        if !message.has_tool_calls() {
+            message.reasoning_details = None;
+        }
+    }
 }
 
 pub struct Client {
@@ -337,12 +595,14 @@ impl Client {
     fn build_request(
         &self,
         model: String,
-        messages: Vec<ChatMessage>,
+        mut messages: Vec<ChatMessage>,
         temperature: Option<f32>,
         tools: Option<Vec<serde_json::Value>>,
         effort_level: Option<String>,
         stream: bool,
     ) -> ChatRequest {
+        strip_dangling_reasoning(&mut messages);
+
         let effort_style = self
             .config
             .effort_style
@@ -385,7 +645,20 @@ impl Client {
         effort_level: Option<String>,
     ) -> Result<ChatResponse> {
         let request = self.build_request(model, messages, temperature, tools, effort_level, false);
+        // Captured before sending, so a rejection can be read back against
+        // the shape that actually went out rather than guessed at.
+        let skeleton = request_skeleton(&request);
+        let body = capture_body(&request);
 
+        let result = self.send_chat(request).await;
+        if let Err(e) = &result {
+            let note = dump_note(body.as_deref());
+            crate::error_log::log_error("llm_api", &format!("{e} | sent: {skeleton}{note}"));
+        }
+        result
+    }
+
+    async fn send_chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         let req = self
             .http_client
             .post(format!("{}/chat/completions", self.config.base_url));
@@ -421,6 +694,24 @@ impl Client {
         effort_level: Option<String>,
     ) -> impl Stream<Item = Result<StreamEvent>> + '_ {
         let request = self.build_request(model, messages, temperature, tools, effort_level, true);
+        // Captured before sending, so a rejection can be read back against
+        // the shape that actually went out rather than guessed at.
+        let skeleton = request_skeleton(&request);
+        let body = capture_body(&request);
+
+        self.chat_stream_inner(request).map(move |item| {
+            if let Err(e) = &item {
+                let note = dump_note(body.as_deref());
+                crate::error_log::log_error("llm_api", &format!("{e} | sent: {skeleton}{note}"));
+            }
+            item
+        })
+    }
+
+    fn chat_stream_inner(
+        &self,
+        request: ChatRequest,
+    ) -> impl Stream<Item = Result<StreamEvent>> + '_ {
         let url = format!("{}/chat/completions", self.config.base_url);
 
         try_stream! {
@@ -659,6 +950,310 @@ mod deser_tests {
     }
 
     #[test]
+    fn reasoning_text_is_appended_across_chunks() {
+        let mut acc = StreamAccumulator::default();
+        acc.push_payload(r#"{"choices":[{"delta":{"reasoning":"Let me "}}]}"#)
+            .unwrap();
+        acc.push_payload(r#"{"choices":[{"delta":{"reasoning":"think..."}}]}"#)
+            .unwrap();
+        assert_eq!(acc.finish().reasoning, Some("Let me think...".to_string()));
+    }
+
+    #[test]
+    fn reasoning_details_text_is_merged_by_index_and_signature_arrives_late() {
+        let mut acc = StreamAccumulator::default();
+        // The block's text streams in across two chunks; the signature that
+        // authenticates it (Anthropic's thinking blocks carry one) shows up
+        // null at first, then populated in a later chunk — a later `null`
+        // must never blank out a signature an earlier chunk already set.
+        for payload in [
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"step one, ","index":0,"signature":null}]}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"step two","index":0,"signature":null}]}}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_details":[{"index":0,"signature":"sig-abc"}]}}]}"#,
+        ] {
+            acc.push_payload(payload).unwrap();
+        }
+        let details = acc.finish().reasoning_details.expect("reasoning details");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["text"], "step one, step two");
+        assert_eq!(details[0]["signature"], "sig-abc");
+        assert_eq!(details[0]["type"], "reasoning.text");
+    }
+
+    #[test]
+    fn reasoning_details_are_ordered_by_index_not_arrival() {
+        let mut acc = StreamAccumulator::default();
+        acc.push_payload(
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"second","index":1}]}}]}"#,
+        )
+        .unwrap();
+        acc.push_payload(
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"first","index":0}]}}]}"#,
+        )
+        .unwrap();
+        let details = acc.finish().reasoning_details.expect("reasoning details");
+        assert_eq!(details[0]["text"], "first");
+        assert_eq!(details[1]["text"], "second");
+    }
+
+    #[test]
+    fn no_reasoning_details_yields_none() {
+        let mut acc = StreamAccumulator::default();
+        acc.push_payload(&content_chunk("hi")).unwrap();
+        let message = acc.finish();
+        assert_eq!(message.reasoning, None);
+        assert_eq!(message.reasoning_details, None);
+    }
+
+    fn assistant_with_reasoning(tool_call: bool) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: Some("some text".to_string()),
+            tool_calls: tool_call.then(|| {
+                vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: function_call_type(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]
+            }),
+            reasoning: Some("thinking".to_string()),
+            reasoning_details: Some(vec![serde_json::json!({"type": "reasoning.text"})]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reasoning_is_dropped_without_a_tool_call_to_lead_into() {
+        // Thinking with nothing after it would be the message's final
+        // block, which Anthropic rejects.
+        let mut messages = vec![assistant_with_reasoning(false)];
+        strip_dangling_reasoning(&mut messages);
+        assert_eq!(messages[0].reasoning_details, None);
+        // The prose is display-only and never sent, so it stays — that's
+        // what `/verbose` shows for a turn that called no tool.
+        assert_eq!(messages[0].reasoning, Some("thinking".to_string()));
+        assert_eq!(messages[0].content, Some("some text".to_string()));
+    }
+
+    #[test]
+    fn thinking_text_prefers_the_provider_prose() {
+        let message = ChatMessage {
+            reasoning: Some("the prose summary".to_string()),
+            reasoning_details: Some(vec![serde_json::json!({"text": "block text"})]),
+            ..Default::default()
+        };
+        assert_eq!(
+            message.thinking_text(),
+            Some("the prose summary".to_string())
+        );
+    }
+
+    #[test]
+    fn thinking_text_falls_back_to_the_blocks() {
+        // What a reply reloaded from a session recorded before the prose
+        // was stored looks like — the blocks are all that survived.
+        let message = ChatMessage {
+            reasoning: None,
+            reasoning_details: Some(vec![
+                serde_json::json!({"text": "first"}),
+                serde_json::json!({"text": "second"}),
+                serde_json::json!({"signature": "sig-only"}),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(message.thinking_text(), Some("first\n\nsecond".to_string()));
+    }
+
+    #[test]
+    fn thinking_text_is_none_when_there_is_nothing_to_show() {
+        assert_eq!(ChatMessage::default().thinking_text(), None);
+        let blank = ChatMessage {
+            reasoning: Some("   ".to_string()),
+            reasoning_details: Some(vec![serde_json::json!({"text": ""})]),
+            ..Default::default()
+        };
+        assert_eq!(blank.thinking_text(), None);
+    }
+
+    #[test]
+    fn reasoning_is_kept_alongside_a_tool_call() {
+        // Including in a turn the user has already spoken past — how far
+        // back a thinking block sits is not what this rule is about.
+        let mut messages = vec![
+            assistant_with_reasoning(true),
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some("go on".to_string()),
+                ..Default::default()
+            },
+            assistant_with_reasoning(true),
+        ];
+        strip_dangling_reasoning(&mut messages);
+        assert!(messages[0].reasoning_details.is_some());
+        assert!(messages[2].reasoning_details.is_some());
+    }
+
+    #[test]
+    fn an_empty_tool_calls_array_counts_as_no_tool_call() {
+        // The bug this guards against: a provider sending `tool_calls: []`
+        // rather than omitting the field entirely on a turn that didn't
+        // really call anything. `Some(vec![])` is `is_some()`, so a check
+        // that only asked "is this None" would wrongly keep reasoning_details
+        // attached to a message with no tool_use block to follow it.
+        let mut messages = vec![ChatMessage {
+            role: "assistant".to_string(),
+            content: Some("no real tool call".to_string()),
+            tool_calls: Some(vec![]),
+            reasoning_details: Some(vec![serde_json::json!({"type": "reasoning.text"})]),
+            ..Default::default()
+        }];
+        strip_dangling_reasoning(&mut messages);
+        assert_eq!(messages[0].reasoning_details, None);
+    }
+
+    #[test]
+    fn request_skeleton_describes_shape_without_leaking_content() {
+        let request = ChatRequest {
+            model: "anthropic/claude-sonnet-5".to_string(),
+            messages: vec![
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: Some("secret system prompt".to_string()),
+                    ..Default::default()
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some("secret question".to_string()),
+                    ..Default::default()
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".to_string(),
+                        call_type: function_call_type(),
+                        function: FunctionCall {
+                            name: "read_file".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    }]),
+                    reasoning_details: Some(vec![serde_json::json!({"text": "secret thinking"})]),
+                    ..Default::default()
+                },
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some("secret tool output".to_string()),
+                    ..Default::default()
+                },
+            ],
+            tools: Some(vec![serde_json::json!({})]),
+            temperature: None,
+            tool_choice: None,
+            reasoning_effort: None,
+            reasoning: None,
+            stream: Some(true),
+        };
+
+        let skeleton = request_skeleton(&request);
+        // The assistant carries 1 tool call and 1 reasoning block that has
+        // no signature (`!`), and no text content of its own (`-`).
+        assert_eq!(
+            skeleton,
+            "model=anthropic/claude-sonnet-5 msgs=4 tools=1 stream=true [S U A(c1,r1!,-) T]"
+        );
+        // Nothing from any message body may end up in the log.
+        for secret in [
+            "secret system prompt",
+            "secret question",
+            "secret thinking",
+            "secret tool output",
+        ] {
+            assert!(!skeleton.contains(secret), "{skeleton}");
+        }
+    }
+
+    #[test]
+    fn a_tool_call_goes_out_with_its_type_discriminator() {
+        // The OpenAI schema requires `type` on every tool call. Without it
+        // a provider translating the request into another API's shape can
+        // fail to recognize the call.
+        let call = ToolCall {
+            id: "call_1".to_string(),
+            call_type: function_call_type(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        };
+        let json: serde_json::Value = serde_json::to_value(&call).unwrap();
+        assert_eq!(json["type"], "function");
+    }
+
+    #[test]
+    fn a_tool_call_stored_without_a_type_still_loads() {
+        // Every tool call already in the database was written before the
+        // field existed, so reading one back must not fail — it takes the
+        // default and is written out correctly from then on.
+        let call: ToolCall = serde_json::from_str(
+            r#"{"id":"call_1","function":{"name":"read_file","arguments":"{}"}}"#,
+        )
+        .expect("a stored tool call with no type still deserializes");
+        assert_eq!(call.call_type, "function");
+    }
+
+    #[test]
+    fn no_captured_body_means_no_dump_note() {
+        // Capture is off by default, so nothing is written and the log
+        // entry keeps its content-free shape.
+        assert_eq!(dump_note(None), "");
+    }
+
+    #[test]
+    fn reasoning_prose_is_never_serialized_into_a_request() {
+        // It comes back on a response and is kept for display, but only
+        // `reasoning_details` — which carries the provider's own signature —
+        // may be echoed back; unsigned prose must not reach the wire.
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            reasoning: Some("thinking it through".to_string()),
+            reasoning_details: Some(vec![serde_json::json!({"type": "reasoning.text"})]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(!json.contains("thinking it through"), "{json}");
+        assert!(!json.contains("\"reasoning\""), "{json}");
+        assert!(json.contains("reasoning_details"), "{json}");
+    }
+
+    #[test]
+    fn has_tool_calls_treats_none_and_empty_alike() {
+        let base = ChatMessage {
+            role: "assistant".to_string(),
+            ..Default::default()
+        };
+        assert!(!base.has_tool_calls());
+        assert!(!ChatMessage {
+            tool_calls: Some(vec![]),
+            ..base.clone()
+        }
+        .has_tool_calls());
+        assert!(ChatMessage {
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                call_type: function_call_type(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            ..base
+        }
+        .has_tool_calls());
+    }
+
+    #[test]
     fn content_and_tool_calls_can_arrive_in_one_turn() {
         let mut acc = StreamAccumulator::default();
         acc.push_payload(&content_chunk("Let me check.")).unwrap();
@@ -696,6 +1291,7 @@ mod deser_tests {
             content: None,
             tool_calls: None,
             tool_call_id: None,
+            ..Default::default()
         };
         let blank = ChatMessage {
             content: Some("   ".to_string()),

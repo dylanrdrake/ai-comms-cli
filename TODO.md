@@ -9,6 +9,9 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
+* session claimed flag on session table in case 2 comms processes open the same session. What would that do? is that ok?
+* should messages table be expanded to include tool calls, errors, etc.. OR errors logged somewhere
+* need a way to copy an error message from somewhere
 * Websearch
 * workin dir needs to be svaed as a session setting. or does it matter?
 * need a model browser/search/picker

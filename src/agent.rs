@@ -53,6 +53,7 @@ pub async fn run_agent(
         content: Some(task.to_string()),
         tool_calls: None,
         tool_call_id: None,
+        ..Default::default()
     }];
 
     run_agent_turn(
@@ -78,13 +79,15 @@ pub async fn run_agent(
 async fn request_turn(
     client: &Client,
     ui: &mut impl AgentUi,
-    messages: Vec<ChatMessage>,
+    mut messages: Vec<ChatMessage>,
     model: &str,
     temperature: Option<f32>,
     tools: Option<Vec<serde_json::Value>>,
     effort_level: Option<String>,
 ) -> Result<ChatMessage> {
-    if client.streaming_enabled() {
+    normalize_system_prompt(&mut messages, tools.is_some());
+
+    let mut message = if client.streaming_enabled() {
         let stream = client.chat_stream(
             model.to_string(),
             messages,
@@ -104,7 +107,7 @@ async fn request_turn(
             }
         }
 
-        assembled.ok_or_else(|| anyhow::anyhow!("Response stream ended without a message"))
+        assembled.ok_or_else(|| anyhow::anyhow!("Response stream ended without a message"))?
     } else {
         let response = client
             .chat(
@@ -120,7 +123,60 @@ async fn request_turn(
             .into_iter()
             .next()
             .map(|choice| choice.message)
-            .ok_or_else(|| anyhow::anyhow!("Provider returned no choices"))
+            .ok_or_else(|| anyhow::anyhow!("Provider returned no choices"))?
+    };
+
+    // Before the blocks are pruned: what's shown to the user isn't bound by
+    // the rules about what may be sent back to a provider.
+    if let Some(text) = message.thinking_text() {
+        ui.event(AgentEvent::Thinking { text }).await;
+    }
+
+    drop_dangling_reasoning(&mut message);
+    Ok(message)
+}
+
+/// Some providers (Anthropic among them) reject a `system`-role message
+/// that isn't the very first entry — it has to immediately follow a user
+/// message or a tool-result-ending assistant message, which in practice
+/// means it can only ever validly sit at the start of the conversation.
+/// `/agent` can turn tool-calling on at any point mid-conversation, so
+/// there's no position session.rs could insert the agent system prompt at
+/// that's guaranteed to stay valid as the conversation grows around it.
+///
+/// So it isn't stored history at all: any stray copy already sitting
+/// somewhere in the array — from before this existed, or left over from a
+/// session that's since switched back to ask mode — is dropped, and a
+/// fresh one is prepended exactly when this turn actually needs it
+/// (`agentic`, i.e. tools are in play). This heals an already-poisoned
+/// session automatically, the same way `strip_dangling_reasoning` does for
+/// reasoning content, without needing to touch what's actually persisted.
+fn normalize_system_prompt(messages: &mut Vec<ChatMessage>, agentic: bool) {
+    messages.retain(|m| {
+        !(m.role == "system" && m.content.as_deref() == Some(AGENT_CHAT_SYSTEM_PROMPT))
+    });
+    if agentic {
+        messages.insert(
+            0,
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(AGENT_CHAT_SYSTEM_PROMPT.to_string()),
+                ..Default::default()
+            },
+        );
+    }
+}
+
+/// Anthropic rejects a stored assistant message whose final content block
+/// would be `thinking` — exactly what `reasoning_details` becomes once
+/// translated, unless a tool_use block follows it. Only keep it when
+/// there's a tool call to follow, since that's the only case it's actually
+/// needed for (see `ChatMessage::reasoning_details`) — a turn that reasoned
+/// but didn't end up calling anything would otherwise poison every later
+/// request in the conversation.
+fn drop_dangling_reasoning(message: &mut ChatMessage) {
+    if !message.has_tool_calls() {
+        message.reasoning_details = None;
     }
 }
 
@@ -223,8 +279,7 @@ pub async fn run_agent_turn(
         ui.event(AgentEvent::RequestFinished).await;
         let message = turn?;
 
-        let no_tool_calls =
-            message.tool_calls.is_none() || message.tool_calls.as_ref().unwrap().is_empty();
+        let no_tool_calls = !message.has_tool_calls();
 
         // If the LLM generated text, show it
         if message.has_visible_content() {
@@ -300,6 +355,7 @@ pub async fn run_agent_turn(
                     content: Some(result.to_string()),
                     tool_calls: None,
                     tool_call_id: Some(tool_call.id.clone()),
+                    ..Default::default()
                 });
             }
         }
@@ -311,6 +367,7 @@ pub async fn run_agent_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::{function_call_type, FunctionCall, ToolCall};
 
     #[test]
     fn categorizes_known_tools() {
@@ -363,5 +420,132 @@ mod tests {
         // even when every known category is set to auto-approve.
         let all_off = settings(false, false, false);
         assert!(requires_approval("some_future_tool", &all_off));
+    }
+
+    #[test]
+    fn dangling_reasoning_is_dropped_without_a_tool_call() {
+        // A turn that reasoned but ended with plain text (or nothing at
+        // all) instead of a tool call — resending its reasoning_details
+        // would leave `thinking` as the final block, which Anthropic
+        // rejects on the next request.
+        let mut message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some("Here's my answer.".to_string()),
+            reasoning: Some("thinking it through".to_string()),
+            reasoning_details: Some(vec![serde_json::json!({"type": "reasoning.text"})]),
+            ..Default::default()
+        };
+        drop_dangling_reasoning(&mut message);
+        assert_eq!(message.reasoning_details, None);
+        // The prose survives: it's never sent to a provider, and `/verbose`
+        // still shows the thinking behind a reply that called no tool.
+        assert_eq!(message.reasoning, Some("thinking it through".to_string()));
+        assert_eq!(message.content, Some("Here's my answer.".to_string()));
+    }
+
+    #[test]
+    fn reasoning_is_kept_alongside_a_tool_call() {
+        let mut message = ChatMessage {
+            role: "assistant".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                call_type: function_call_type(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            reasoning_details: Some(vec![serde_json::json!({"type": "reasoning.text"})]),
+            ..Default::default()
+        };
+        drop_dangling_reasoning(&mut message);
+        assert!(message.reasoning_details.is_some());
+    }
+
+    #[test]
+    fn dangling_reasoning_is_dropped_with_an_empty_tool_calls_array_too() {
+        // A provider can send `tool_calls: []` rather than omitting the
+        // field on a turn that didn't really call anything — that must
+        // still count as "no tool call" here, not just a bare `None`.
+        let mut message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some("no real tool call".to_string()),
+            tool_calls: Some(vec![]),
+            reasoning_details: Some(vec![serde_json::json!({"type": "reasoning.text"})]),
+            ..Default::default()
+        };
+        drop_dangling_reasoning(&mut message);
+        assert_eq!(message.reasoning_details, None);
+    }
+
+    fn user(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".to_string(),
+            content: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn assistant(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn normalize_system_prompt_prepends_it_fresh_for_an_agentic_turn() {
+        let mut messages = vec![user("hi"), assistant("hello")];
+        normalize_system_prompt(&mut messages, true);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(
+            messages[0].content.as_deref(),
+            Some(AGENT_CHAT_SYSTEM_PROMPT)
+        );
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn normalize_system_prompt_adds_nothing_for_a_plain_turn() {
+        let mut messages = vec![user("hi"), assistant("hello")];
+        normalize_system_prompt(&mut messages, false);
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|m| m.role != "system"));
+    }
+
+    #[test]
+    fn normalize_system_prompt_heals_a_stray_copy_left_mid_conversation() {
+        // What `/agent` used to do: insert the prompt wherever it happened
+        // to be typed, which a provider can reject if that position isn't
+        // valid (e.g. right after a plain assistant reply). An
+        // already-poisoned session — or one that's since switched back to
+        // ask mode — must not keep resending that stray copy.
+        let stray = ChatMessage {
+            role: "system".to_string(),
+            content: Some(AGENT_CHAT_SYSTEM_PROMPT.to_string()),
+            ..Default::default()
+        };
+        let mut messages = vec![user("hi"), assistant("hello"), stray, user("again")];
+
+        normalize_system_prompt(&mut messages, false);
+        assert!(messages.iter().all(|m| m.role != "system"));
+        assert_eq!(messages.len(), 3);
+
+        let mut messages = vec![
+            user("hi"),
+            assistant("hello"),
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(AGENT_CHAT_SYSTEM_PROMPT.to_string()),
+                ..Default::default()
+            },
+            user("again"),
+        ];
+        normalize_system_prompt(&mut messages, true);
+        // Exactly one copy, and it's the fresh one at the front — not the
+        // stray one left in place.
+        assert_eq!(messages.iter().filter(|m| m.role == "system").count(), 1);
+        assert_eq!(messages[0].role, "system");
     }
 }

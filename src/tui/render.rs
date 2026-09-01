@@ -179,6 +179,30 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
                 }
                 lines.push(Line::raw(""));
             }
+            TranscriptItem::Thinking(text) => {
+                if app.verbose {
+                    let thought: Vec<Line<'static>> = text
+                        .lines()
+                        .map(|line| {
+                            Line::from(Span::styled(
+                                line.to_string(),
+                                Style::new().dark_gray().italic(),
+                            ))
+                        })
+                        .collect();
+                    push_rendered(
+                        &mut lines,
+                        Span::styled("💭 ", Style::new().dark_gray()),
+                        thought,
+                        None,
+                        // 💭 is double-width, so wrap a column narrower —
+                        // same adjustment the tool-call gutter makes.
+                        content_width.saturating_sub(1),
+                        "   ",
+                    );
+                    lines.push(Line::raw(""));
+                }
+            }
             TranscriptItem::Error(message) => {
                 lines.push(Line::from(vec![
                     Span::styled("✗ ", Style::new().red().bold()),
@@ -1238,6 +1262,20 @@ mod tests {
         assert!(out.contains("Terminal commands:"), "{out}");
         assert!(out.contains("✗ Auto"), "{out}");
         assert!(out.contains("✓ Ask"), "{out}");
+    }
+
+    #[test]
+    fn thinking_only_shows_when_verbose() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript
+            .push(TranscriptItem::Thinking("weighing the options".to_string()));
+
+        let out = render_to_string(&app, 70, 12);
+        assert!(!out.contains("weighing the options"), "{out}");
+
+        app.verbose = true;
+        let out = render_to_string(&app, 70, 12);
+        assert!(out.contains("weighing the options"), "{out}");
     }
 
     #[test]

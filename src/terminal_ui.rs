@@ -110,6 +110,18 @@ impl AgentUi for TerminalAgentUi {
                     // regardless of what kind each one is.
                     println!();
                 }
+                AgentEvent::Thinking { text } => {
+                    if self.verbose {
+                        // Same marker-plus-hanging-indent shape the
+                        // assistant's own reply uses, one step dimmer.
+                        println!(
+                            "{} {}",
+                            "💭".bright_black(),
+                            wrap::wrap_indented(&text, "   ").bright_black().italic()
+                        );
+                        println!();
+                    }
+                }
                 AgentEvent::ToolCallStarted { name, arguments } => {
                     // Printed without a trailing newline — closed by
                     // whichever of approval/denial/completion resolves it

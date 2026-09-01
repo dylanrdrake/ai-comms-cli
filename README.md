@@ -268,7 +268,7 @@ exactly:
 | `/effort <level>` | Switch reasoning effort for the rest of the session, and remember it |
 | `/effort clear` | Nullify it — no effort field is sent at all until set again |
 | `/effort default` | Read the *currently* configured default effort and save that to the session |
-| `/verbose` | Toggle showing full tool call arguments/results instead of a one-line notice |
+| `/verbose` | Toggle showing the model's thinking, plus full tool call arguments/results instead of a one-line notice |
 | `/max-iterations <n>` | Switch the tool-calling iteration cap per turn (agent mode only), and remember it |
 | `/max-iterations clear` | Nullify it — agent mode then errors on any turn until a cap is set again |
 | `/max-iterations default` | Read the *currently* configured default cap and save that to the session |
@@ -382,7 +382,7 @@ first message.
 | `/effort <level>` | Switch reasoning effort for the rest of the session, and remember it |
 | `/effort clear` | Nullify it — no effort field is sent at all until set again |
 | `/effort default` | Read the *currently* configured default effort and save that to the session |
-| `/verbose` | Toggle showing full tool call arguments/results instead of a one-line notice |
+| `/verbose` | Toggle showing the model's thinking, plus full tool call arguments/results instead of a one-line notice |
 | `/max-iterations <n>` | Switch the tool-calling iteration cap per turn (agent mode only), and remember it |
 | `/max-iterations clear` | Nullify it — agent mode then errors on any turn until a cap is set again |
 | `/max-iterations default` | Read the *currently* configured default cap and save that to the session |
@@ -595,6 +595,8 @@ sudo dnf groupinstall "Development Tools"
 - File operations are restricted to your current working directory and home directory
 - API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.comms/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `comms` command, and the field is stripped from the file afterward
 - `session`/`tui` history (including tool calls and their results) is stored unencrypted in `~/.comms/chats.db` — add it to `.gitignore` and avoid pasting secrets into a session if you plan to keep or share the database file
+- The last 100 LLM API errors (a non-2xx response, a stalled/dropped connection, a malformed stream) are kept at `~/.comms/errors.log`, so a confusing one can be looked back at without having to catch and copy it in the moment — plain text, one line per entry, oldest dropped as new ones come in
+- Each of those entries records the shape of the request that failed — role sequence, tool-call and reasoning counts — but no message text. To capture the request itself, set `COMMS_DEBUG_REQUESTS=1`: the failing request's full JSON body is written to `~/.comms/failed-request.json` (only the most recent one, overwritten each time) and the log entry names the file. **That file contains the entire conversation verbatim** — every message, tool call and tool result — so it's off by default, and worth deleting once you're done with it
 
 ## Development
 

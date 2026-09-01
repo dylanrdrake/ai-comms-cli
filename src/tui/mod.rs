@@ -119,6 +119,7 @@ fn open_new(context: &Context, agentic: bool, title: Option<String>) -> Result<C
             content: Some(AGENT_CHAT_SYSTEM_PROMPT.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            ..Default::default()
         })?;
     }
 
@@ -184,6 +185,12 @@ fn seed_transcript(app: &mut App, history: &[StoredMessage]) {
                 }
             }
             "assistant" => {
+                // Ahead of the reply it led to, matching the live ordering.
+                // Pushed even when the reply itself had no visible text —
+                // a turn that only called a tool still thought first.
+                if let Some(thought) = message.thinking_text() {
+                    app.transcript.push(TranscriptItem::Thinking(thought));
+                }
                 if let Some(text) = &message.content {
                     if !text.trim().is_empty() {
                         // Each stored message knows the model that produced

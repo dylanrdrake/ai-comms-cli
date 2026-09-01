@@ -7,7 +7,6 @@
 //! loops and any future GUI can share the same bookkeeping instead of each
 //! reimplementing "append, persist, name the session".
 
-use crate::agent::AGENT_CHAT_SYSTEM_PROMPT;
 use crate::client::ChatMessage;
 use crate::config::ApprovalSettings;
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
@@ -53,14 +52,6 @@ pub struct ChatSession {
     /// How many of `messages` have been written to the database. Everything
     /// from here on is pending; see [`ChatSession::persist_pending`].
     saved_len: usize,
-}
-
-/// Whether the agent-chat system prompt is already present, so turning
-/// agent mode on doesn't seed a duplicate.
-fn has_agent_system_prompt(messages: &[ChatMessage]) -> bool {
-    messages
-        .iter()
-        .any(|m| m.role == "system" && m.content.as_deref() == Some(AGENT_CHAT_SYSTEM_PROMPT))
 }
 
 impl ChatSession {
@@ -168,11 +159,14 @@ impl ChatSession {
     }
 
     /// Switches between plain and agent (tool-calling) mode and records it,
-    /// so the switch sticks on resume and in `sessions list`. Turning agent
-    /// mode on seeds the agent system prompt if this session doesn't
-    /// already have one (a session that started plain won't); turning it
-    /// off deliberately leaves prior history — including that prompt —
-    /// alone, since no tools are offered either way once it's off.
+    /// so the switch sticks on resume and in `sessions list`. Doesn't touch
+    /// message history either way: the agent system prompt isn't stored —
+    /// some providers (Anthropic among them) require a `system`-role
+    /// message to sit at the very start of the conversation, and `/agent`
+    /// can flip this on at any point mid-conversation, so there's no
+    /// position here that's guaranteed to stay valid as the conversation
+    /// grows around it. `agent::request_turn` prepends it fresh on every
+    /// turn that actually needs it instead.
     pub fn set_agentic(&mut self, agentic: bool) -> Result<()> {
         let kind = if agentic { KIND_AGENT_CHAT } else { KIND_CHAT };
         if self.kind == kind {
@@ -180,15 +174,6 @@ impl ChatSession {
         }
         store::set_session_kind(&self.conn, &self.id, kind)?;
         self.kind = kind.to_string();
-
-        if agentic && !has_agent_system_prompt(&self.messages) {
-            self.push_and_persist(ChatMessage {
-                role: "system".to_string(),
-                content: Some(AGENT_CHAT_SYSTEM_PROMPT.to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            })?;
-        }
         Ok(())
     }
 
@@ -338,6 +323,7 @@ impl ChatSession {
             content: Some(text),
             tool_calls: None,
             tool_call_id: None,
+            ..Default::default()
         });
     }
 
@@ -351,6 +337,7 @@ impl ChatSession {
             content: Some(text),
             tool_calls: None,
             tool_call_id: None,
+            ..Default::default()
         });
     }
 
@@ -449,15 +436,17 @@ mod tests {
                 updated_at      INTEGER NOT NULL
             );
             CREATE TABLE messages (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                seq           INTEGER NOT NULL,
-                role          TEXT NOT NULL,
-                content       TEXT,
-                tool_calls    TEXT,
-                tool_call_id  TEXT,
-                model         TEXT,
-                effort_level  TEXT
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq               INTEGER NOT NULL,
+                role              TEXT NOT NULL,
+                content           TEXT,
+                tool_calls        TEXT,
+                tool_call_id      TEXT,
+                model             TEXT,
+                effort_level      TEXT,
+                reasoning_details TEXT,
+                reasoning         TEXT
             );
             ",
         )
@@ -511,6 +500,7 @@ mod tests {
             content: Some("system prompt".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            ..Default::default()
         });
         session.persist_pending().unwrap();
         // A system-only session has nothing to name itself after yet.
@@ -557,20 +547,13 @@ mod tests {
         assert_eq!(summary.model, "second-model");
     }
 
-    fn count_agent_system_prompts(session: &ChatSession) -> usize {
-        session
-            .messages()
-            .iter()
-            .filter(|m| {
-                m.role == "system" && m.content.as_deref() == Some(AGENT_CHAT_SYSTEM_PROMPT)
-            })
-            .count()
-    }
-
     #[test]
-    fn set_agentic_persists_the_kind_and_seeds_the_system_prompt_once() {
+    fn set_agentic_persists_the_kind_without_touching_history() {
         let mut session = memory_session();
         assert!(!session.is_agentic());
+        session.push_user("hello".to_string());
+        session.persist_pending().unwrap();
+        let messages_before = session.messages().len();
 
         session.set_agentic(true).unwrap();
         assert!(session.is_agentic());
@@ -578,11 +561,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.kind, crate::store::KIND_AGENT_CHAT);
-        assert_eq!(count_agent_system_prompts(&session), 1);
-
-        // Turning it on again (already on) must not seed a second copy.
-        session.set_agentic(true).unwrap();
-        assert_eq!(count_agent_system_prompts(&session), 1);
+        // No system prompt gets stored — a provider-valid position for one
+        // can't be guaranteed here, since `/agent` can flip this on at any
+        // point mid-conversation; `agent::request_turn` prepends it fresh
+        // on each turn that actually needs it instead.
+        assert_eq!(session.messages().len(), messages_before);
     }
 
     #[test]
@@ -595,8 +578,6 @@ mod tests {
 
         session.set_agentic(false).unwrap();
         assert!(!session.is_agentic());
-        // The system prompt from turning agentic on stays; nothing is
-        // stripped from history on the way back to plain mode.
         assert_eq!(session.messages().len(), messages_before);
 
         let summary = store::find_session(&session.conn, session.id())
@@ -787,6 +768,7 @@ mod tests {
                 content: Some("system prompt".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                ..Default::default()
             })
             .unwrap();
         assert!(session.discard_if_unused().unwrap());

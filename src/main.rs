@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod conversation;
 mod crypto;
+mod error_log;
 mod session;
 mod spinner;
 mod store;
@@ -932,6 +933,7 @@ async fn cmd_ask(
         content: Some(prompt.to_string()),
         tool_calls: None,
         tool_call_id: None,
+        ..Default::default()
     }];
 
     let spinner = Spinner::start("Thinking...");

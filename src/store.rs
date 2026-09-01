@@ -87,15 +87,17 @@ pub fn open_db() -> Result<Connection> {
         );
 
         CREATE TABLE IF NOT EXISTS messages (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-            seq           INTEGER NOT NULL,
-            role          TEXT NOT NULL,
-            content       TEXT,
-            tool_calls    TEXT,
-            tool_call_id  TEXT,
-            model         TEXT,
-            effort_level  TEXT
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            seq               INTEGER NOT NULL,
+            role              TEXT NOT NULL,
+            content           TEXT,
+            tool_calls        TEXT,
+            tool_call_id      TEXT,
+            model             TEXT,
+            effort_level      TEXT,
+            reasoning_details TEXT,
+            reasoning         TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
@@ -106,6 +108,13 @@ pub fn open_db() -> Result<Connection> {
     // them; back them onto any database created before this change.
     ensure_column(&conn, "messages", "model", "TEXT")?;
     ensure_column(&conn, "messages", "effort_level", "TEXT")?;
+    // A reasoning model's own thinking blocks, needed to keep a follow-up
+    // request valid when a tool-calling turn continues past one — see
+    // `ChatMessage::reasoning_details`.
+    ensure_column(&conn, "messages", "reasoning_details", "TEXT")?;
+    // The same thinking as prose, kept only to show back to the user under
+    // `/verbose` — never resent, unlike the blocks above.
+    ensure_column(&conn, "messages", "reasoning", "TEXT")?;
 
     // Likewise for sessions gaining per-session effort/verbose/max-iterations
     // overrides, so those can be switched mid-conversation and remembered.
@@ -332,12 +341,19 @@ pub fn append_message(
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
+    let reasoning_details_json = message
+        .reasoning_details
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
 
     let content = crypto::encrypt_opt(message.content.as_deref())?;
     let tool_calls_json = crypto::encrypt_opt(tool_calls_json.as_deref())?;
+    let reasoning_details_json = crypto::encrypt_opt(reasoning_details_json.as_deref())?;
+    let reasoning = crypto::encrypt_opt(message.reasoning.as_deref())?;
 
     conn.execute(
-        "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, model, effort_level) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, model, effort_level, reasoning_details, reasoning) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             session_id,
             seq as i64,
@@ -347,6 +363,8 @@ pub fn append_message(
             message.tool_call_id,
             model,
             effort_level,
+            reasoning_details_json,
+            reasoning,
         ],
     )?;
 
@@ -434,7 +452,7 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
 /// model/effort level that produced each message.
 pub fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<StoredMessage>> {
     let mut stmt = conn.prepare(
-        "SELECT role, content, tool_calls, tool_call_id, model, effort_level FROM messages WHERE session_id = ?1 ORDER BY seq ASC",
+        "SELECT role, content, tool_calls, tool_call_id, model, effort_level, reasoning_details, reasoning FROM messages WHERE session_id = ?1 ORDER BY seq ASC",
     )?;
 
     let rows = stmt.query_map(params![session_id], |row| {
@@ -444,6 +462,8 @@ pub fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<StoredMe
         let tool_call_id: Option<String> = row.get(3)?;
         let model: Option<String> = row.get(4)?;
         let effort_level: Option<String> = row.get(5)?;
+        let reasoning_details_json: Option<String> = row.get(6)?;
+        let reasoning: Option<String> = row.get(7)?;
         Ok((
             role,
             content,
@@ -451,15 +471,32 @@ pub fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<StoredMe
             tool_call_id,
             model,
             effort_level,
+            reasoning_details_json,
+            reasoning,
         ))
     })?;
 
     let mut messages = Vec::new();
     for row in rows {
-        let (role, content, tool_calls_json, tool_call_id, model, effort_level) = row?;
+        let (
+            role,
+            content,
+            tool_calls_json,
+            tool_call_id,
+            model,
+            effort_level,
+            reasoning_details_json,
+            reasoning,
+        ) = row?;
         let content = crypto::decrypt_opt(content)?;
         let tool_calls_json = crypto::decrypt_opt(tool_calls_json)?;
         let tool_calls: Option<Vec<ToolCall>> = match tool_calls_json {
+            Some(json) => Some(serde_json::from_str(&json)?),
+            None => None,
+        };
+        let reasoning = crypto::decrypt_opt(reasoning)?;
+        let reasoning_details_json = crypto::decrypt_opt(reasoning_details_json)?;
+        let reasoning_details: Option<Vec<serde_json::Value>> = match reasoning_details_json {
             Some(json) => Some(serde_json::from_str(&json)?),
             None => None,
         };
@@ -469,6 +506,8 @@ pub fn load_messages(conn: &Connection, session_id: &str) -> Result<Vec<StoredMe
                 content,
                 tool_calls,
                 tool_call_id,
+                reasoning,
+                reasoning_details,
             },
             model,
             effort_level,
@@ -500,6 +539,7 @@ pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::{function_call_type, FunctionCall};
 
     fn memory_db() -> Connection {
         crate::crypto::seed_test_key();
@@ -522,15 +562,17 @@ mod tests {
                 updated_at      INTEGER NOT NULL
             );
             CREATE TABLE messages (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                seq           INTEGER NOT NULL,
-                role          TEXT NOT NULL,
-                content       TEXT,
-                tool_calls    TEXT,
-                tool_call_id  TEXT,
-                model         TEXT,
-                effort_level  TEXT
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id        TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq               INTEGER NOT NULL,
+                role              TEXT NOT NULL,
+                content           TEXT,
+                tool_calls        TEXT,
+                tool_call_id      TEXT,
+                model             TEXT,
+                effort_level      TEXT,
+                reasoning_details TEXT,
+                reasoning         TEXT
             );
             ",
         )
@@ -546,12 +588,14 @@ mod tests {
                 content: Some("system prompt".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                ..Default::default()
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: Some("Write me a snake game".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                ..Default::default()
             },
         ];
         assert_eq!(derive_title(&messages), "Write me a snake game");
@@ -570,6 +614,7 @@ mod tests {
             content: Some(long),
             tool_calls: None,
             tool_call_id: None,
+            ..Default::default()
         }];
         let title = derive_title(&messages);
         assert!(title.ends_with("..."));
@@ -596,12 +641,14 @@ mod tests {
                 content: Some("hello".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                ..Default::default()
             },
             ChatMessage {
                 role: "assistant".to_string(),
                 content: Some("hi there".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                ..Default::default()
             },
         ];
 
@@ -615,6 +662,66 @@ mod tests {
         assert_eq!(loaded[1].message.content, Some("hi there".to_string()));
         assert_eq!(loaded[1].model.as_deref(), Some("orcarouter/auto"));
         assert_eq!(loaded[1].effort_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn reasoning_details_round_trip_through_persistence() {
+        let conn = memory_db();
+        let id = create_session(
+            &conn,
+            "anthropic/claude-sonnet-5",
+            KIND_AGENT_CHAT,
+            Some("high"),
+            Some(20),
+            Some(0.7),
+            &ApprovalSettings::default(),
+        )
+        .unwrap();
+
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                call_type: function_call_type(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: r#"{"filepath":"a.rs"}"#.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning: Some("checking the file first".to_string()),
+            reasoning_details: Some(vec![serde_json::json!({
+                "type": "reasoning.text",
+                "text": "checking the file first",
+                "signature": "sig-abc",
+                "index": 0,
+            })]),
+        };
+        append_message(
+            &conn,
+            &id,
+            0,
+            &message,
+            "anthropic/claude-sonnet-5",
+            Some("high"),
+        )
+        .unwrap();
+
+        let loaded = load_messages(&conn, &id).unwrap();
+        let details = loaded[0]
+            .message
+            .reasoning_details
+            .as_ref()
+            .expect("reasoning details survive a round trip");
+        assert_eq!(details[0]["text"], "checking the file first");
+        assert_eq!(details[0]["signature"], "sig-abc");
+        // The prose survives too, so `/verbose` can still show the thinking
+        // behind a reply after the session is resumed.
+        assert_eq!(
+            loaded[0].message.reasoning.as_deref(),
+            Some("checking the file first")
+        );
     }
 
     #[test]
@@ -861,6 +968,7 @@ mod tests {
                 content: Some("hi".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                ..Default::default()
             },
             "model-a",
             None,

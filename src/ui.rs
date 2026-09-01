@@ -312,6 +312,12 @@ pub enum AgentEvent {
     /// `AssistantMessage` that follows them, so a front end renders one or
     /// the other — never both.
     AssistantDelta { text: String },
+    /// The model's own thinking for this turn, when it returned any.
+    /// Emitted before the reply (and before any tool call) it led to, so a
+    /// front end can show the reasoning in the order it happened. Front
+    /// ends gate this behind `/verbose`: it's the same class of detail as a
+    /// tool call's arguments.
+    Thinking { text: String },
     /// The model produced visible text for the user. Always emitted at the
     /// end of a turn, streaming or not, with the complete text.
     AssistantMessage {

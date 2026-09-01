@@ -33,6 +33,9 @@ pub enum TranscriptItem {
         /// well not have been produced by.
         label: Option<String>,
     },
+    /// The model's own thinking for a turn. Only drawn when `/verbose` is
+    /// on — the same class of detail as a tool call's arguments.
+    Thinking(String),
     ToolCall {
         name: String,
         arguments: String,
@@ -307,6 +310,7 @@ impl App {
                 }
                 self.finish_streaming();
             }
+            AgentEvent::Thinking { text } => self.push_thinking(text),
             AgentEvent::ToolCallStarted { name, arguments } => {
                 self.finish_streaming();
                 self.transcript.push(TranscriptItem::ToolCall {
@@ -337,6 +341,23 @@ impl App {
             | AgentEvent::RequestFinished
             | AgentEvent::IterationStarted { .. }
             | AgentEvent::TurnFinished => {}
+        }
+    }
+
+    /// Thinking resolves with the request, which — when streaming — is
+    /// after the reply it led to has already been painted delta by delta.
+    /// Slot it in ahead of that block so the transcript still reads in the
+    /// order the model worked: what it thought, then what it said.
+    fn push_thinking(&mut self, text: String) {
+        let item = TranscriptItem::Thinking(text);
+        match self.transcript.last() {
+            Some(TranscriptItem::Assistant {
+                streaming: true, ..
+            }) => {
+                let before_last = self.transcript.len() - 1;
+                self.transcript.insert(before_last, item);
+            }
+            _ => self.transcript.push(item),
         }
     }
 
@@ -870,6 +891,43 @@ mod tests {
             Some(&TranscriptItem::Notice(
                 "Temperature set to default".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn thinking_slots_in_ahead_of_the_reply_it_led_to() {
+        // Streaming paints the reply first and the thinking only resolves
+        // with the request, so the item has to go in above the block that
+        // is already on screen — otherwise the transcript reads backwards.
+        let mut a = app();
+        a.apply(Event::Agent(AgentEvent::AssistantDelta {
+            text: "the answer".to_string(),
+        }));
+        a.apply(Event::Agent(AgentEvent::Thinking {
+            text: "the thought".to_string(),
+        }));
+
+        assert_eq!(
+            a.transcript[a.transcript.len() - 2],
+            TranscriptItem::Thinking("the thought".to_string())
+        );
+        assert!(matches!(
+            a.transcript.last(),
+            Some(TranscriptItem::Assistant { text, .. }) if text == "the answer"
+        ));
+    }
+
+    #[test]
+    fn thinking_appends_when_nothing_is_streaming() {
+        // The non-streaming path: no reply on screen yet, so it simply goes
+        // on the end and the reply lands after it.
+        let mut a = app();
+        a.apply(Event::Agent(AgentEvent::Thinking {
+            text: "the thought".to_string(),
+        }));
+        assert_eq!(
+            a.transcript.last(),
+            Some(&TranscriptItem::Thinking("the thought".to_string()))
         );
     }
 
