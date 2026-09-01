@@ -1,5 +1,5 @@
 use crate::client::{ChatMessage, Client, StreamEvent};
-use crate::config::ApprovalSettings;
+use crate::config::{ApprovalSettings, SessionGates};
 use crate::tools::{execute_tool, get_tool_definitions};
 use crate::ui::{AgentEvent, AgentUi, ApprovalRequest};
 use anyhow::Result;
@@ -45,7 +45,7 @@ pub async fn run_agent(
     model: &str,
     max_iterations: Option<usize>,
     temperature: Option<f32>,
-    approval: &ApprovalSettings,
+    gates: &SessionGates,
     effort_level: Option<String>,
 ) -> Result<Option<String>> {
     let mut messages = vec![ChatMessage {
@@ -63,7 +63,7 @@ pub async fn run_agent(
         model,
         max_iterations,
         temperature,
-        approval,
+        gates,
         effort_level,
     )
     .await
@@ -241,7 +241,7 @@ pub async fn run_agent_turn(
     model: &str,
     max_iterations: Option<usize>,
     temperature: Option<f32>,
-    approval: &ApprovalSettings,
+    gates: &SessionGates,
     effort_level: Option<String>,
 ) -> Result<Option<String>> {
     // Unlike `temperature`/`effort_level`, there's no provider to fall back
@@ -316,7 +316,11 @@ pub async fn run_agent_turn(
                 .await;
 
                 // Check if approval is needed
-                let approved = if requires_approval(tool_name, approval) {
+                // Read per tool call rather than once per turn: a gate
+                // flipped with `/approval` while this turn is running is
+                // meant to apply to what the turn does next, not to the
+                // turn after it.
+                let approved = if requires_approval(tool_name, &gates.approval()) {
                     ui.approve(ApprovalRequest {
                         tool_name: tool_name.clone(),
                         category: get_tool_category(tool_name),
@@ -329,7 +333,9 @@ pub async fn run_agent_turn(
 
                 let result = if approved {
                     // Execute the tool
-                    let tool_result = execute_tool(tool_name, &tool_call.function.arguments).await;
+                    let tool_result =
+                        execute_tool(tool_name, &tool_call.function.arguments, gates.sandbox())
+                            .await;
 
                     match tool_result {
                         Ok(result) => result,

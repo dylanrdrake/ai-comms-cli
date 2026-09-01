@@ -46,6 +46,10 @@ pub struct SessionSummary {
     /// configured default taken when it was created, mutable from inside
     /// it with `/approval`.
     pub approval: ApprovalSettings,
+    /// Whether this session confines file writes to the working directory
+    /// and home — a snapshot of the configured default taken when it was
+    /// created, mutable from inside it with `/sandbox`.
+    pub sandbox: bool,
     /// Not surfaced by the CLI, but kept for sorting and display.
     #[allow(dead_code)]
     pub created_at: i64,
@@ -82,6 +86,7 @@ pub fn open_db() -> Result<Connection> {
             approval_read      INTEGER NOT NULL DEFAULT 1,
             approval_write     INTEGER NOT NULL DEFAULT 1,
             approval_terminal  INTEGER NOT NULL DEFAULT 1,
+            sandbox            INTEGER NOT NULL DEFAULT 1,
             created_at      INTEGER NOT NULL,
             updated_at      INTEGER NOT NULL
         );
@@ -140,6 +145,10 @@ pub fn open_db() -> Result<Connection> {
         "approval_terminal",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
+    // Where the file-writing tools may write, per session — see
+    // `Config::sandbox`. Defaults on, so a session written before this
+    // existed comes back confined rather than unbounded.
+    ensure_column(&conn, "sessions", "sandbox", "INTEGER NOT NULL DEFAULT 1")?;
 
     Ok(conn)
 }
@@ -194,13 +203,14 @@ pub fn create_session(
     max_iterations: Option<i64>,
     temperature: Option<f64>,
     approval: &ApprovalSettings,
+    sandbox: bool,
 ) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
     let ts = now();
     let title = crypto::encrypt("Untitled")?;
 
     conn.execute(
-        "INSERT INTO sessions (id, title, model, kind, effort_level, max_iterations, temperature, approval_read, approval_write, approval_terminal, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+        "INSERT INTO sessions (id, title, model, kind, effort_level, max_iterations, temperature, approval_read, approval_write, approval_terminal, sandbox, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
         params![
             id,
             title,
@@ -212,6 +222,7 @@ pub fn create_session(
             approval.read_disk,
             approval.write_disk,
             approval.terminal,
+            sandbox,
             ts
         ],
     )?;
@@ -324,6 +335,16 @@ pub fn set_session_approval(
     Ok(())
 }
 
+/// Records whether this session confines file writes to the working
+/// directory and home.
+pub fn set_session_sandbox(conn: &Connection, session_id: &str, sandbox: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET sandbox = ?1 WHERE id = ?2",
+        params![sandbox, session_id],
+    )?;
+    Ok(())
+}
+
 /// Appends a single message to a session and bumps its updated_at timestamp.
 /// `seq` should be the message's 0-based position within the session.
 /// `model`/`effort_level` record what was active when the message was
@@ -380,7 +401,7 @@ pub fn append_message(
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, created_at, updated_at \
+         approval_read, approval_write, approval_terminal, sandbox, created_at, updated_at \
          FROM sessions ORDER BY updated_at DESC",
     )?;
 
@@ -399,8 +420,9 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
                 write_disk: row.get(9)?,
                 terminal: row.get(10)?,
             },
-            created_at: row.get(11)?,
-            updated_at: row.get(12)?,
+            sandbox: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
         })
     })?;
 
@@ -417,7 +439,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
 pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, created_at, updated_at \
+         approval_read, approval_write, approval_terminal, sandbox, created_at, updated_at \
          FROM sessions WHERE id = ?1 OR id LIKE ?2",
     )?;
 
@@ -440,8 +462,9 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
                 write_disk: row.get(9)?,
                 terminal: row.get(10)?,
             },
-            created_at: row.get(11)?,
-            updated_at: row.get(12)?,
+            sandbox: row.get(11)?,
+            created_at: row.get(12)?,
+            updated_at: row.get(13)?,
         }))
     } else {
         Ok(None)
@@ -558,6 +581,7 @@ mod tests {
                 approval_read      INTEGER NOT NULL DEFAULT 1,
                 approval_write     INTEGER NOT NULL DEFAULT 1,
                 approval_terminal  INTEGER NOT NULL DEFAULT 1,
+                sandbox            INTEGER NOT NULL DEFAULT 1,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -632,6 +656,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
 
@@ -675,6 +700,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
 
@@ -735,6 +761,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -746,6 +773,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
 
@@ -766,6 +794,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
         let prefix = &id[..8];
@@ -785,6 +814,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
 
@@ -809,6 +839,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
         let summary = find_session(&conn, &id).unwrap().unwrap();
@@ -834,6 +865,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
 
@@ -861,6 +893,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
 
@@ -882,6 +915,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
 
@@ -909,6 +943,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
 
@@ -933,6 +968,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
 
@@ -957,6 +993,7 @@ mod tests {
             Some(20),
             Some(0.7),
             &ApprovalSettings::default(),
+            true,
         )
         .unwrap();
         append_message(

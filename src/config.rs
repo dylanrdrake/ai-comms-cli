@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 const KEYRING_SERVICE: &str = "ai-comms-cli";
 const KEYRING_USERNAME: &str = "api_key";
@@ -96,6 +98,13 @@ pub struct Config {
     /// optional `HTTP-Referer`/`X-Title` attribution headers).
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+    /// Whether file writes are confined to the working directory and the
+    /// user's home. On by default; turning it off lets the agent's write
+    /// tools touch any path the process can. Reads are never bounded either
+    /// way — they mutate nothing, and confining them would break ordinary
+    /// work like reading a file under `/etc`.
+    #[serde(default = "default_true")]
+    pub sandbox: bool,
     /// Whether to stream responses token-by-token. On by default; turn it off
     /// for providers that handle streaming (especially streaming alongside
     /// tool calls) badly, which falls back to waiting for the whole reply.
@@ -129,6 +138,7 @@ impl Default for Config {
             approval: ApprovalSettings::default(),
             max_iterations: default_max_iterations(),
             temperature: default_temperature(),
+            sandbox: true,
             effort_level: None,
             effort_style: None,
             extra_headers: HashMap::new(),
@@ -204,5 +214,106 @@ pub fn clear_api_key() -> Result<()> {
     match keyring_entry()?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(anyhow!("Failed to remove API key from OS keychain: {e}")),
+    }
+}
+
+/// A live view of a session's safety controls, rather than a copy of them.
+///
+/// The agent loop runs on its own task, so it used to be handed a snapshot
+/// taken when the turn was spawned — which meant a `/approval write off`
+/// typed while a turn was running had no effect until the *next* turn, even
+/// though the settings row updated immediately and said otherwise. Sharing
+/// the settings instead lets each tool call read what they say right now,
+/// which is what someone flipping a gate mid-turn is asking for.
+///
+/// Both controls live here for the same reason: they decide what a tool is
+/// allowed to do, so a turn in progress is exactly when a change to one
+/// matters most. Settings that only shape the *next* request — model,
+/// effort, temperature — are deliberately not here, and still apply from the
+/// next turn.
+///
+/// Cheap to clone: every clone reads and writes the same state.
+#[derive(Clone, Debug, Default)]
+pub struct SessionGates {
+    approval: Arc<Mutex<ApprovalSettings>>,
+    sandbox: Arc<AtomicBool>,
+}
+
+impl SessionGates {
+    pub fn new(approval: ApprovalSettings, sandbox: bool) -> Self {
+        Self {
+            approval: Arc::new(Mutex::new(approval)),
+            sandbox: Arc::new(AtomicBool::new(sandbox)),
+        }
+    }
+
+    /// The approval gates as they stand. Cloned out rather than handing back
+    /// a guard, so a caller can't hold the lock across an await.
+    pub fn approval(&self) -> ApprovalSettings {
+        self.lock().clone()
+    }
+
+    pub fn set_approval(&self, approval: ApprovalSettings) {
+        *self.lock() = approval;
+    }
+
+    /// Whether file writes are confined to the working directory and home.
+    pub fn sandbox(&self) -> bool {
+        self.sandbox.load(Ordering::Relaxed)
+    }
+
+    pub fn set_sandbox(&self, sandbox: bool) {
+        self.sandbox.store(sandbox, Ordering::Relaxed);
+    }
+
+    /// A poisoned lock still holds perfectly good settings — the panic that
+    /// poisoned it happened elsewhere — and refusing to read them would turn
+    /// an unrelated panic into a dead approval gate.
+    fn lock(&self) -> MutexGuard<'_, ApprovalSettings> {
+        self.approval.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_gate_flipped_on_one_handle_is_seen_through_another() {
+        // The whole point: the running turn holds a clone, and the worker
+        // that answers `/approval` or `/sandbox` holds the original. A write
+        // through one has to be visible through the other, or the turn keeps
+        // running on the gates it started with.
+        let worker = SessionGates::new(ApprovalSettings::default(), true);
+        let running_turn = worker.clone();
+        assert!(running_turn.approval().write_disk);
+        assert!(running_turn.sandbox());
+
+        worker.set_approval(worker.approval().with_category("write", false));
+        worker.set_sandbox(false);
+
+        assert!(!running_turn.approval().write_disk);
+        assert!(!running_turn.sandbox());
+        // Only the category asked for moves.
+        assert!(running_turn.approval().read_disk);
+        assert!(running_turn.approval().terminal);
+    }
+
+    #[test]
+    fn gates_survive_a_poisoned_lock() {
+        // A panic somewhere else must not leave the gates unreadable — the
+        // settings behind the lock are still perfectly good, and failing
+        // here would turn an unrelated panic into a dead approval gate.
+        let gates = SessionGates::new(ApprovalSettings::default(), true);
+        let poisoner = gates.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock();
+            panic!("poison the lock");
+        })
+        .join();
+
+        assert!(gates.approval().read_disk);
+        gates.set_approval(gates.approval().with_category("read", false));
+        assert!(!gates.approval().read_disk);
     }
 }

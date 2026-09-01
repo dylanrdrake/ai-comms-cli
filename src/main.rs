@@ -23,7 +23,7 @@ use std::sync::Arc;
 use client::{ChatMessage, Client};
 use config::{
     clear_api_key, get_api_key, get_config_path, load_config, save_config, set_api_key,
-    ApprovalSettings, VALID_EFFORT_STYLES,
+    ApprovalSettings, SessionGates, VALID_EFFORT_STYLES,
 };
 use session::ChatSession;
 use spinner::Spinner;
@@ -123,6 +123,15 @@ enum Commands {
 
     /// View or set whether responses stream in as they're generated
     Stream {
+        /// on/off (also accepts true/false, yes/no, 1/0). Omit to show the
+        /// current setting.
+        #[arg(value_parser = parse_bool)]
+        value: Option<bool>,
+    },
+
+    /// View or set whether the agent's file writes are confined to the
+    /// working directory and your home directory
+    Sandbox {
         /// on/off (also accepts true/false, yes/no, 1/0). Omit to show the
         /// current setting.
         #[arg(value_parser = parse_bool)]
@@ -385,6 +394,7 @@ async fn main() -> Result<()> {
         Some(Commands::MaxIterations { value, clear }) => cmd_max_iterations(value, clear).await?,
         Some(Commands::Temperature { value, clear }) => cmd_temperature(value, clear).await?,
         Some(Commands::Stream { value }) => cmd_stream(value).await?,
+        Some(Commands::Sandbox { value }) => cmd_sandbox(value).await?,
         Some(Commands::EffortLevel { value, clear }) => cmd_effort_level(value, clear).await?,
         Some(Commands::Ask {
             prompt,
@@ -747,6 +757,26 @@ async fn cmd_headers(action: Option<HeaderCommands>) -> Result<()> {
             } else {
                 println!("No header named '{}' was set.", name);
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// The persistent default for confining the agent's file writes. A session
+/// snapshots this when it's created, so changing it here affects new
+/// sessions; `/sandbox` changes the one you're in.
+async fn cmd_sandbox(value: Option<bool>) -> Result<()> {
+    let mut config = load_config()?;
+
+    match value {
+        Some(enabled) => {
+            config.sandbox = enabled;
+            save_config(&config)?;
+            println!("{} {}", "✓".green(), ui::sandbox_notice(enabled, true));
+        }
+        None => {
+            println!("{}", ui::sandbox_notice(config.sandbox, false));
         }
     }
 
@@ -1137,6 +1167,16 @@ fn apply_submission(
             println!("{}", "Approval Settings:".blue());
             print_approval_status(session.approval());
         }
+        ui::Submission::SetSandbox(sandbox) => {
+            session.set_sandbox(sandbox)?;
+            println!("{}", ui::sandbox_notice(sandbox, true).blue());
+        }
+        ui::Submission::ShowSandbox => {
+            println!("{}", ui::sandbox_notice(session.sandbox(), false).blue());
+        }
+        ui::Submission::UnknownCommand(message) => {
+            println!("{} {}", "✗".red(), message);
+        }
     }
     Ok(())
 }
@@ -1194,6 +1234,7 @@ async fn cmd_session(
                 default_max_iterations,
                 default_temperature,
                 config.approval.clone(),
+                config.sandbox,
             )?
         }
     };
@@ -1251,7 +1292,7 @@ async fn cmd_session(
                 let temperature = session.temperature();
                 let turn = if session.is_agentic() {
                     let max_iterations = session.max_iterations();
-                    let approval = session.approval().clone();
+                    let gates = SessionGates::new(session.approval().clone(), session.sandbox());
                     agent::run_agent_turn(
                         &client,
                         &mut ui,
@@ -1259,7 +1300,7 @@ async fn cmd_session(
                         &model,
                         max_iterations,
                         temperature,
-                        &approval,
+                        &gates,
                         effort_level,
                     )
                     .await
@@ -1327,6 +1368,7 @@ async fn cmd_agent(
     let max_iterations = resolve_max_iterations(&config, max_iterations);
     let temperature = resolve_temperature(&config, temperature);
     let approval = config.approval.clone();
+    let sandbox = config.sandbox;
     let effort_level = resolve_effort_level(&config, effort_level);
     let client = Client::new(config)?;
 
@@ -1342,7 +1384,7 @@ async fn cmd_agent(
         &model,
         max_iterations,
         temperature,
-        &approval,
+        &SessionGates::new(approval, sandbox),
         effort_level,
     )
     .await?;
@@ -1359,6 +1401,7 @@ async fn cmd_tui() -> Result<()> {
         max_iterations: config.max_iterations,
         temperature: config.temperature,
         approval: config.approval.clone(),
+        sandbox: config.sandbox,
         client: Arc::new(Client::new(config)?),
     };
 

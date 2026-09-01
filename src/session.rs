@@ -45,6 +45,10 @@ pub struct ChatSession {
     /// `effort_level`/`max_iterations`/`temperature` there's no "unset,
     /// defer to config" state once a turn actually needs to check them).
     approval: ApprovalSettings,
+    /// Whether this session confines the agent's file writes to the working
+    /// directory and the user's home. Always concrete, like `approval` — a
+    /// tool about to write needs a yes or no, not "defer to config".
+    sandbox: bool,
     messages: Vec<ChatMessage>,
     /// Whether the session has been given a title derived from a user
     /// message yet. Sessions start as "Untitled".
@@ -71,6 +75,7 @@ impl ChatSession {
         max_iterations: Option<usize>,
         temperature: Option<f32>,
         approval: ApprovalSettings,
+        sandbox: bool,
     ) -> Result<Self> {
         let id = store::create_session(
             &conn,
@@ -80,6 +85,7 @@ impl ChatSession {
             max_iterations.map(|n| n as i64),
             temperature.map(|n| n as f64),
             &approval,
+            sandbox,
         )?;
         Ok(ChatSession {
             conn,
@@ -92,6 +98,7 @@ impl ChatSession {
             max_iterations,
             temperature,
             approval,
+            sandbox,
             messages: Vec::new(),
             title_set: false,
             saved_len: 0,
@@ -136,6 +143,7 @@ impl ChatSession {
                 effort_level: summary.effort_level.clone(),
                 verbose: summary.verbose,
                 max_iterations: summary.max_iterations.map(|n| n as usize),
+                sandbox: summary.sandbox,
                 temperature: summary.temperature.map(|n| n as f32),
                 approval: summary.approval.clone(),
                 messages,
@@ -257,6 +265,23 @@ impl ChatSession {
     /// This session's current tool-approval gates.
     pub fn approval(&self) -> &ApprovalSettings {
         &self.approval
+    }
+
+    /// Switches whether file writes are confined to the working directory
+    /// and home, and records it.
+    pub fn set_sandbox(&mut self, sandbox: bool) -> Result<()> {
+        if self.sandbox == sandbox {
+            return Ok(());
+        }
+        store::set_session_sandbox(&self.conn, &self.id, sandbox)?;
+        self.sandbox = sandbox;
+        Ok(())
+    }
+
+    /// Whether this session confines file writes to the working directory
+    /// and home.
+    pub fn sandbox(&self) -> bool {
+        self.sandbox
     }
 
     /// The session's current title — "Untitled" until the first user
@@ -432,6 +457,7 @@ mod tests {
                 approval_read      INTEGER NOT NULL DEFAULT 1,
                 approval_write     INTEGER NOT NULL DEFAULT 1,
                 approval_terminal  INTEGER NOT NULL DEFAULT 1,
+                sandbox            INTEGER NOT NULL DEFAULT 1,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -459,6 +485,7 @@ mod tests {
             Some(20),
             Some(0.7),
             ApprovalSettings::default(),
+            true,
         )
         .unwrap()
     }

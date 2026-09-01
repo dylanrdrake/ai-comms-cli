@@ -117,7 +117,12 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
     ]
 }
 
-pub async fn execute_tool(name: &str, arguments: &str) -> Result<serde_json::Value> {
+/// Runs one tool call. `sandbox` is the session's current setting: with it
+/// on, the tools that write are confined to the working directory and the
+/// user's home. Reads are not bounded either way — they mutate nothing, and
+/// confining them would break ordinary work like reading a file under
+/// `/etc`.
+pub async fn execute_tool(name: &str, arguments: &str, sandbox: bool) -> Result<serde_json::Value> {
     let args: serde_json::Value = serde_json::from_str(arguments)?;
 
     match name {
@@ -132,7 +137,7 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<serde_json::Val
                 .ok_or(anyhow!("Missing content"))?;
             let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("write");
 
-            write_file(filepath, content, mode)
+            write_file(filepath, content, mode, sandbox)
         }
         "read_file" => {
             let filepath = args
@@ -161,7 +166,7 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<serde_json::Val
                 .and_then(|v| v.as_str())
                 .ok_or(anyhow!("Missing replace"))?;
 
-            replace_in_file(filepath, search, replace)
+            replace_in_file(filepath, search, replace, sandbox)
         }
         "run_terminal_command" => {
             let command = args
@@ -180,9 +185,41 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<serde_json::Val
     }
 }
 
-fn write_file(filepath: &str, content: &str, mode: &str) -> Result<serde_json::Value> {
-    let cwd = std::env::current_dir()?;
+/// The refusal to hand back when `path` is outside what the sandbox allows,
+/// or `None` when the write may go ahead.
+///
+/// The bound is the working directory or the user's home. `path` must
+/// already be canonicalized — resolving `..` and symlinks is what makes this
+/// a check on where a write lands rather than on how it was spelled.
+///
+/// With `sandbox` off there is no bound at all; the refusal names the
+/// setting so the way out of it is visible from the error itself.
+fn sandbox_refusal(path: &Path, sandbox: bool) -> Option<serde_json::Value> {
+    if !sandbox {
+        return None;
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
     let home = home::home_dir().unwrap_or_default();
+    if path.starts_with(&cwd) || path.starts_with(&home) {
+        return None;
+    }
+    Some(json!({
+        "success": false,
+        "error": format!(
+            "Sandbox: {} is outside the working directory and home directory. \
+             Allow writes anywhere with /sandbox off (or comms sandbox off).",
+            path.display()
+        )
+    }))
+}
+
+fn write_file(
+    filepath: &str,
+    content: &str,
+    mode: &str,
+    sandbox: bool,
+) -> Result<serde_json::Value> {
+    let cwd = std::env::current_dir()?;
 
     let raw_path = std::path::Path::new(filepath);
     let absolute = if raw_path.is_absolute() {
@@ -204,12 +241,8 @@ fn write_file(filepath: &str, content: &str, mode: &str) -> Result<serde_json::V
     fs::create_dir_all(parent)?;
     let path = parent.canonicalize()?.join(file_name);
 
-    // Security check
-    if !path.starts_with(&cwd) && !path.starts_with(&home) {
-        return Ok(json!({
-            "success": false,
-            "error": format!("Security: cannot write outside {:?}", cwd)
-        }));
+    if let Some(refusal) = sandbox_refusal(&path, sandbox) {
+        return Ok(refusal);
     }
 
     if mode == "append" {
@@ -281,7 +314,12 @@ fn list_files(dirpath: &str) -> Result<serde_json::Value> {
     }))
 }
 
-fn replace_in_file(filepath: &str, search: &str, replace: &str) -> Result<serde_json::Value> {
+fn replace_in_file(
+    filepath: &str,
+    search: &str,
+    replace: &str,
+    sandbox: bool,
+) -> Result<serde_json::Value> {
     let path = Path::new(filepath);
 
     if !path.exists() {
@@ -291,7 +329,14 @@ fn replace_in_file(filepath: &str, search: &str, replace: &str) -> Result<serde_
         }));
     }
 
-    let mut content = fs::read_to_string(path)?;
+    // Canonicalized first: the check is about where a path *lands*, not how
+    // it's spelled, so `../../etc/hosts` has to resolve before it's judged.
+    let path = path.canonicalize()?;
+    if let Some(refusal) = sandbox_refusal(&path, sandbox) {
+        return Ok(refusal);
+    }
+
+    let mut content = fs::read_to_string(&path)?;
 
     if !content.contains(search) {
         return Ok(json!({
@@ -301,7 +346,7 @@ fn replace_in_file(filepath: &str, search: &str, replace: &str) -> Result<serde_
     }
 
     content = content.replace(search, replace);
-    fs::write(path, content)?;
+    fs::write(&path, content)?;
 
     Ok(json!({
         "success": true,
@@ -426,6 +471,75 @@ async fn run_terminal_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_file_outside_the_workspace(name: &str) -> std::path::PathBuf {
+        // `/tmp` is outside both the working directory and home, which is
+        // exactly the territory the sandbox exists to keep writes out of.
+        let path =
+            std::env::temp_dir().join(format!("comms-sandbox-test-{}-{name}", std::process::id()));
+        fs::write(&path, "before").unwrap();
+        path
+    }
+
+    #[test]
+    fn replace_in_file_refuses_to_write_outside_the_sandbox() {
+        // The gap this closes: `replace_in_file` had no bound at all, so it
+        // could rewrite any existing file the process could open, while
+        // `write_file` next to it was checked.
+        let path = temp_file_outside_the_workspace("refused");
+
+        let result = replace_in_file(path.to_str().unwrap(), "before", "after", true).unwrap();
+
+        assert_eq!(result["success"], false);
+        assert!(
+            result["error"].as_str().unwrap().contains("Sandbox"),
+            "{result}"
+        );
+        // Refused before the write, not after it.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn replace_in_file_writes_outside_the_workspace_with_the_sandbox_off() {
+        // Turning it off is the whole point of the setting, so this is the
+        // other half of the contract, not an oversight.
+        let path = temp_file_outside_the_workspace("allowed");
+
+        let result = replace_in_file(path.to_str().unwrap(), "before", "after", false).unwrap();
+
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after");
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn write_file_refuses_outside_the_sandbox_and_allows_inside_it() {
+        let outside =
+            std::env::temp_dir().join(format!("comms-sandbox-test-{}-write", std::process::id()));
+        let refused = write_file(outside.to_str().unwrap(), "x", "write", true).unwrap();
+        assert_eq!(refused["success"], false);
+        assert!(!outside.exists());
+
+        // A relative path resolves against the working directory, which is
+        // inside the bound.
+        let inside = format!("comms-sandbox-test-{}.txt", std::process::id());
+        let allowed = write_file(&inside, "x", "write", true).unwrap();
+        assert_eq!(allowed["success"], true, "{allowed}");
+        fs::remove_file(&inside).ok();
+    }
+
+    #[test]
+    fn the_bound_is_where_a_path_lands_not_how_it_is_spelled() {
+        // Canonicalization is what makes this true: a path that walks out of
+        // the workspace with `..` has to be judged on where it ends up.
+        let escape = format!(
+            "{}/../../../../../../etc/comms-sandbox-should-never-exist",
+            std::env::current_dir().unwrap().display()
+        );
+        let result = write_file(&escape, "x", "write", true).unwrap();
+        assert_eq!(result["success"], false, "{result}");
+    }
 
     #[tokio::test]
     async fn run_terminal_command_returns_stdout_and_exit_code() {

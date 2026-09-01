@@ -12,7 +12,7 @@
 
 use crate::agent;
 use crate::client::Client;
-use crate::config::ApprovalSettings;
+use crate::config::{ApprovalSettings, SessionGates};
 use crate::session::ChatSession;
 use crate::ui::{AgentEvent, AgentUi, ApprovalRequest};
 use anyhow::Result;
@@ -48,6 +48,9 @@ pub enum Command {
     /// Toggle verbose tool detail in the TUI view. Purely a display
     /// setting; the agent loop never sees it.
     ToggleVerbose,
+    /// Confine the agent's file writes to the working directory and home,
+    /// or let them go anywhere.
+    SetSandbox(bool),
     /// Switch the tool-calling iteration cap per turn (agent mode only).
     /// `None` nullifies it — a turn falls back to whatever the configured
     /// default is when it runs. A turn already running keeps the cap it
@@ -84,7 +87,9 @@ pub enum Event {
     /// decide whether a new message sends immediately or queues.
     Busy(bool),
     /// A message was accepted but won't be sent until the current turn ends.
-    Queued { pending: usize },
+    Queued {
+        pending: usize,
+    },
     /// The in-flight turn was cancelled.
     Cancelled,
     /// A user message was accepted and is now part of the transcript. Front
@@ -100,26 +105,43 @@ pub enum Event {
     /// Agent (tool-calling) mode was turned on or off (or a change failed).
     /// Front ends re-label from here rather than assuming the command
     /// succeeded.
-    AgenticChanged { agentic: bool },
+    AgenticChanged {
+        agentic: bool,
+    },
     /// The reasoning effort changed (or a change failed). Front ends
     /// re-label from here rather than assuming the command succeeded.
-    EffortChanged { effort_level: Option<String> },
+    EffortChanged {
+        effort_level: Option<String>,
+    },
     /// Verbose tool detail was turned on or off.
-    VerboseChanged { verbose: bool },
+    VerboseChanged {
+        verbose: bool,
+    },
+    SandboxChanged {
+        sandbox: bool,
+    },
     /// The tool-calling iteration cap changed (or a change failed). Front
     /// ends re-label from here rather than assuming the command succeeded.
     /// `None` means nullified — turns fall back to the configured default.
-    MaxIterationsChanged { max_iterations: Option<usize> },
+    MaxIterationsChanged {
+        max_iterations: Option<usize>,
+    },
     /// A tool-approval gate changed (or a change failed). Front ends
     /// re-label from here rather than assuming the command succeeded.
-    ApprovalSettingsChanged { approval: ApprovalSettings },
+    ApprovalSettingsChanged {
+        approval: ApprovalSettings,
+    },
     /// The sampling temperature changed (or a change failed). Front ends
     /// re-label from here rather than assuming the command succeeded.
     /// `None` means nullified, same deal as `MaxIterationsChanged`.
-    TemperatureChanged { temperature: Option<f32> },
+    TemperatureChanged {
+        temperature: Option<f32>,
+    },
     /// The session's title changed — set once a session goes from
     /// "Untitled" to a title derived from its first user message.
-    TitleChanged { title: String },
+    TitleChanged {
+        title: String,
+    },
 }
 
 /// Handle to a running conversation worker.
@@ -146,6 +168,9 @@ impl Conversation {
 
         let worker = Worker {
             client,
+            // Built before the session moves in, and shared with every turn
+            // this worker spawns so a mid-turn `/approval` reaches it.
+            gates: SessionGates::new(session.approval().clone(), session.sandbox()),
             session,
             max_iterations,
             temperature,
@@ -200,6 +225,11 @@ struct Worker {
     /// Whether turns run the tool-calling loop (`agent-chat`) or are a plain
     /// exchange (`chat`).
     agentic: bool,
+    /// The session's approval gates as a shared handle. A running turn holds
+    /// a clone of this rather than a copy of the settings, so `/approval`
+    /// typed mid-turn applies to the turn's next tool call — see
+    /// [`ApprovalGates`].
+    gates: SessionGates,
     events: mpsc::UnboundedSender<Event>,
 }
 
@@ -232,6 +262,7 @@ impl Worker {
                 Command::SetEffort(effort_level) => self.set_effort(effort_level),
                 Command::ResetEffort => self.reset_effort(),
                 Command::ToggleVerbose => self.toggle_verbose(),
+                Command::SetSandbox(sandbox) => self.set_sandbox(sandbox),
                 Command::SetMaxIterations(max_iterations) => {
                     self.set_max_iterations(max_iterations)
                 }
@@ -274,7 +305,7 @@ impl Worker {
         let effort_level = self.session.effort_level().map(|s| s.to_string());
         let max_iterations = self.session.max_iterations();
         let temperature = self.session.temperature();
-        let approval = self.session.approval().clone();
+        let gates = self.gates.clone();
         let agentic = self.agentic;
 
         let mut turn = tokio::spawn(async move {
@@ -287,7 +318,7 @@ impl Worker {
                     &model,
                     max_iterations,
                     temperature,
-                    &approval,
+                    &gates,
                     effort_level,
                 )
                 .await
@@ -360,17 +391,26 @@ impl Worker {
                             queue.push_back(text);
                             let _ = self.events.send(Event::Queued { pending: queue.len() });
                         }
-                        // Applies from the next turn on; the running one
-                        // already captured its model/mode/effort.
+                        // These apply from the next turn on; the running
+                        // one already captured its model/mode/effort.
                         Some(Command::SetModel(model)) => self.set_model(model),
                         Some(Command::SetAgentic(agentic)) => self.set_agentic(agentic),
                         Some(Command::SetEffort(effort_level)) => self.set_effort(effort_level),
                         Some(Command::ResetEffort) => self.reset_effort(),
                         Some(Command::ToggleVerbose) => self.toggle_verbose(),
+                        // Like approval, this reaches the running turn: it
+                        // decides what a tool may do, not what the next
+                        // request looks like.
+                        Some(Command::SetSandbox(sandbox)) => self.set_sandbox(sandbox),
                         Some(Command::SetMaxIterations(max_iterations)) => {
                             self.set_max_iterations(max_iterations)
                         }
                         Some(Command::ResetMaxIterations) => self.reset_max_iterations(),
+                        // Approval is the exception: it reaches the
+                        // running turn too, at its next tool call. A gate is
+                        // a safety control, so someone flipping one during a
+                        // turn means *this* turn — waiting for the next one
+                        // would be exactly backwards.
                         Some(Command::SetApproval { category, enabled }) => {
                             self.set_approval(&category, enabled)
                         }
@@ -516,8 +556,23 @@ impl Worker {
     /// Switches one tool-approval gate and tells the front end what the
     /// session's gates ended up as, so the display can't drift from what
     /// the next turn will actually use.
+    fn set_sandbox(&mut self, sandbox: bool) {
+        // Through the shared handle as well as the session, so a turn
+        // already running sees it at its next tool call.
+        self.gates.set_sandbox(sandbox);
+        if let Err(e) = self.session.set_sandbox(sandbox) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to switch the sandbox: {e}"),
+            }));
+        }
+        let _ = self.events.send(Event::SandboxChanged { sandbox });
+    }
+
     fn set_approval(&mut self, category: &str, enabled: bool) {
         let approval = self.session.approval().with_category(category, enabled);
+        // Through the shared handle as well as the session, so a turn
+        // already running sees it at its next tool call.
+        self.gates.set_approval(approval.clone());
         if let Err(e) = self.session.set_approval(approval) {
             let _ = self.events.send(Event::Agent(AgentEvent::Error {
                 message: format!("Failed to switch approval: {e}"),

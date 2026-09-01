@@ -102,6 +102,9 @@ pub struct App {
     /// Mirrors the plain CLI's `-v`: gates whether tool call arguments and
     /// results are shown, not just that a tool ran. Toggled with `/verbose`.
     pub verbose: bool,
+    /// Whether the agent's file writes are confined to the working directory
+    /// and home. Changed with `/sandbox`.
+    pub sandbox: bool,
     /// This session's `/max-iterations` override, changed with
     /// `/max-iterations`/`/max-iterations default`. `None` means nullified —
     /// turns fall back to the configured default. Only takes effect in
@@ -143,6 +146,7 @@ impl App {
             title: "Untitled".to_string(),
             agentic: false,
             verbose: false,
+            sandbox: true,
             max_iterations: None,
             temperature: None,
             approval: ApprovalSettings::default(),
@@ -236,6 +240,16 @@ impl App {
                 } else {
                     format!("Effort is {label}")
                 }));
+            }
+            Event::SandboxChanged { sandbox } => {
+                let changed = sandbox != self.sandbox;
+                self.sandbox = sandbox;
+                if changed {
+                    self.transcript
+                        .push(TranscriptItem::Notice(crate::ui::sandbox_notice(
+                            sandbox, true,
+                        )));
+                }
             }
             Event::VerboseChanged { verbose } => {
                 self.verbose = verbose;

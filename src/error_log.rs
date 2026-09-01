@@ -13,7 +13,7 @@ use crate::config::get_config_dir;
 use anyhow::Result;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_ENTRIES: usize = 100;
@@ -31,7 +31,19 @@ pub fn log_error(context: &str, message: &str) {
 }
 
 fn try_log_error(context: &str, message: &str) -> Result<()> {
-    let path = get_config_dir()?.join(LOG_FILE);
+    append_entry(&get_config_dir()?, context, message)
+}
+
+/// The body of [`try_log_error`], against an explicit directory.
+///
+/// Split out so a test can hand it a temp directory rather than trying to
+/// move the real one. Redirecting `get_config_dir` means overriding `HOME`,
+/// which only works on Unix — on Windows the home directory comes from
+/// `USERPROFILE`, so the test wrote to the developer's actual profile and
+/// then failed looking for the file somewhere else. It also made the test
+/// mutate process-wide state that every other test shares.
+fn append_entry(dir: &Path, context: &str, message: &str) -> Result<()> {
+    let path = dir.join(LOG_FILE);
 
     let mut lines: Vec<String> = if path.exists() {
         fs::read_to_string(&path)?
@@ -167,15 +179,13 @@ mod tests {
 
     #[test]
     fn log_error_trims_to_the_most_recent_entries() {
-        crate::crypto::seed_test_key();
         let dir = tempfile_dir();
-        std::env::set_var("HOME", &dir);
 
         for i in 0..(MAX_ENTRIES + 10) {
-            try_log_error("test", &format!("entry {i}")).unwrap();
+            append_entry(&dir, "test", &format!("entry {i}")).unwrap();
         }
 
-        let path = dir.join(".comms").join(LOG_FILE);
+        let path = dir.join(LOG_FILE);
         let contents = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), MAX_ENTRIES);
@@ -199,4 +209,3 @@ mod tests {
         dir
     }
 }
-

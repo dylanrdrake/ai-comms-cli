@@ -8,7 +8,7 @@ An OpenAI-compatible CLI frontend for any LLM provider, with agentic tool capabi
 - **Multiple interaction modes** — Q&A, interactive chat, agentic tasks, and a full-screen TUI
 - **Streaming responses** — Replies appear as they're generated rather than all at once
 - **File operations** — LLM can read, write, and modify local files
-- **Model selection** — Choose from 200+ models or use adaptive routing
+- **Model selection** — Choose from configured provider's models
 - **Agentic loops** — Multi-turn execution with tool calling
 - **Persistent sessions** — `session`/`tui` conversations are saved to SQLite and resumable across restarts
 - **Secure credential storage** — API keys live in your OS keychain, not a plaintext file
@@ -143,6 +143,21 @@ In `tui`, the session's current value shows in the settings row as 🌡
 Persistence](#session-persistence)), color-coded cool-to-hot (cyan → yellow
 → orange → pink) as it rises from 0.
 
+#### `sandbox [on|off]`
+View or set whether the agent's file-writing tools are confined to your current working directory and your home directory.
+
+```bash
+# Show the current setting
+comms sandbox
+
+# Let the agent write anywhere it has permission to
+comms sandbox off
+```
+
+On by default. It bounds `write_file` and `replace_in_file` only — reads are never restricted, since they change nothing and confining them would break ordinary work like reading a file under `/etc`. The bound is checked against the path a write *resolves to*, so `..` and symlinks can't be used to step outside it.
+
+This is the persistent default; a session snapshots it at creation, and `/sandbox` changes the session you're in. It's a separate axis from `approval`: approval decides whether you're *asked* first, the sandbox decides whether the write is allowed at all.
+
 #### `effort-level [value]`
 View or set the persistent default reasoning effort sent to models that support it. Applies to `ask`, `session`, and `agent`. Usually `low`, `medium`, or `high`, but not checked against a fixed list — models vary in what they accept, and an unsupported value just gets rejected by the API.
 
@@ -275,8 +290,15 @@ exactly:
 | `/temperature <n>` (or `/temp <n>`) | Switch the sampling temperature for the rest of the session, and remember it |
 | `/temperature clear` (or `/temp clear`) | Nullify it — requests are then sent with no temperature field |
 | `/temperature default` (or `/temp default`) | Read the *currently* configured default temperature and save that to the session |
-| `/approval <read\|write\|terminal\|all> <on\|off>` | Switch a tool-approval gate for the rest of the session, and remember it |
+| `/approval <read\|write\|terminal\|all> <on\|off>` | Switch a tool-approval gate for the rest of the session, and remember it. Takes effect immediately — including partway through a running turn, from its next tool call |
 | `/approval` | Show the approval gates currently in use |
+| `/sandbox <on\|off>` | Confine the agent's file writes to the working directory and home, or allow them anywhere. Takes effect immediately, including partway through a running turn |
+| `/sandbox` | Show whether writes are currently confined |
+
+A mistyped invocation of one of these (`/effort` with no value, `/approval
+bogus off`), or a misspelled command name (`/mode` for `/model`), is
+reported as an error rather than sent to the model — see the note under
+`tui`'s command table for the exact boundary.
 
 ```bash
 comms session
@@ -364,10 +386,12 @@ first message.
 |---|---|
 | `Enter` | Send. If a reply is still streaming, the message is queued and sent when it finishes |
 | `Esc` | Cancel the in-flight turn (kills a running tool command too) |
+| `Alt-Enter` / `Shift-Enter` | Insert a newline instead of sending. `Alt-Enter` works everywhere; `Shift-Enter` needs a terminal that supports the kitty keyboard protocol (kitty, WezTerm, Ghostty, foot, recent Alacritty), because the older input protocol can't tell `Shift-Enter` apart from `Enter` at all |
 | `↑` / `↓` | Recall previous messages into the input box |
 | type an answer, `Enter` | Answer a tool approval prompt — `y`/`yes` allows, anything else (including blank) denies |
 | `PgUp` / `PgDn` / `End` | Scroll the transcript; `End` re-pins to the newest |
 | Mouse wheel | Also scrolls the transcript — `↑`/`↓` stay dedicated to prompt history |
+| `Ctrl-Shift-V` / `Shift-Insert` / middle-click | Paste, using your terminal's own paste binding. Multi-line pastes land in the input box as text rather than sending a message per line. `Ctrl-V` is **not** a paste key in most terminals — it never reaches your clipboard |
 | `Ctrl-B` | Back to the launch screen (the session is saved) |
 | `Ctrl-C` | Quit |
 
@@ -389,12 +413,24 @@ first message.
 | `/temperature <n>` (or `/temp <n>`) | Switch the sampling temperature for the rest of the session, and remember it |
 | `/temperature clear` (or `/temp clear`) | Nullify it — requests are then sent with no temperature field |
 | `/temperature default` (or `/temp default`) | Read the *currently* configured default temperature and save that to the session |
-| `/approval <read\|write\|terminal\|all> <on\|off>` | Switch a tool-approval gate for the rest of the session, and remember it |
+| `/approval <read\|write\|terminal\|all> <on\|off>` | Switch a tool-approval gate for the rest of the session, and remember it. Takes effect immediately — including partway through a running turn, from its next tool call |
 | `/approval` | Show the approval gates currently in use |
+| `/sandbox <on\|off>` | Confine the agent's file writes to the working directory and home, or allow them anywhere. Takes effect immediately, including partway through a running turn |
+| `/sandbox` | Show whether writes are currently confined |
 
-Only recognized commands are intercepted — a message that merely starts with a
-slash (`/etc/hosts`, say) is sent as normal text. All of the above persist to
-the session, so they stick across `Ctrl-B`/`--resume` too.
+Only recognized commands are intercepted — including a *mistyped* one.
+`/approval bogus off`, or a bare `/effort` with no value, is reported as an
+error rather than sent to the model, since a line naming a known command is
+confidently meant as one. So is a misspelled command name: `/mode gpt-5`
+answers with `Did you mean /model?` instead of quietly asking the model
+about it.
+
+A message that merely starts with a slash is still sent as normal text
+whenever it isn't close to a command — paths (`/etc/hosts`), and words that
+merely extend a command name (`/verbosely`), both go through untouched.
+
+All of the above persist to the session, so they stick across
+`Ctrl-B`/`--resume` too.
 
 Sessions are saved exactly as the other commands save them, so a `tui`
 session can be resumed with `comms session --resume` and vice versa — mode,
@@ -592,9 +628,9 @@ sudo dnf groupinstall "Development Tools"
 
 ## Security
 
-- File operations are restricted to your current working directory and home directory
+- The agent's file-writing tools (`write_file`, `replace_in_file`) are confined to your current working directory and home directory by default, checked against the path a write resolves to so `..` and symlinks can't step outside it. Turn it off per session with `/sandbox off` or globally with `comms sandbox off`. Reads and terminal commands are not bounded this way — a terminal command runs whatever you approve
 - API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.comms/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `comms` command, and the field is stripped from the file afterward
-- `session`/`tui` history (including tool calls and their results) is stored unencrypted in `~/.comms/chats.db` — add it to `.gitignore` and avoid pasting secrets into a session if you plan to keep or share the database file
+- `session`/`tui` history is stored in `~/.comms/chats.db` with message content, tool calls, reasoning, and titles encrypted at rest (AES-256-GCM, key held in your OS keychain under a separate `db_encryption_key` entry) — but the surrounding session metadata (roles, model names, effort levels, timestamps) is stored in the clear, and rows written before encryption existed stay plaintext until they're next written. The key lives in the same keychain `comms` already uses, so this protects the file at rest (backups, drive theft) rather than against someone who can run `comms` as you; avoid pasting secrets into a session if you plan to share the database file
 - The last 100 LLM API errors (a non-2xx response, a stalled/dropped connection, a malformed stream) are kept at `~/.comms/errors.log`, so a confusing one can be looked back at without having to catch and copy it in the moment — plain text, one line per entry, oldest dropped as new ones come in
 - Each of those entries records the shape of the request that failed — role sequence, tool-call and reasoning counts — but no message text. To capture the request itself, set `COMMS_DEBUG_REQUESTS=1`: the failing request's full JSON body is written to `~/.comms/failed-request.json` (only the most recent one, overwritten each time) and the log entry names the file. **That file contains the entire conversation verbatim** — every message, tool call and tool result — so it's off by default, and worth deleting once you're done with it
 

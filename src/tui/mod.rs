@@ -27,8 +27,9 @@ use anyhow::Result;
 use app::{App, Focus, TranscriptItem};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
-    MouseEventKind,
+    Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::{execute, terminal};
 use futures_util::StreamExt;
@@ -36,6 +37,7 @@ use picker::{Activation, Picker, SessionRow};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,6 +54,9 @@ pub struct Context {
     pub max_iterations: Option<usize>,
     pub temperature: Option<f32>,
     pub approval: ApprovalSettings,
+    /// The configured default for confining the agent's file writes, taken
+    /// as this session's starting value.
+    pub sandbox: bool,
 }
 
 enum Screen {
@@ -109,6 +114,7 @@ fn open_new(context: &Context, agentic: bool, title: Option<String>) -> Result<C
         context.max_iterations,
         context.temperature,
         context.approval.clone(),
+        context.sandbox,
     )?;
     if let Some(title) = title {
         session.set_title(title)?;
@@ -156,6 +162,7 @@ fn start_chat(
     app.max_iterations = session.max_iterations();
     app.temperature = session.temperature();
     app.approval = session.approval().clone();
+    app.sandbox = session.sandbox();
     app.title = session.title().to_string();
     seed_transcript(&mut app, &history);
 
@@ -217,6 +224,11 @@ fn seed_transcript(app: &mut App, history: &[StoredMessage]) {
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+/// Whether the terminal accepted the keyboard enhancement flags, so teardown
+/// knows whether it has a push to undo. A static because both [`leave`] and
+/// the panic hook have to see it and neither is handed any state.
+static ENHANCED_KEYS: AtomicBool = AtomicBool::new(false);
+
 fn enter() -> Result<Tui> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -232,11 +244,31 @@ fn enter() -> Result<Tui> {
         EnableMouseCapture
     )?;
 
+    // Shift-Enter can't be seen at all under the legacy input protocol: a
+    // bare Enter arrives as a carriage return, which has nowhere to carry a
+    // modifier, so Shift-Enter is byte-identical to Enter. (Alt-Enter works
+    // because Alt has always been encoded as an escape prefix, which *is*
+    // distinguishable.) The kitty keyboard protocol reports the modifier
+    // properly, so ask for its disambiguation flag wherever the terminal
+    // advertises support and leave everything alone where it doesn't —
+    // Alt-Enter still covers those.
+    let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    ENHANCED_KEYS.store(enhanced, Ordering::Relaxed);
+
     // A panic while in raw mode would otherwise leave the terminal unusable
     // with no echo and no cursor, so restore first, then panic normally.
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = terminal::disable_raw_mode();
+        if ENHANCED_KEYS.load(Ordering::Relaxed) {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = execute!(
             io::stdout(),
             DisableBracketedPaste,
@@ -251,6 +283,11 @@ fn enter() -> Result<Tui> {
 
 fn leave(terminal: &mut Tui) -> Result<()> {
     terminal::disable_raw_mode()?;
+    // Popped before the rest so the terminal is back on its own protocol
+    // even if a later command fails.
+    if ENHANCED_KEYS.swap(false, Ordering::Relaxed) {
+        execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+    }
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
@@ -399,7 +436,7 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
                 }
             }
             KeyCode::Backspace => p.rename_backspace(),
-            KeyCode::Char(c) => p.rename_insert_char(c),
+            KeyCode::Char(c) if is_typed_char(&key) => p.rename_insert_char(c),
             _ => {}
         }
         return Ok(false);
@@ -471,7 +508,7 @@ fn handle_naming_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> R
         KeyCode::Backspace => {
             input.pop();
         }
-        KeyCode::Char(c) => input.push(c),
+        KeyCode::Char(c) if is_typed_char(&key) => input.push(c),
         _ => {}
     }
     Ok(false)
@@ -496,6 +533,18 @@ fn handle_mouse_scroll(app: &mut App, mouse: MouseEvent) {
     }
 }
 
+/// Whether a `Char` keypress is someone typing, rather than a chord that
+/// happens to carry a letter. Without this every unhandled Ctrl-combination
+/// types its bare letter — Ctrl-V, the paste chord users reach for first,
+/// put a stray `v` in the input box instead of doing nothing.
+///
+/// Only CONTROL disqualifies a keypress. SHIFT is how capitals arrive, and
+/// ALT composes real characters on some layouts and terminals, so neither
+/// can be treated as "not typing".
+fn is_typed_char(key: &KeyEvent) -> bool {
+    !key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 /// Handles a keypress in the conversation. Returns whether to leave it and
 /// go back to the launch screen.
 fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) -> bool {
@@ -510,7 +559,7 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
             KeyCode::Backspace => app.backspace(),
             KeyCode::Left => app.move_left(),
             KeyCode::Right => app.move_right(),
-            KeyCode::Char(c) => app.insert_char(c),
+            KeyCode::Char(c) if is_typed_char(&key) => app.insert_char(c),
             _ => {}
         }
         return false;
@@ -523,8 +572,9 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
     }
 
     match key.code {
-        // Alt-Enter always inserts a newline; Shift-Enter does too on the
-        // terminals that report the modifier at all, which many don't.
+        // Alt-Enter always inserts a newline. Shift-Enter does too wherever
+        // the terminal can report the modifier — see `enter`, which asks
+        // for that reporting when the terminal supports it.
         KeyCode::Enter
             if key
                 .modifiers
@@ -550,6 +600,18 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                     }
                     app::Submission::ResetEffort => conversation.send(Command::ResetEffort),
                     app::Submission::ToggleVerbose => conversation.send(Command::ToggleVerbose),
+                    app::Submission::SetSandbox(sandbox) => {
+                        conversation.send(Command::SetSandbox(sandbox))
+                    }
+                    // A read of state the UI already holds — no round trip
+                    // through the worker, same as `/approval` bare.
+                    app::Submission::ShowSandbox => {
+                        app.transcript
+                            .push(TranscriptItem::Notice(crate::ui::sandbox_notice(
+                                app.sandbox,
+                                false,
+                            )));
+                    }
                     app::Submission::SetMaxIterations(max_iterations) => {
                         conversation.send(Command::SetMaxIterations(max_iterations))
                     }
@@ -573,6 +635,11 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                             changed: false,
                         });
                     }
+                    // Same deal: a failed command is reported locally,
+                    // without needing the worker at all.
+                    app::Submission::UnknownCommand(message) => {
+                        app.transcript.push(TranscriptItem::Error(message));
+                    }
                 }
             }
         }
@@ -589,7 +656,7 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
         KeyCode::PageUp => app.scroll_back = app.scroll_back.saturating_add(5),
         KeyCode::PageDown => app.scroll_back = app.scroll_back.saturating_sub(5),
         KeyCode::End => app.scroll_back = 0,
-        KeyCode::Char(c) => app.insert_char(c),
+        KeyCode::Char(c) if is_typed_char(&key) => app.insert_char(c),
         _ => {}
     }
     false
@@ -606,6 +673,33 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::empty(),
         }
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn a_control_chord_does_not_type_its_letter() {
+        // Ctrl-V is the paste chord people reach for first. Most terminals
+        // don't treat it as paste, so it arrives here as an ordinary
+        // keypress — and used to leave a stray `v` in the input box.
+        assert!(!is_typed_char(&key(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn ordinary_typing_still_types() {
+        assert!(is_typed_char(&key(
+            KeyCode::Char('v'),
+            KeyModifiers::empty()
+        )));
+        // Capitals arrive carrying SHIFT, and ALT composes real characters
+        // on some layouts — neither means "not typing".
+        assert!(is_typed_char(&key(KeyCode::Char('V'), KeyModifiers::SHIFT)));
+        assert!(is_typed_char(&key(KeyCode::Char('e'), KeyModifiers::ALT)));
     }
 
     #[test]
