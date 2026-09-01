@@ -34,6 +34,19 @@ pub struct TerminalAgentUi {
     /// actually ran. Tool calls run one at a time, so there's never more
     /// than one in flight to track.
     pending_arguments: Option<String>,
+    /// Whether the current tool-call header line (`🔨 name  detail`) is
+    /// still open — printed without a trailing newline, waiting for
+    /// whichever event resolves it to close it with a trailing status
+    /// marker on the same line, the CLI's equivalent of the TUI
+    /// transcript's trailing ✓/✗/?. A verbose dump between the header and
+    /// its resolution closes it early instead, since the marker can no
+    /// longer land on that same (now scrolled-past) line.
+    tool_header_open: bool,
+    /// Whether the current call showed an approval prompt (closing the
+    /// header with `?`). Its own typed `y`/`N` answer already says how it
+    /// resolved, so — unlike a call that ran with no prompt at all —
+    /// `ToolCallCompleted`/`ToolCallDenied` draw no further marker for it.
+    approval_shown: bool,
 }
 
 impl TerminalAgentUi {
@@ -43,6 +56,8 @@ impl TerminalAgentUi {
             show_model_label,
             spinner: None,
             pending_arguments: None,
+            tool_header_open: false,
+            approval_shown: false,
         }
     }
 
@@ -90,41 +105,65 @@ impl AgentUi for TerminalAgentUi {
                         // resuming at column 0.
                         println!("{} {}", "●".cyan(), wrap::wrap_indented(&text, "  "));
                     }
+                    // One blank line after every transcript unit, matching
+                    // the TUI, which spaces its items the same way
+                    // regardless of what kind each one is.
+                    println!();
                 }
                 AgentEvent::ToolCallStarted { name, arguments } => {
-                    // Matches the TUI transcript's gear marker for a tool
-                    // call; completion still gets its own ✓/✗ line below,
-                    // the CLI's equivalent of the TUI's trailing status.
-                    tool_notice("⚙".magenta(), &name, &arguments);
+                    // Printed without a trailing newline — closed by
+                    // whichever of approval/denial/completion resolves it
+                    // next, with a trailing status marker, so the whole
+                    // call reads as one line: the CLI's equivalent of the
+                    // TUI transcript's gutter-marker-plus-trailing-status
+                    // row instead of repeating the tool's name on its own
+                    // line every time.
+                    print_tool_header(&name, &arguments);
+                    self.tool_header_open = true;
+                    self.approval_shown = false;
                     if self.verbose {
+                        println!();
+                        self.tool_header_open = false;
                         print_fields(&tool_call_fields(&name, &arguments));
                     }
                     self.pending_arguments = Some(arguments);
                 }
-                AgentEvent::ToolCallDenied { name } => {
+                AgentEvent::ToolCallDenied { name: _ } => {
                     // Consumes the pending call so the ToolCallCompleted
                     // that always follows a denial knows not to report the
-                    // same call again as if it had succeeded.
-                    let arguments = self.pending_arguments.take().unwrap_or_default();
-                    tool_notice("✗".red(), &format!("{name} denied"), &arguments);
+                    // same call again as if it had succeeded. A denial only
+                    // ever happens after an approval prompt — the typed `N`
+                    // that produced it already says how this resolved, so
+                    // there's no separate marker to draw underneath it.
+                    let _ = self.pending_arguments.take();
+                    println!();
                 }
-                AgentEvent::ToolCallCompleted { name, result } => {
+                AgentEvent::ToolCallCompleted { name: _, result } => {
                     // Only the non-denied path reaches here with a pending
                     // entry; a denial already reported itself and cleared it.
                     if self.pending_arguments.take().is_none() {
                         return;
                     }
-                    println!("{} {}", "✓".green(), name.bold());
+                    // A call that went through an approval prompt already
+                    // has its answer on screen (the typed `y`); only a call
+                    // that ran with no prompt at all still needs its own
+                    // closing marker.
+                    if !self.approval_shown {
+                        self.close_tool_header("✓".green());
+                    }
                     if self.verbose {
                         print_fields(&json_fields(&result));
                     }
+                    println!();
                 }
                 AgentEvent::Error { message } => {
                     println!("{} {}", "✗".red(), message);
+                    println!();
                 }
                 AgentEvent::TurnFinished => {
                     if self.verbose {
                         println!("{}", "✓ Agent finished".green());
+                        println!();
                     }
                 }
             }
@@ -140,6 +179,13 @@ impl TerminalAgentUi {
     /// The blocking stdin prompt behind [`AgentUi::approve`], kept separate
     /// so the async wrapper stays trivial.
     fn prompt_approval(&mut self, request: ApprovalRequest) -> Result<bool> {
+        // Closes the tool-call header with a trailing `?`, matching the
+        // TUI transcript's `AwaitingApproval` marker, before the prompt
+        // itself — which has no TUI transcript equivalent (that lives in
+        // the TUI's separate approval modal instead) — continues below.
+        self.close_tool_header("?".yellow());
+        self.approval_shown = true;
+
         let category_label = match request.category {
             "read" => "Read from disk",
             "write" => "Write to disk",
@@ -184,16 +230,41 @@ impl TerminalAgentUi {
 
         Ok(parse_yes_no(&input))
     }
+
+    /// Closes the currently open tool-call header line with a trailing
+    /// status marker — landing right after the name/detail on the same
+    /// line, matching the TUI transcript's trailing ✓/? — or, if the line
+    /// was already closed by a verbose dump, prints the marker on its own
+    /// short indented line instead, rather than repeating the tool's name.
+    /// Only ever called for `?` (always) and `✓` on a call that ran with no
+    /// approval prompt — one that went through a prompt has its answer on
+    /// screen already and draws no further marker.
+    fn close_tool_header(&mut self, marker: ColoredString) {
+        if self.tool_header_open {
+            println!(" {marker}");
+            self.tool_header_open = false;
+        } else {
+            println!("  {marker}");
+        }
+    }
 }
 
-/// Prints `marker name  detail`, where `detail` is the file path or command
-/// the call is acting on when its arguments have one — the same terse
-/// identification the TUI always shows for a tool call, regardless of `-v`.
-fn tool_notice(marker: ColoredString, name: &str, arguments: &str) {
+/// Prints `🔨 name  detail` with no trailing newline — `detail` is the file
+/// path or command the call is acting on when its arguments have one, the
+/// same terse identification the TUI always shows for a tool call,
+/// regardless of `-v`. Left open for [`TerminalAgentUi::close_tool_header`]
+/// to finish with a trailing status marker.
+fn print_tool_header(name: &str, arguments: &str) {
     match primary_argument(arguments) {
-        Some(detail) => println!("{marker} {}  {}", name.bold(), detail.bright_black()),
-        None => println!("{marker} {}", name.bold()),
+        Some(detail) => print!(
+            "{} {}  {}",
+            "🔨".magenta(),
+            name.bold(),
+            detail.bright_black()
+        ),
+        None => print!("{} {}", "🔨".magenta(), name.bold()),
     }
+    let _ = io::stdout().flush();
 }
 
 /// The verbose-only per-field breakdown under a tool notice, matching the

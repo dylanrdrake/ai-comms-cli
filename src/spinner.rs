@@ -6,7 +6,9 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const TICK: Duration = Duration::from_millis(80);
+// Same frames and cadence as the TUI's busy indicator (`tui/render.rs`), so
+// the two front ends feel identical while waiting on a reply.
+const TICK: Duration = Duration::from_millis(100);
 
 /// An animated terminal spinner shown while waiting on a slow call (e.g. an
 /// LLM response). Runs on its own task; call `stop()` once the call resolves
@@ -25,10 +27,11 @@ impl Spinner {
         let handle = tokio::spawn(async move {
             let mut frame = 0;
             while running_clone.load(Ordering::Relaxed) {
+                // One color across frame and message, matching the TUI's
+                // busy segment rather than the CLI's old cyan/yellow split.
                 print!(
-                    "\r{} {}",
-                    FRAMES[frame % FRAMES.len()].cyan(),
-                    message.yellow()
+                    "\r{}",
+                    format!("{} {}", FRAMES[frame % FRAMES.len()], message).yellow()
                 );
                 let _ = io::stdout().flush();
                 frame += 1;

@@ -1274,10 +1274,10 @@ async fn cmd_session(
                 };
 
                 match turn {
-                    // The reply itself is printed by the UI; this is the
-                    // blank line that has always followed it.
-                    Ok(Some(_)) => println!(),
-                    Ok(None) => {}
+                    // The reply itself, and its trailing blank line, are
+                    // printed by the UI now — one blank line after every
+                    // transcript unit, matching the TUI.
+                    Ok(Some(_)) | Ok(None) => {}
                     Err(e) => println!("{} {}\n", "✗".red(), e),
                 }
 
@@ -1296,6 +1296,9 @@ async fn cmd_session(
                 ) {
                     println!("{} {}", "✗".red(), e);
                 }
+                // One blank line after every transcript unit, matching a
+                // message reply and the TUI's own Notice spacing.
+                println!();
             }
         }
     }

@@ -120,6 +120,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
                         markdown_lines(text),
                         cursor,
                         content_width,
+                        GUTTER_CONTINUATION,
                     );
                 }
                 lines.push(Line::raw(""));
@@ -155,10 +156,16 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
                     // `trailing` marker — same mechanism the streaming
                     // cursor uses, so it always lands on the last wrapped
                     // row rather than getting buried mid-wrap.
-                    Span::styled("⚙ ", Style::new().magenta()),
+                    Span::styled("🔨 ", Style::new().magenta()),
                     vec![Line::from(header)],
                     marker.map(|(m, style)| Span::styled(format!(" {m}"), style)),
-                    content_width,
+                    // `content_width` assumes a 2-column prefix, one less
+                    // than "🔨 "'s actual 3 (🔨 is double-width) — wrap one
+                    // column narrower so the prefixed row still fits, rather
+                    // than overflowing the terminal width and getting
+                    // wrapped a second time, out from under the gutter.
+                    content_width.saturating_sub(1),
+                    "   ",
                 );
                 if app.verbose {
                     for (key, shown) in tool_call_fields(name, arguments) {
@@ -615,12 +622,19 @@ fn push_labeled(lines: &mut Vec<Line<'static>>, label: String, value: String, wi
     }
 }
 
+/// `gutter` is the continuation indent for a wrapped row — normally
+/// [`GUTTER_CONTINUATION`], sized to match a single-width marker
+/// (`❯`/`●`/`—`) plus its trailing space, but callers whose `prefix` is
+/// wider (🔨 is double-width, so `"🔨 "` alone fills 3 columns) pass a
+/// wider one instead, so a wrapped continuation row still lines up under
+/// the first row's actual text rather than the usual 2-column gutter.
 fn push_rendered(
     lines: &mut Vec<Line<'static>>,
     prefix: Span<'static>,
     mut rendered: Vec<Line<'static>>,
     trailing: Option<Span<'static>>,
     width: usize,
+    gutter: &str,
 ) {
     if rendered.is_empty() {
         rendered.push(Line::raw(""));
@@ -633,7 +647,7 @@ fn push_rendered(
             if line_index == 0 && row_index == 0 {
                 row.spans.insert(0, prefix.clone());
             } else {
-                row.spans.insert(0, Span::raw(GUTTER_CONTINUATION));
+                row.spans.insert(0, Span::raw(gutter.to_string()));
             }
             if line_index == last_line && row_index == last_row {
                 if let Some(trailing) = trailing.clone() {
@@ -1133,7 +1147,7 @@ mod tests {
             .lines()
             .find(|l| l.contains("read_file"))
             .expect("header row shown");
-        assert!(row.trim_start().starts_with("⚙ read_file"), "{row:?}");
+        assert!(row.trim_start().starts_with("🔨  read_file"), "{row:?}");
         assert!(row.trim_end().ends_with('✓'), "{row:?}");
     }
 
@@ -1151,7 +1165,7 @@ mod tests {
             .find(|l| l.contains("run_terminal_command"))
             .expect("header row shown");
         assert!(
-            row.trim_start().starts_with("⚙ run_terminal_command"),
+            row.trim_start().starts_with("🔨  run_terminal_command"),
             "{row:?}"
         );
         assert!(!row.contains('▸'), "{row:?}");
@@ -1168,11 +1182,13 @@ mod tests {
         let out = render_to_string(&app, 30, 14);
         let row = out
             .lines()
-            .position(|l| l.trim_start().starts_with("⚙ a_pretty"))
+            .position(|l| l.trim_start().starts_with("🔨  a_pretty"))
             .expect("header row shown");
         let continuation = out.lines().nth(row + 1).expect("continuation row");
+        // 3 columns, not the usual 2 — "🔨 " is double-width, one column
+        // wider than the other markers' gutter.
         assert!(
-            continuation.starts_with("  ") && !continuation.trim().is_empty(),
+            continuation.starts_with("   ") && !continuation.trim().is_empty(),
             "{continuation:?}"
         );
     }
