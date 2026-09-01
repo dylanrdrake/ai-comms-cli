@@ -17,38 +17,77 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
     // row — normally what's been typed, or, while a tool call is waiting on
     // a decision, the approval prompt that takes over the same box instead
     // of floating a separate modal over the conversation.
-    let input_width = frame.area().width.saturating_sub(2);
     let content_rows = match &app.pending_approval {
         // The typed-answer line plus the blank line under it, ahead of the
         // tool/argument detail — see `draw_approval`.
         Some(request) => approval_lines(request).len() as u16 + 2,
-        None => input_lines(&app.input, input_width).len() as u16,
+        None => input_lines(&app.input, frame.area().width.saturating_sub(2)).len() as u16,
     };
     let input_rows = content_rows
         .clamp(1, MAX_INPUT_ROWS)
         // Never take so much that the conversation has nowhere to go. The
-        // reserve covers the two status rows, the gap row above the input,
-        // and the input box's own two border rows — the session title rides
-        // in the transcript pane's own border, not a separate row.
+        // reserve covers the title row, the rule under it, the input box's
+        // own two border rows, and the settings/key-binding rows below it.
         .min(frame.area().height.saturating_sub(7).max(1));
 
     let areas = Layout::vertical([
-        Constraint::Min(1),                 // transcript: comms - <title>
-        Constraint::Length(1),              // top status: ready/model/effort/temp
-        Constraint::Length(1),              // a hair of breathing room before input
-        Constraint::Length(input_rows + 2), // input, plus its borders
-        Constraint::Length(1),              // bottom status: mode/verbose/controls
+        Constraint::Length(1),              // session title
+        Constraint::Length(1),              // rule
+        Constraint::Min(1),                 // chat history
+        Constraint::Length(input_rows + 2), // message prompt, bordered, plus its borders
+        Constraint::Length(1),              // settings: ask/agent, model, effort, temp, verbose
+        Constraint::Length(1),              // key bindings
     ])
     .split(frame.area());
 
-    draw_transcript(frame, areas[0], app);
-    draw_top_status(frame, areas[1], app, tick);
-    draw_input(frame, areas[3], app);
-    draw_bottom_status(frame, areas[4], app);
+    draw_title(frame, areas[0], app);
+    draw_rule(frame, areas[1], None);
+    let scrolled = draw_transcript(frame, areas[2], app);
+    draw_input(frame, areas[3], app, scrolled);
+    draw_settings(frame, areas[4], app, tick);
+    draw_keybindings(frame, areas[5]);
 }
 
-fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
+/// The session's title, plain — no border, no "comms -" prefix.
+fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            app.title.clone(),
+            Style::new().bold(),
+        ))),
+        area,
+    );
+}
+
+/// A subtle full-width divider, standing in for the borders the screen used
+/// to have. `hint`, when given, is overlaid right-aligned on top of it —
+/// used for the "scrolled" notice, the way a bordered box would have shown
+/// it in its own title.
+pub(super) fn draw_rule(frame: &mut Frame, area: Rect, hint: Option<&str>) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::new().dark_gray(),
+        ))),
+        area,
+    );
+    if let Some(hint) = hint {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(hint, Style::new().yellow())).right_aligned()),
+            area,
+        );
+    }
+}
+
+/// Draws the transcript and reports whether the view is scrolled away from
+/// the newest content, so the top status row can flag it.
+fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
     let mut lines: Vec<Line> = Vec::new();
+    // User/Assistant text is wrapped by hand (see `wrap_styled`) rather
+    // than left to ratatui's `Wrap`, specifically so a row broken by
+    // wrapping — not just one broken by a literal newline — still lines up
+    // under the gutter instead of resuming at column 0.
+    let content_width = area.width.saturating_sub(2).max(1) as usize;
 
     for item in &app.transcript {
         match item {
@@ -58,22 +97,30 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
                     Span::styled("❯ ", Style::new().green().bold()),
                     text,
                     None,
+                    content_width,
                 );
                 lines.push(Line::raw(""));
             }
             TranscriptItem::Assistant {
                 text, streaming, ..
             } => {
-                // No model label — just the reply text.
-                let prefix = Span::raw("");
+                // No model label — just a plain dot marking it as a reply,
+                // and the text.
+                let prefix = Span::styled("● ", Style::new().cyan());
                 let cursor = streaming.then(|| Span::styled("▌", Style::new().cyan()));
                 if *streaming {
                     // Mid-stream the text is usually mid-construct — an
                     // unclosed fence or a half-written list — so render it
                     // plainly and let the finished message reformat once.
-                    push_block(&mut lines, prefix, text, cursor);
+                    push_block(&mut lines, prefix, text, cursor, content_width);
                 } else {
-                    push_rendered(&mut lines, prefix, markdown_lines(text), cursor);
+                    push_rendered(
+                        &mut lines,
+                        prefix,
+                        markdown_lines(text),
+                        cursor,
+                        content_width,
+                    );
                 }
                 lines.push(Line::raw(""));
             }
@@ -88,10 +135,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
                     ToolStatus::Denied => ("✗", Style::new().red()),
                     ToolStatus::Done { .. } => ("✓", Style::new().green()),
                 };
-                let mut header = vec![
-                    Span::styled(format!("  {marker} "), style),
-                    Span::styled(name.clone(), Style::new().bold()),
-                ];
+                let mut header = vec![Span::styled(name.clone(), Style::new().bold())];
                 // The file or command a call is acting on identifies it well
                 // enough to show even without -v; the rest of its arguments
                 // (and its result) are the detail that gates behind verbose.
@@ -101,20 +145,20 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
                         Style::new().dark_gray(),
                     ));
                 }
-                lines.push(Line::from(header));
+                push_rendered(
+                    &mut lines,
+                    Span::styled(format!("{marker} "), style),
+                    vec![Line::from(header)],
+                    None,
+                    content_width,
+                );
                 if app.verbose {
                     for (key, shown) in tool_call_fields(name, arguments) {
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("     {key}  "), Style::new().dark_gray()),
-                            Span::raw(shown),
-                        ]));
+                        push_labeled(&mut lines, format!("     {key}  "), shown, content_width);
                     }
                     if let ToolStatus::Done { result } = status {
                         for (key, shown) in json_fields(result) {
-                            lines.push(Line::from(vec![
-                                Span::styled(format!("     {key}  "), Style::new().dark_gray()),
-                                Span::raw(shown),
-                            ]));
+                            push_labeled(&mut lines, format!("     {key}  "), shown, content_width);
                         }
                     }
                 }
@@ -122,23 +166,26 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
             }
             TranscriptItem::Error(message) => {
                 lines.push(Line::from(vec![
-                    Span::styled("  ✗ ", Style::new().red().bold()),
+                    Span::styled("✗ ", Style::new().red().bold()),
                     Span::styled(message.clone(), Style::new().red()),
                 ]));
                 lines.push(Line::raw(""));
             }
             TranscriptItem::Notice(message) => {
-                lines.push(Line::from(Span::styled(
-                    format!("  — {message}"),
-                    Style::new().dark_gray().italic(),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled("— ", Style::new().dark_gray().italic()),
+                    Span::styled(message.clone(), Style::new().dark_gray().italic()),
+                ]));
                 lines.push(Line::raw(""));
             }
             TranscriptItem::ApprovalStatus { approval, changed } => {
-                lines.push(Line::from(Span::styled(
-                    format!("  — Approval {}:", if *changed { "set to" } else { "is" }),
-                    Style::new().dark_gray().italic(),
-                )));
+                lines.push(Line::from(vec![
+                    Span::styled("— ", Style::new().dark_gray().italic()),
+                    Span::styled(
+                        format!("Approval {}:", if *changed { "set to" } else { "is" }),
+                        Style::new().dark_gray().italic(),
+                    ),
+                ]));
                 for (label, enabled) in [
                     ("Read from disk:    ", approval.read_disk),
                     ("Write to disk:     ", approval.write_disk),
@@ -165,8 +212,10 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
         lines.pop();
     }
 
-    let inner_width = area.width.saturating_sub(2);
-    let visible = area.height.saturating_sub(2);
+    // No border, and the title now rides in its own row above `area`
+    // (see `draw_title`), so the whole of `area` is free for content.
+    let inner_width = area.width;
+    let visible = area.height;
 
     // Measured with ratatui's own wrapper rather than estimated: any
     // disagreement between the estimate and the real layout shows up as the
@@ -200,45 +249,21 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // scroll_back counts up from the bottom; 0 pins to the newest content.
     let offset = max_offset.saturating_sub(app.scroll_back.min(max_offset));
 
-    frame.render_widget(
-        paragraph
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(
-                        format!(" comms - {} ", app.title),
-                        Style::new().bold(),
-                    ))
-                    .title_bottom(scroll_hint(app, max_offset)),
-            )
-            .scroll((offset, 0)),
-        area,
-    );
+    frame.render_widget(paragraph.scroll((offset, 0)), area);
+
+    // Reported so the rule below can carry the "scrolled" notice instead of
+    // a border's bottom title, since there's no border to carry it anymore.
+    !app.is_pinned_to_bottom() && max_offset > 0
 }
 
-fn scroll_hint(app: &App, max_offset: u16) -> Line<'static> {
-    if !app.is_pinned_to_bottom() && max_offset > 0 {
-        Line::from(Span::styled(
-            " scrolled — End to follow ",
-            Style::new().yellow(),
-        ))
-        .right_aligned()
-    } else {
-        Line::raw("")
-    }
-}
-
-fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
+/// `scrolled` carries the "scrolled — End to follow" notice onto the box's
+/// top border, right-aligned — the same edge the transcript's own border
+/// used to show it on, back when it had one.
+fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
     if let Some(request) = &app.pending_approval {
-        draw_approval(frame, area, app, request);
+        draw_approval(frame, area, app, request, scrolled);
         return;
     }
-
-    let (title, style) = if app.busy {
-        (" message (queues while busy) ", Style::new().dark_gray())
-    } else {
-        (" message ", Style::new().dark_gray())
-    };
 
     let width = area.width.saturating_sub(2).max(1);
     let rows = input_lines(&app.input, width);
@@ -249,17 +274,25 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App) {
     let visible = area.height.saturating_sub(2).max(1);
     let scroll = (cursor_row + 1).saturating_sub(visible);
 
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().dark_gray());
+    if scrolled {
+        block = block.title(
+            Line::from(Span::styled(
+                " scrolled — End to follow ",
+                Style::new().yellow(),
+            ))
+            .right_aligned(),
+        );
+    }
+
     // Wrapped by hand rather than by `Wrap`, so the cursor position below is
     // computed against exactly the rows being drawn.
     let paragraph = Paragraph::new(Text::from(
         rows.into_iter().map(Line::from).collect::<Vec<_>>(),
     ))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(style)
-            .title(Span::styled(title, style)),
-    )
+    .block(block)
     .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
 
@@ -314,9 +347,11 @@ fn input_cursor(input: &str, cursor: usize, width: u16) -> (u16, u16) {
     (row as u16, col as u16)
 }
 
-/// Ready/busy, model, and effort — the request-shaping settings, grouped
-/// above the input box.
-fn draw_top_status(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
+/// Every controllable setting in one row below the message prompt: ready/
+/// busy, ask/agent mode, model, effort, temperature, verbose, and how many
+/// messages are queued — everything `/model`, `/agent`, `/effort`,
+/// `/temperature`, `/verbose`, etc. can change.
+fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let mut spans = Vec::new();
 
     if app.busy {
@@ -328,6 +363,14 @@ fn draw_top_status(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         spans.push(Span::styled(" ready ", Style::new().green()));
     }
 
+    spans.push(Span::styled(
+        format!("· {} ", if app.agentic { "agent" } else { "ask" }),
+        if app.agentic {
+            Style::new().yellow()
+        } else {
+            Style::new().cyan()
+        },
+    ));
     spans.push(Span::styled(
         format!("· {} ", app.model),
         Style::new().dark_gray(),
@@ -345,21 +388,6 @@ fn draw_top_status(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         ),
         Style::new().dark_gray(),
     ));
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-/// Ask/agent, verbose, queue depth, session id, and the keybinding hints —
-/// grouped below the input box, closest to where you're typing.
-fn draw_bottom_status(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![Span::styled(
-        format!(" {} ", if app.agentic { "agent" } else { "ask" }),
-        if app.agentic {
-            Style::new().yellow()
-        } else {
-            Style::new().cyan()
-        },
-    )];
     spans.push(Span::styled(
         format!("· {} ", if app.verbose { "verbose" } else { "quiet" }),
         if app.verbose {
@@ -376,12 +404,21 @@ fn draw_bottom_status(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
 
-    spans.push(Span::styled(
-        "· Enter send · Esc cancel · PgUp/PgDn scroll · Ctrl-B back · Ctrl-C quit",
-        Style::new().dark_gray(),
-    ));
-
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The keybinding hints, on their own row at the very bottom.
+/// Dimmed a step further than the rest of the muted (dark_gray) text
+/// elsewhere, so it recedes into the background rather than competing with
+/// the settings row right above it.
+fn draw_keybindings(frame: &mut Frame, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Enter send · Esc cancel · PgUp/PgDn scroll · Ctrl-B back · Ctrl-C quit",
+            Style::new().dark_gray().dim(),
+        ))),
+        area,
+    );
 }
 
 /// Takes over the input box — rather than floating a modal over the
@@ -396,7 +433,13 @@ fn draw_bottom_status(frame: &mut Frame, area: Rect, app: &App) {
 /// That's why this deliberately doesn't `.wrap(..)`: a field long enough to
 /// overflow the box just gets clipped at the edge instead, which loses
 /// characters but never the interactive prompt beneath it.
-fn draw_approval(frame: &mut Frame, area: Rect, app: &App, request: &ApprovalRequest) {
+fn draw_approval(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    request: &ApprovalRequest,
+    scrolled: bool,
+) {
     let category = match request.category {
         "read" => "Read from disk",
         "write" => "Write to disk",
@@ -416,12 +459,21 @@ fn draw_approval(frame: &mut Frame, area: Rect, app: &App, request: &ApprovalReq
         Span::raw(app.input.clone()),
     ]));
 
-    let paragraph = Paragraph::new(Text::from(lines)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::new().yellow())
-            .title(Span::styled(title, Style::new().yellow().bold())),
-    );
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().yellow())
+        .title(Span::styled(title, Style::new().yellow().bold()));
+    if scrolled {
+        block = block.title(
+            Line::from(Span::styled(
+                " scrolled — End to follow ",
+                Style::new().yellow(),
+            ))
+            .right_aligned(),
+        );
+    }
+
+    let paragraph = Paragraph::new(Text::from(lines)).block(block);
     frame.render_widget(paragraph, area);
 
     let col = prompt.chars().count() as u16 + app.input[..app.cursor].chars().count() as u16;
@@ -493,30 +545,69 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
 
 /// Pushes already-rendered rows under a speaker label, keeping the label on
 /// the first row and any trailing marker on the last.
+/// Every message-start line leads with a 2-column glyph — `❯ `, `✓ `, `— `,
+/// or two blank spaces where there's no icon — so replies read as one
+/// aligned gutter down the left edge. Continuation lines — a literal
+/// embedded newline, or a row `wrap_styled` broke a long one into — get
+/// this same blank width instead of the glyph, so their text lines up
+/// under the first line's content rather than under the icon.
+const GUTTER_CONTINUATION: &str = "  ";
+
+/// Pushes a "label  value" row, one level of indent deeper than the
+/// message gutter — a verbose tool-call field or result. The value wraps
+/// and, unlike the message gutter, its continuation lines up under the
+/// value itself rather than back at the label, since there's no icon here
+/// competing for that column.
+fn push_labeled(lines: &mut Vec<Line<'static>>, label: String, value: String, width: usize) {
+    let label_width = label.chars().count();
+    let value_width = width.saturating_sub(label_width).max(1);
+    let blank = " ".repeat(label_width);
+    for (index, mut row) in wrap_styled(Line::from(Span::raw(value)), value_width)
+        .into_iter()
+        .enumerate()
+    {
+        if index == 0 {
+            row.spans
+                .insert(0, Span::styled(label.clone(), Style::new().dark_gray()));
+        } else {
+            row.spans.insert(0, Span::raw(blank.clone()));
+        }
+        lines.push(row);
+    }
+}
+
 fn push_rendered(
     lines: &mut Vec<Line<'static>>,
     prefix: Span<'static>,
     mut rendered: Vec<Line<'static>>,
     trailing: Option<Span<'static>>,
+    width: usize,
 ) {
     if rendered.is_empty() {
         rendered.push(Line::raw(""));
     }
-    let last = rendered.len() - 1;
-    for (index, mut line) in rendered.into_iter().enumerate() {
-        if index == 0 {
-            line.spans.insert(0, prefix.clone());
-        }
-        if index == last {
-            if let Some(trailing) = trailing.clone() {
-                line.spans.push(trailing);
+    let last_line = rendered.len() - 1;
+    for (line_index, line) in rendered.into_iter().enumerate() {
+        let wrapped = wrap_styled(line, width);
+        let last_row = wrapped.len() - 1;
+        for (row_index, mut row) in wrapped.into_iter().enumerate() {
+            if line_index == 0 && row_index == 0 {
+                row.spans.insert(0, prefix.clone());
+            } else {
+                row.spans.insert(0, Span::raw(GUTTER_CONTINUATION));
             }
+            if line_index == last_line && row_index == last_row {
+                if let Some(trailing) = trailing.clone() {
+                    row.spans.push(trailing);
+                }
+            }
+            lines.push(row);
         }
-        lines.push(line);
     }
 }
 
-/// Pushes one speaker's text, split into a `Line` per newline.
+/// Pushes one speaker's text, split into a `Line` per newline (and, within
+/// each, further wrapped to `width` — see `wrap_styled`).
 ///
 /// A ratatui `Line` is a single row: it doesn't break on an embedded `\n`,
 /// so putting a whole multi-paragraph reply in one Line both renders it as
@@ -529,22 +620,109 @@ fn push_block(
     prefix: Span<'static>,
     text: &str,
     trailing: Option<Span<'static>>,
+    width: usize,
 ) {
     let segments: Vec<&str> = text.split('\n').collect();
-    let last = segments.len() - 1;
-    for (index, segment) in segments.into_iter().enumerate() {
-        let mut spans = Vec::new();
-        if index == 0 {
-            spans.push(prefix.clone());
+    let last_segment = segments.len() - 1;
+    for (seg_index, segment) in segments.into_iter().enumerate() {
+        let wrapped = wrap_styled(Line::from(Span::raw(segment.to_string())), width);
+        let last_row = wrapped.len() - 1;
+        for (row_index, mut row) in wrapped.into_iter().enumerate() {
+            if seg_index == 0 && row_index == 0 {
+                row.spans.insert(0, prefix.clone());
+            } else {
+                row.spans.insert(0, Span::raw(GUTTER_CONTINUATION));
+            }
+            if seg_index == last_segment && row_index == last_row {
+                if let Some(trailing) = trailing.clone() {
+                    row.spans.push(trailing);
+                }
+            }
+            lines.push(row);
         }
-        spans.push(Span::raw(segment.to_string()));
-        if index == last {
-            if let Some(trailing) = trailing.clone() {
-                spans.push(trailing);
+    }
+}
+
+/// Word-wraps one styled line to `width` columns, keeping each span's style
+/// attached to the text it colors. Breaks preferentially at spaces; a
+/// single word longer than `width` is hard-broken so no row ever exceeds
+/// it. Doing this ourselves — rather than leaving it to ratatui's `Wrap`,
+/// which has no notion of a hanging indent — is what lets a wrapped
+/// continuation row share the gutter indent with the row it continues,
+/// the same as a row split by a literal newline already does.
+fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+
+    // Each span's text broken into (word-or-space, is_space) tokens, style
+    // still attached, so a word split across a style boundary (rare, but
+    // possible around markdown emphasis markers) still wraps sanely.
+    let mut tokens: Vec<(String, Style, bool)> = Vec::new();
+    for span in line.spans {
+        let style = span.style;
+        let mut word = String::new();
+        for ch in span.content.chars() {
+            if ch == ' ' {
+                if !word.is_empty() {
+                    tokens.push((std::mem::take(&mut word), style, false));
+                }
+                tokens.push((" ".to_string(), style, true));
+            } else {
+                word.push(ch);
             }
         }
-        lines.push(Line::from(spans));
+        if !word.is_empty() {
+            tokens.push((word, style, false));
+        }
     }
+
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut col = 0usize;
+    for (index, (text, style, is_space)) in tokens.into_iter().enumerate() {
+        let token_width = text.chars().count();
+
+        if is_space {
+            // A space landing exactly at the start of a row *a wrap broke
+            // onto* is just where the break happened to fall — starting
+            // that row indented by it would look like a stray extra space.
+            // But the line's own leading whitespace (`index == 0`, e.g. a
+            // code block's indentation) is real content and must survive.
+            if col == 0 && index != 0 {
+                continue;
+            }
+            if col + token_width > width {
+                rows.push(Vec::new());
+                col = 0;
+            } else {
+                rows.last_mut().unwrap().push(Span::styled(text, style));
+                col += token_width;
+            }
+            continue;
+        }
+
+        if token_width > width {
+            // Doesn't fit on a row by itself either way: hard-break it.
+            let chars: Vec<char> = text.chars().collect();
+            for chunk in chars.chunks(width) {
+                if col > 0 {
+                    rows.push(Vec::new());
+                }
+                col = chunk.len();
+                rows.last_mut()
+                    .unwrap()
+                    .push(Span::styled(chunk.iter().collect::<String>(), style));
+            }
+            continue;
+        }
+
+        if col > 0 && col + token_width > width {
+            rows.push(Vec::new());
+            col = 0;
+        }
+        rows.last_mut().unwrap().push(Span::styled(text, style));
+        col += token_width;
+    }
+
+    rows.into_iter().map(Line::from).collect()
 }
 
 #[cfg(test)]
@@ -605,11 +783,12 @@ mod tests {
     }
 
     #[test]
-    fn transcript_border_shows_comms_and_the_session_title() {
+    fn title_row_shows_the_session_title_alone() {
         let mut app = sample_app();
         app.title = "Write me a snake game".to_string();
         let out = render_to_string(&app, 60, 20);
-        assert!(out.contains("comms - Write me a snake game"), "{out}");
+        let title_row = out.lines().next().unwrap();
+        assert_eq!(title_row.trim_end(), "Write me a snake game");
     }
 
     #[test]
@@ -651,21 +830,87 @@ mod tests {
     fn a_short_conversation_sits_at_the_bottom_of_the_pane() {
         let out = render_to_string(&sample_app(), 60, 20);
         let rows: Vec<&str> = out.lines().collect();
-        // Below the transcript pane's own bottom border: the top status
-        // row, the gap row above the input, the 3-row input box, and the
-        // bottom status row — its last content row is just inside the
-        // border above all of that.
-        let last_content = rows.len() - 1 - 1 - 3 - 1 - 1 - 1;
+        // Below the chat history: the input box's 3 rows (top border, one
+        // content row for the empty input here, bottom border), the
+        // settings row, and the key-bindings row — the last content row
+        // sits right above all five of those.
+        let last_content = rows.len() - 6;
         assert!(
             rows[last_content].contains("hi there"),
             "newest message should be flush with the bottom of the pane, got:\n{out}"
         );
-        // ...and the space is above it, not below. Row 0 is the transcript
-        // pane's own top border, so its first content row is row 1.
+        // ...and the space is above it, not below. Row 0 is the session
+        // title and row 1 the rule under it, so content starts at row 2.
         assert!(
-            rows[2].trim_matches(|c| c == '│' || c == ' ').is_empty(),
+            rows[2].trim().is_empty(),
             "expected blank space above the conversation, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn scrolling_away_from_the_bottom_flags_the_input_box() {
+        let mut app = sample_app();
+        for i in 0..30 {
+            app.transcript
+                .push(TranscriptItem::User(format!("message {i}")));
+        }
+        let pinned = render_to_string(&app, 60, 20);
+        assert!(!pinned.contains("scrolled"), "{pinned}");
+
+        app.scroll_back = 3;
+        let scrolled = render_to_string(&app, 60, 20);
+        assert!(scrolled.contains("scrolled — End to follow"), "{scrolled}");
+        // On the input box's own top border, not floating elsewhere.
+        let hint_row = scrolled
+            .lines()
+            .find(|l| l.contains("scrolled"))
+            .expect("hint shown");
+        assert!(
+            hint_row.starts_with('┌') && hint_row.ends_with('┐'),
+            "{hint_row}"
+        );
+    }
+
+    #[test]
+    fn wrapped_continuation_rows_align_under_the_gutter() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript.push(TranscriptItem::User(
+            "one two three four five six seven eight nine ten".into(),
+        ));
+        let out = render_to_string(&app, 30, 14);
+        let row = out
+            .lines()
+            .position(|l| l.trim_start().starts_with("❯ one"))
+            .expect("first row shown");
+        // The row after it is a wrap-induced continuation (no literal
+        // newline in the input), and should start 2 columns in — lined up
+        // under "one", not back at column 0 under the glyph.
+        let continuation = out.lines().nth(row + 1).expect("continuation row");
+        assert!(
+            continuation.starts_with("  ") && !continuation.trim().is_empty(),
+            "{continuation:?}"
+        );
+    }
+
+    #[test]
+    fn code_block_indentation_survives_wrapping() {
+        // The wrap-styled "drop a leading space" rule is meant for the
+        // stray space a wrap break happens to land on mid-line — not for a
+        // line's own leading whitespace, which is real content (nested
+        // indentation inside a code block, say) and must be kept.
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript.push(TranscriptItem::Assistant {
+            text: "```python\nif True:\n    return 1\n```".into(),
+            streaming: false,
+            label: Some("m".into()),
+        });
+        let out = render_to_string(&app, 50, 20);
+        let indented = out
+            .lines()
+            .find(|l| l.contains("return 1"))
+            .expect("indented line shown");
+        // Gutter (2 cols) + the code's own 4-space indent.
+        assert!(indented.starts_with("      return 1"), "{indented:?}");
     }
 
     #[test]
@@ -809,6 +1054,53 @@ mod tests {
         let out = render_to_string(&app, 70, 12);
         assert!(out.contains("read_file"), "{out}");
         assert!(out.contains('✓'), "{out}");
+    }
+
+    #[test]
+    fn tool_call_header_wraps_under_the_gutter() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript.push(TranscriptItem::ToolCall {
+            name: "a_pretty_long_tool_name_that_should_wrap_around".into(),
+            arguments: "{}".into(),
+            status: ToolStatus::Running,
+        });
+        let out = render_to_string(&app, 30, 14);
+        let row = out
+            .lines()
+            .position(|l| l.trim_start().starts_with("▸ a_pretty"))
+            .expect("header row shown");
+        let continuation = out.lines().nth(row + 1).expect("continuation row");
+        assert!(
+            continuation.starts_with("  ") && !continuation.trim().is_empty(),
+            "{continuation:?}"
+        );
+    }
+
+    #[test]
+    fn verbose_field_values_wrap_under_themselves_not_the_label() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.verbose = true;
+        app.transcript.push(TranscriptItem::ToolCall {
+            name: "write_file".into(),
+            arguments:
+                r#"{"content":"a value long enough that it should wrap onto a second row here"}"#
+                    .into(),
+            status: ToolStatus::Done {
+                result: "{}".into(),
+            },
+        });
+        let out = render_to_string(&app, 40, 16);
+        let label_row = out
+            .lines()
+            .position(|l| l.contains("content"))
+            .expect("field label shown");
+        let continuation = out.lines().nth(label_row + 1).expect("continuation row");
+        // Indented past the label's own width, not just the 2-column
+        // message gutter, and not empty.
+        assert!(
+            continuation.starts_with("     ") && !continuation.trim().is_empty(),
+            "{continuation:?}"
+        );
     }
 
     #[test]
@@ -995,13 +1287,14 @@ mod tests {
         app.cursor = app.input.len();
         let multi = render_to_string(&app, 40, 16);
 
-        // All three lines are visible, and the box grew to show them.
-        assert!(multi.contains("one") && multi.contains("two") && multi.contains("three"));
-        let box_rows = |out: &str| out.lines().filter(|l| l.contains('│')).count();
+        // All three lines are visible simultaneously — which only happens if
+        // the box actually grew to 3 rows; at 1 row, cursor-follow scrolling
+        // would show just "three" and hide the rest.
         assert!(
-            box_rows(&multi) > 0 && multi != single,
+            multi.contains("one") && multi.contains("two") && multi.contains("three"),
             "expected the input box to grow:\n{multi}"
         );
+        assert_ne!(multi, single);
     }
 
     #[test]

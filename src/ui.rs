@@ -334,21 +334,6 @@ pub trait AgentUi {
     fn approve(&mut self, request: ApprovalRequest) -> impl Future<Output = Result<bool>> + Send;
 }
 
-/// An [`AgentUi`] that shows nothing and denies every approval request.
-/// Useful for tests and for any caller that wants the loop to run without a
-/// user attached.
-pub struct SilentUi;
-
-impl AgentUi for SilentUi {
-    fn event(&mut self, _event: AgentEvent) -> impl Future<Output = ()> + Send {
-        async {}
-    }
-
-    fn approve(&mut self, _request: ApprovalRequest) -> impl Future<Output = Result<bool>> + Send {
-        async { Ok(false) }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

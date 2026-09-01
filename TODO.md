@@ -10,8 +10,6 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
-* scroll scolls chat history
-* left hand gutter for message labels/bullets
 * need a model browser/search/picker
 * [agent/ask] [verbose]
  <current os user>: 

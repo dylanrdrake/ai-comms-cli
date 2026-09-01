@@ -83,7 +83,9 @@ impl AgentUi for TerminalAgentUi {
                         let label = format!("{}:", response_label(&model, &effort_level));
                         println!("{} {}", label.cyan(), wrap::wrap(&text));
                     } else {
-                        println!("{}", wrap::wrap(&text));
+                        // Matches the TUI transcript's dot marker, now that
+                        // neither shows a model label on every reply.
+                        println!("{} {}", "●".cyan(), wrap::wrap(&text));
                     }
                 }
                 AgentEvent::ToolCallStarted { name, arguments } => {

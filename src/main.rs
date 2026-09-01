@@ -896,7 +896,7 @@ fn print_transcript(messages: &[store::StoredMessage]) {
             }
             "assistant" => {
                 if let Some(content) = &m.content {
-                    println!("\n{}\n", wrap::wrap(content));
+                    println!("\n{} {}\n", "●".cyan(), wrap::wrap(content));
                 }
             }
             _ => {}

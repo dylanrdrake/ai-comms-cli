@@ -5,9 +5,10 @@
 //! row does. Kept free of I/O: the caller loads sessions and acts on the
 //! [`Activation`] returned when a row is chosen.
 
+use super::render::draw_rule;
 use crate::store::{SessionSummary, KIND_AGENT_CHAT};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// How many recent sessions the launch screen offers directly, before
@@ -211,7 +212,13 @@ impl Picker {
 }
 
 pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str) {
-    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
+    let areas = Layout::vertical([
+        Constraint::Length(1), // title
+        Constraint::Length(1), // rule
+        Constraint::Min(1),    // list
+        Constraint::Length(1), // footer/hint
+    ])
+    .split(frame.area());
 
     let mut lines: Vec<Line> = Vec::new();
     for (index, item) in picker.items.iter().enumerate() {
@@ -291,21 +298,34 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str) {
     };
 
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(format!(" {title} "), Style::new().bold())),
-        ),
+        Paragraph::new(Line::from(Span::styled(
+            title.to_string(),
+            Style::new().bold(),
+        ))),
         areas[0],
     );
-    frame.render_widget(Paragraph::new(footer), areas[1]);
+    draw_rule(frame, areas[1], None);
+    frame.render_widget(Paragraph::new(Text::from(lines)), areas[2]);
+    frame.render_widget(Paragraph::new(footer), areas[3]);
 }
 
 /// The prompt shown before a new session is created, so it starts with a
 /// real name instead of "Untitled". Leaving it blank falls back to the
 /// usual behavior: derived from the first message once there is one.
 pub fn draw_naming(frame: &mut Frame, input: &str) {
-    let areas = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
+    let areas = Layout::vertical([
+        Constraint::Length(1), // title
+        Constraint::Length(1), // rule
+        Constraint::Min(1),    // content
+        Constraint::Length(1), // hint
+    ])
+    .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("comms", Style::new().bold()))),
+        areas[0],
+    );
+    draw_rule(frame, areas[1], None);
 
     let lines = vec![
         Line::raw(""),
@@ -315,21 +335,14 @@ pub fn draw_naming(frame: &mut Frame, input: &str) {
             Span::styled("▏", Style::new().yellow()),
         ]),
     ];
+    frame.render_widget(Paragraph::new(Text::from(lines)), areas[2]);
 
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(" comms ", Style::new().bold())),
-        ),
-        areas[0],
-    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Enter continue (blank uses the default) · Esc cancel",
             Style::new().dark_gray(),
         ))),
-        areas[1],
+        areas[3],
     );
 }
 
