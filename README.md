@@ -105,12 +105,17 @@ comms max-iterations
 
 # Set the default
 comms max-iterations 20
+
+# Clear it — agent mode then needs a cap set per call (--max-iterations) or
+# per session (/max-iterations) to run at all; it does not fall back to 20
+comms max-iterations --clear
 ```
 
-Defaults to 20. Overridden per call with `--max-iterations` on `agent`, or
-persistently per session with `/max-iterations` inside a `session`/`tui`
-conversation — see [Per-session models](#model-name) for how that
-precedence works.
+Ships at 20 on a fresh install (no `config.json` yet), but once cleared it
+stays cleared — nothing silently reintroduces a number. Overridden per call
+with `--max-iterations` on `agent`, or persistently per session with
+`/max-iterations` inside a `session`/`tui` conversation — see
+[Per-session models](#model-name) for how that precedence works.
 
 #### `temperature [value]`
 View or set the persistent default sampling temperature (0-2) sent to models that support it.
@@ -121,15 +126,25 @@ comms temperature
 
 # Set the default
 comms temperature 1.2
+
+# Clear it — requests are then sent with no temperature field at all, and
+# the provider uses its own default, rather than this falling back to 0.7
+comms temperature --clear
 ```
 
-Defaults to 0.7. Overridden per call with `--temperature` on `session`,
-`agent`, or `tui`, or persistently per session with `/temperature` (or its
-`/temp` shorthand) inside a `session`/`tui` conversation — see
-[Per-session models](#model-name) for how that precedence works.
+Ships at 0.7 on a fresh install, same caveat as `max-iterations` once
+cleared. Overridden per call with `--temperature` on `ask`, `session`, or
+`agent`, or persistently per session with `/temperature` (or its `/temp`
+shorthand) inside a `session`/`tui` conversation — see [Per-session
+models](#model-name) for how that precedence works.
+
+In `tui`, the session's current value shows in the settings row as 🌡
+`<value>` (or `default` when nullified — see [Session
+Persistence](#session-persistence)), color-coded cool-to-hot (cyan → yellow
+→ orange → pink) as it rises from 0.
 
 #### `effort-level [value]`
-View or set the persistent default reasoning effort (`low`, `medium`, or `high`) sent to models that support it. Applies to `ask`, `session`, and `agent`.
+View or set the persistent default reasoning effort sent to models that support it. Applies to `ask`, `session`, and `agent`. Usually `low`, `medium`, or `high`, but not checked against a fixed list — models vary in what they accept, and an unsupported value just gets rejected by the API.
 
 ```bash
 # Show the current effort level
@@ -142,7 +157,14 @@ comms effort-level high
 comms effort-level --clear
 ```
 
+Overridden per call with `--effort-level` on `ask`, `session`, or `agent`, or
+persistently per session with `/effort` inside a `session`/`tui` conversation.
+
 When an effort level is set, `ask`, `session`, and `agent` label responses as `<model> (<effort>)` instead of just `<model>`, so you can see which effort level produced a given answer.
+
+In `tui`, the session's current value shows in the settings row as 🧠
+`<level>`, color-coded calm-to-intense (cyan → yellow → red) as it rises
+from `low`.
 
 #### `endpoint [url]`
 View or set the API base URL, so you can point `comms` at any OpenAI-compatible service instead of OpenRouter (OrcaRouter, Together, Groq, a self-hosted gateway, etc).
@@ -220,6 +242,10 @@ comms ask "What's the capital of France?"
 
 # Specify a model
 comms ask "Explain quantum computing" -m anthropic/claude-opus-4.5
+
+# Override temperature or effort level for this call only
+comms ask "Write a haiku" --temperature 1.2
+comms ask "Design a lock-free queue" --effort-level high
 ```
 
 #### `session`
@@ -239,13 +265,16 @@ exactly:
 | `/model` | Show the model currently in use |
 | `/agent` | Turn on tool-calling for the rest of the session |
 | `/ask` | Turn tool-calling back off |
-| `/effort <level>` | Switch reasoning effort (`low`/`medium`/`high`) for the rest of the session |
-| `/effort clear` | Fall back to the configured default effort |
+| `/effort <level>` | Switch reasoning effort for the rest of the session, and remember it |
+| `/effort clear` | Nullify it — no effort field is sent at all until set again |
+| `/effort default` | Read the *currently* configured default effort and save that to the session |
 | `/verbose` | Toggle showing full tool call arguments/results instead of a one-line notice |
 | `/max-iterations <n>` | Switch the tool-calling iteration cap per turn (agent mode only), and remember it |
-| `/max-iterations clear` | Fall back to the configured default cap |
+| `/max-iterations clear` | Nullify it — agent mode then errors on any turn until a cap is set again |
+| `/max-iterations default` | Read the *currently* configured default cap and save that to the session |
 | `/temperature <n>` (or `/temp <n>`) | Switch the sampling temperature for the rest of the session, and remember it |
-| `/temperature clear` (or `/temp clear`) | Fall back to the configured default temperature |
+| `/temperature clear` (or `/temp clear`) | Nullify it — requests are then sent with no temperature field |
+| `/temperature default` (or `/temp default`) | Read the *currently* configured default temperature and save that to the session |
 | `/approval <read\|write\|terminal\|all> <on\|off>` | Switch a tool-approval gate for the rest of the session, and remember it |
 | `/approval` | Show the approval gates currently in use |
 
@@ -259,6 +288,10 @@ comms session -m anthropic/claude-opus-4.5
 
 # Override the default max tool-calling iterations per turn while in agent mode
 comms session --max-iterations 30
+
+# Override the default reasoning effort for a new session (ignored when
+# resuming — a resumed session always keeps its own saved value)
+comms session --effort-level high
 
 # Resume a previous session by id (or a unique prefix of it) — works
 # whether that session is currently in ask or agent mode
@@ -283,6 +316,10 @@ comms agent "Create utils.rs with a reverse array function" -v
 
 # Override the default max iterations for this call
 comms agent "Generate project structure" --max-iterations 30
+
+# Override temperature or effort level for this call only
+comms agent "Generate project structure" --temperature 0.3
+comms agent "Design a lock-free queue" --effort-level high
 ```
 
 #### `tui`
@@ -292,25 +329,23 @@ tool approvals appear inline, and a running turn be interrupted. Otherwise
 the two are functionally identical — same commands, same settings, same
 saved sessions, interchangeably resumable from either.
 
-Run bare, it opens on a **launch screen**: start a new session, jump straight
-back into a recent one, or go to a sessions browser covering all of them. The
-flags skip it and go straight into a conversation.
+It's not a subcommand — there are no flags. Run `comms` with nothing else on
+the command line, and it opens on a **launch screen**: start a new session,
+jump straight back into a recent one, or go to a sessions browser covering
+all of them.
 
 ```bash
-comms tui                      # launch screen
-comms tui --session            # straight into a new session (ask mode)
-comms tui --resume a1b2c3d4    # straight into a saved session
+comms
 ```
 
-`--session` and `--resume` are mutually exclusive. Every new session starts in
-plain ask mode; use `/agent` from inside it to turn tools on (see
-**Commands** below) — there's no separate "agent" launch flag anymore. A
-resumed session picks back up in whichever mode, model, and effort level it
-was last left in, regardless of any of the flags above.
+Every new session starts in plain ask mode; use `/agent` from inside it to
+turn tools on (see **Commands** below) — there's no separate "agent" launch
+option. A resumed session picks back up in whichever mode, model, and effort
+level it was last left in.
 
-Choosing "New session" from the launch screen (as opposed to `--session`,
-which skips straight in) first asks for a title; leave it blank to fall back
-to the usual behavior of naming the session from your first message.
+Choosing "New session" from the launch screen first asks for a title; leave
+it blank to fall back to the usual behavior of naming the session from your
+first message.
 
 **Launch screen / sessions browser**
 
@@ -344,13 +379,16 @@ to the usual behavior of naming the session from your first message.
 | `/model` | Show the model currently in use |
 | `/agent` | Turn on tool-calling (read/write files, run commands) for the rest of the session |
 | `/ask` | Turn tool-calling back off |
-| `/effort <level>` | Switch reasoning effort (`low`/`medium`/`high`) for the rest of the session |
-| `/effort clear` | Fall back to the configured default effort |
+| `/effort <level>` | Switch reasoning effort for the rest of the session, and remember it |
+| `/effort clear` | Nullify it — no effort field is sent at all until set again |
+| `/effort default` | Read the *currently* configured default effort and save that to the session |
 | `/verbose` | Toggle showing full tool call arguments/results instead of a one-line notice |
 | `/max-iterations <n>` | Switch the tool-calling iteration cap per turn (agent mode only), and remember it |
-| `/max-iterations clear` | Fall back to the configured default cap |
+| `/max-iterations clear` | Nullify it — agent mode then errors on any turn until a cap is set again |
+| `/max-iterations default` | Read the *currently* configured default cap and save that to the session |
 | `/temperature <n>` (or `/temp <n>`) | Switch the sampling temperature for the rest of the session, and remember it |
-| `/temperature clear` (or `/temp clear`) | Fall back to the configured default temperature |
+| `/temperature clear` (or `/temp clear`) | Nullify it — requests are then sent with no temperature field |
+| `/temperature default` (or `/temp default`) | Read the *currently* configured default temperature and save that to the session |
 | `/approval <read\|write\|terminal\|all> <on\|off>` | Switch a tool-approval gate for the rest of the session, and remember it |
 | `/approval` | Show the approval gates currently in use |
 
@@ -431,10 +469,10 @@ Configuration is stored at `~/.comms/config.json`:
 
 - Your API key is **not** in this file — `comms login`/`logout` store and remove it from the OS keychain instead (see [Security](#security)). If you have an old config with a plaintext `api_key` field, the next command that loads config transparently migrates it into the OS keychain and rewrites the file without it.
 - `base_url` is managed via `comms endpoint` and is the API endpoint used by every command. Defaults to OpenRouter; point it at any OpenAI-compatible service.
-- `default_model` is managed via `comms model` and is used by `ask`, `session`, and `agent` when `-m`/`--model` isn't passed.
+- `default_model` is managed via `comms model` and is used by `ask`, `session`, and `agent` when `-m`/`--model` isn't passed, and always by `tui`, which has no flags at all.
 - `approval` settings control whether the agent prompts before performing actions. Managed via `comms approval`.
-- `max_iterations` is managed via `comms max-iterations` and is the default for `agent` when `--max-iterations` isn't passed.
-- `temperature` is managed via `comms temperature` and is the default for `ask`, `session`, `agent`, and `tui` when `--temperature` isn't passed.
+- `max_iterations` is managed via `comms max-iterations` and is the default for `session`/`agent` when `--max-iterations` isn't passed, and for `tui`, which has no flags at all. `null` (after `comms max-iterations --clear`) means agent mode has no cap until one is set somewhere — it does not fall back to 20.
+- `temperature` is managed via `comms temperature` and is the default for `ask`, `session`, and `agent` when `--temperature` isn't passed, and for `tui`, which has no flags at all. `null` (after `comms temperature --clear`) means requests are sent with no `temperature` field at all — it does not fall back to 0.7.
 - `effort_level` is managed via `comms effort-level` and is sent for `ask`, `session`, and `agent` when set, shaped according to `effort_style`.
 - `effort_style` is managed via `comms effort-style` and controls whether the effort level is sent flat, nested, or omitted (see [`effort-style`](#effort-style-value)).
 - `extra_headers` is managed via `comms headers` and is merged into every API request.
@@ -457,6 +495,15 @@ Only one provider is active at a time today — switching back to OpenRouter mea
 ## Session Persistence
 
 `session` and `tui` conversations are saved automatically to a SQLite database at `~/.comms/chats.db`. Every message (yours, the assistant's, and any tool calls/results while in agent mode) is written as the conversation happens, so you don't lose anything if you exit or your terminal closes — including a turn you cancelled partway through.
+
+**Settings are a snapshot, not a live link to your config.** A session's row — model, effort level, max iterations, temperature, approval gates — is written to the database the moment it's created, before your first message, not after. `tui` has no flags at all, so a session it creates is always a straight snapshot of your persistent config defaults; `comms session` is the only place a brand new session can start away from those defaults, via its `--model`/`--effort-level`/`--max-iterations`/`--temperature` flags. That snapshot can itself be `None` for effort/max-iterations/temperature, if nothing is configured anywhere — same as `ask`/`agent`, which merge a `--flag` with the config default the same way but only ever for that one call, never a session.
+
+From then on, the session's settings are entirely its own: `/model` and `/approval` changes always write a concrete value straight back to that same row; `/effort`, `/max-iterations`, and `/temperature` additionally support two different resets, since a session can also nullify these three:
+
+- **`/setting clear`** nullifies it outright, with no fallback substituted anywhere: `/effort clear` and `/temperature clear` mean no effort/temperature field is sent in the request at all (the provider uses its own default); `/max-iterations clear` means agent mode has no cap, so any turn that actually needs one fails immediately with an error telling you to set one, rather than the loop running unbounded or guessing a number.
+- **`/setting default`** is a one-time snapshot instead: it reads whatever the global default currently is and saves that concrete value to the session right now — frozen from that point on, exactly like typing the value itself, and distinct from `clear` even when the global default happens to be unset (an `/effort default` with no global default configured saves `None` explicitly, the same as `clear` would, but as a deliberate choice rather than an indefinite fallback).
+
+Either way, every outgoing request from a session reads its own stored settings directly, never your global config — including for a value that's currently `None`. Later changing a global default with `comms model`/`comms temperature`/etc. never reaches into any session that already exists, whether that session has an explicit value, is nullified, or was created before you ever set the global default at all. The global defaults themselves work the same way: `comms max-iterations --clear`/`comms temperature --clear` null them out too (see [`max-iterations`](#max-iterations-value) and [`temperature`](#temperature-value)), and nothing brings them back except setting one explicitly again.
 
 Each session gets an id (a UUID) and a title derived from your first message (or one you choose up front, in the TUI). Use:
 

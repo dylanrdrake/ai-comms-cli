@@ -43,8 +43,8 @@ pub async fn run_agent(
     ui: &mut impl AgentUi,
     task: &str,
     model: &str,
-    max_iterations: usize,
-    temperature: f32,
+    max_iterations: Option<usize>,
+    temperature: Option<f32>,
     approval: &ApprovalSettings,
     effort_level: Option<String>,
 ) -> Result<Option<String>> {
@@ -80,7 +80,7 @@ async fn request_turn(
     ui: &mut impl AgentUi,
     messages: Vec<ChatMessage>,
     model: &str,
-    temperature: f32,
+    temperature: Option<f32>,
     tools: Option<Vec<serde_json::Value>>,
     effort_level: Option<String>,
 ) -> Result<ChatMessage> {
@@ -133,7 +133,7 @@ pub async fn run_chat_turn(
     ui: &mut impl AgentUi,
     messages: &mut Vec<ChatMessage>,
     model: &str,
-    temperature: f32,
+    temperature: Option<f32>,
     effort_level: Option<String>,
 ) -> Result<Option<String>> {
     ui.event(AgentEvent::RequestStarted).await;
@@ -183,11 +183,22 @@ pub async fn run_agent_turn(
     ui: &mut impl AgentUi,
     messages: &mut Vec<ChatMessage>,
     model: &str,
-    max_iterations: usize,
-    temperature: f32,
+    max_iterations: Option<usize>,
+    temperature: Option<f32>,
     approval: &ApprovalSettings,
     effort_level: Option<String>,
 ) -> Result<Option<String>> {
+    // Unlike `temperature`/`effort_level`, there's no provider to fall back
+    // to a default for this — it never leaves the process, so a missing cap
+    // can't be sent as "no value" the way an omitted request field can. Fail
+    // clearly up front rather than picking a number on the caller's behalf.
+    let max_iterations = max_iterations.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No max-iterations cap is set. Set one with /max-iterations <n> for this session, \
+             or comms max-iterations <n> as the persistent default."
+        )
+    })?;
+
     let tool_definitions = get_tool_definitions();
     let mut iteration = 0;
     let mut final_response = None;

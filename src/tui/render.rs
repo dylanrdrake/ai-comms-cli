@@ -129,11 +129,14 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
                 arguments,
                 status,
             } => {
-                let (marker, style) = match status {
-                    ToolStatus::AwaitingApproval => ("?", Style::new().yellow()),
-                    ToolStatus::Running => ("▸", Style::new().yellow()),
-                    ToolStatus::Denied => ("✗", Style::new().red()),
-                    ToolStatus::Done { .. } => ("✓", Style::new().green()),
+                // No trailing marker while running — the spinner-driven
+                // "working" state in the settings row already says so; a
+                // static triangle here didn't add anything.
+                let marker: Option<(&str, Style)> = match status {
+                    ToolStatus::AwaitingApproval => Some(("?", Style::new().yellow())),
+                    ToolStatus::Running => None,
+                    ToolStatus::Denied => Some(("✗", Style::new().red())),
+                    ToolStatus::Done { .. } => Some(("✓", Style::new().green())),
                 };
                 let mut header = vec![Span::styled(name.clone(), Style::new().bold())];
                 // The file or command a call is acting on identifies it well
@@ -147,9 +150,14 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
                 }
                 push_rendered(
                     &mut lines,
-                    Span::styled(format!("{marker} "), style),
+                    // The gutter marks the row as a tool call; the status
+                    // (still color-coded) rides at the end instead, as a
+                    // `trailing` marker — same mechanism the streaming
+                    // cursor uses, so it always lands on the last wrapped
+                    // row rather than getting buried mid-wrap.
+                    Span::styled("⚙ ", Style::new().magenta()),
                     vec![Line::from(header)],
-                    None,
+                    marker.map(|(m, style)| Span::styled(format!(" {m}"), style)),
                     content_width,
                 );
                 if app.verbose {
@@ -347,6 +355,33 @@ fn input_cursor(input: &str, cursor: usize, width: u16) -> (u16, u16) {
     (row as u16, col as u16)
 }
 
+/// A muted-to-intense gradient for `low`/`medium`/`high`; unset (following
+/// the configured default) stays the same dark_gray every other "no
+/// override" field uses.
+fn effort_style(effort_level: Option<&str>) -> Style {
+    match effort_level {
+        Some("low") => Style::new().cyan(),
+        Some("medium") => Style::new().yellow(),
+        Some("high") => Style::new().red(),
+        _ => Style::new().dark_gray(),
+    }
+}
+
+/// A cool-to-hot gradient matching the word itself; unset stays the same
+/// dark_gray every other "no override" field uses. Pink rather than red at
+/// the top — red and orange read too similarly next to each other.
+fn temperature_style(temperature: Option<f32>) -> Style {
+    const ORANGE: Color = Color::Rgb(255, 140, 0);
+    const PINK: Color = Color::Rgb(255, 105, 180);
+    match temperature {
+        None => Style::new().dark_gray(),
+        Some(t) if t < 0.5 => Style::new().cyan(),
+        Some(t) if t < 1.0 => Style::new().yellow(),
+        Some(t) if t < 1.5 => Style::new().fg(ORANGE),
+        Some(_) => Style::new().fg(PINK),
+    }
+}
+
 /// Every controllable setting in one row below the message prompt: ready/
 /// busy, ask/agent mode, model, effort, temperature, verbose, and how many
 /// messages are queued — everything `/model`, `/agent`, `/effort`,
@@ -364,6 +399,10 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     }
 
     spans.push(Span::styled(
+        format!("· {} ", app.model),
+        Style::new().dark_gray(),
+    ));
+    spans.push(Span::styled(
         format!("· {} ", if app.agentic { "agent" } else { "ask" }),
         if app.agentic {
             Style::new().yellow()
@@ -371,22 +410,18 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
             Style::new().cyan()
         },
     ));
+    let effort_label = app.effort_level.as_deref().unwrap_or("default");
     spans.push(Span::styled(
-        format!("· {} ", app.model),
-        Style::new().dark_gray(),
+        format!("· 🧠 {effort_label} "),
+        effort_style(app.effort_level.as_deref()),
     ));
+    let temp_label = app
+        .temperature
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "default".to_string());
     spans.push(Span::styled(
-        format!("· {} ", app.effort_level.as_deref().unwrap_or("default")),
-        Style::new().dark_gray(),
-    ));
-    spans.push(Span::styled(
-        format!(
-            "· temp {} ",
-            app.temperature
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "default".to_string())
-        ),
-        Style::new().dark_gray(),
+        format!("· 🌡 {temp_label} "),
+        temperature_style(app.temperature),
     ));
     spans.push(Span::styled(
         format!("· {} ", if app.verbose { "verbose" } else { "quiet" }),
@@ -412,10 +447,14 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
 /// elsewhere, so it recedes into the background rather than competing with
 /// the settings row right above it.
 fn draw_keybindings(frame: &mut Frame, area: Rect) {
+    // A shade darker than the plain `dark_gray()` used elsewhere — `.dim()`
+    // alone isn't reliable across terminals (some ignore the SGR faint
+    // attribute entirely), so the color itself carries the extra dimness.
+    const KEYBIND_GRAY: Color = Color::Rgb(90, 90, 90);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Enter send · Esc cancel · PgUp/PgDn scroll · Ctrl-B back · Ctrl-C quit",
-            Style::new().dark_gray().dim(),
+            Style::new().fg(KEYBIND_GRAY).dim(),
         ))),
         area,
     );
@@ -807,11 +846,34 @@ mod tests {
     fn top_status_shows_temperature_at_the_end() {
         let mut app = sample_app();
         let out = render_to_string(&app, 80, 20);
-        assert!(out.contains("temp default"), "{out}");
+        assert!(out.contains("🌡 default"), "{out}");
 
         app.temperature = Some(1.2);
         let out = render_to_string(&app, 80, 20);
-        assert!(out.contains("temp 1.2"), "{out}");
+        assert!(out.contains("🌡 1.2"), "{out}");
+    }
+
+    #[test]
+    fn temperature_style_follows_a_cool_to_hot_gradient() {
+        assert_eq!(temperature_style(None), Style::new().dark_gray());
+        assert_eq!(temperature_style(Some(0.0)), Style::new().cyan());
+        assert_eq!(temperature_style(Some(0.7)), Style::new().yellow());
+        assert_eq!(
+            temperature_style(Some(1.2)),
+            Style::new().fg(Color::Rgb(255, 140, 0))
+        );
+        assert_eq!(
+            temperature_style(Some(2.0)),
+            Style::new().fg(Color::Rgb(255, 105, 180))
+        );
+    }
+
+    #[test]
+    fn effort_style_follows_a_calm_to_intense_gradient() {
+        assert_eq!(effort_style(None), Style::new().dark_gray());
+        assert_eq!(effort_style(Some("low")), Style::new().cyan());
+        assert_eq!(effort_style(Some("medium")), Style::new().yellow());
+        assert_eq!(effort_style(Some("high")), Style::new().red());
     }
 
     #[test]
@@ -1057,6 +1119,45 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_gutter_is_generic_and_status_trails_the_line() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript.push(TranscriptItem::ToolCall {
+            name: "read_file".into(),
+            arguments: r#"{"filepath":"a.rs"}"#.into(),
+            status: ToolStatus::Done {
+                result: r#"{"success":true}"#.into(),
+            },
+        });
+        let out = render_to_string(&app, 70, 12);
+        let row = out
+            .lines()
+            .find(|l| l.contains("read_file"))
+            .expect("header row shown");
+        assert!(row.trim_start().starts_with("⚙ read_file"), "{row:?}");
+        assert!(row.trim_end().ends_with('✓'), "{row:?}");
+    }
+
+    #[test]
+    fn a_running_tool_call_has_no_trailing_marker() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript.push(TranscriptItem::ToolCall {
+            name: "run_terminal_command".into(),
+            arguments: r#"{"command":"cargo build"}"#.into(),
+            status: ToolStatus::Running,
+        });
+        let out = render_to_string(&app, 70, 12);
+        let row = out
+            .lines()
+            .find(|l| l.contains("run_terminal_command"))
+            .expect("header row shown");
+        assert!(
+            row.trim_start().starts_with("⚙ run_terminal_command"),
+            "{row:?}"
+        );
+        assert!(!row.contains('▸'), "{row:?}");
+    }
+
+    #[test]
     fn tool_call_header_wraps_under_the_gutter() {
         let mut app = App::new("m".to_string(), None, "id".to_string());
         app.transcript.push(TranscriptItem::ToolCall {
@@ -1067,7 +1168,7 @@ mod tests {
         let out = render_to_string(&app, 30, 14);
         let row = out
             .lines()
-            .position(|l| l.trim_start().starts_with("▸ a_pretty"))
+            .position(|l| l.trim_start().starts_with("⚙ a_pretty"))
             .expect("header row shown");
         let continuation = out.lines().nth(row + 1).expect("continuation row");
         assert!(

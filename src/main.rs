@@ -22,7 +22,7 @@ use std::sync::Arc;
 use client::{ChatMessage, Client};
 use config::{
     clear_api_key, get_api_key, get_config_path, load_config, save_config, set_api_key,
-    ApprovalSettings, VALID_EFFORT_LEVELS, VALID_EFFORT_STYLES,
+    ApprovalSettings, VALID_EFFORT_STYLES,
 };
 use session::ChatSession;
 use spinner::Spinner;
@@ -35,6 +35,9 @@ use ui::{parse_bool, response_label};
 #[command(about = "AI Comms CLI - An OpenAI-compatible frontend for any LLM provider", long_about = None)]
 #[command(version = "0.1.0")]
 struct Cli {
+    /// With no subcommand at all, `comms` launches the full-screen TUI on
+    /// its launch screen — the only way in; there's no `tui` subcommand or
+    /// flags to skip straight into a new or resumed session.
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -99,12 +102,22 @@ enum Commands {
     MaxIterations {
         /// Value to set as the default (omit to show the current default)
         value: Option<usize>,
+
+        /// Clear the stored default — `ask`/`agent`/a new `session` then run
+        /// with no cap unless `--max-iterations` is passed for that call
+        #[arg(long)]
+        clear: bool,
     },
 
     /// View or set the persistent default sampling temperature
     Temperature {
         /// Value to set as the default (omit to show the current default)
         value: Option<f32>,
+
+        /// Clear the stored default — requests are then sent with no
+        /// temperature field, and the provider uses its own default
+        #[arg(long)]
+        clear: bool,
     },
 
     /// View or set whether responses stream in as they're generated
@@ -133,6 +146,16 @@ enum Commands {
         /// Model to use (overrides the persistent default for this call)
         #[arg(short, long)]
         model: Option<String>,
+
+        /// Sampling temperature (overrides the persistent default for this call)
+        #[arg(long)]
+        temperature: Option<f32>,
+
+        /// Reasoning effort (overrides the persistent default for this
+        /// call). Not checked against a fixed list — pass whatever your
+        /// model accepts.
+        #[arg(long)]
+        effort_level: Option<String>,
     },
 
     /// Interactive session — starts in plain ask mode; /agent turns on
@@ -153,6 +176,13 @@ enum Commands {
         /// default for this call)
         #[arg(long)]
         temperature: Option<f32>,
+
+        /// Reasoning effort for a new session (overrides the persistent
+        /// default; ignored when resuming, which keeps its saved value).
+        /// Not checked against a fixed list — pass whatever your model
+        /// accepts.
+        #[arg(long)]
+        effort_level: Option<String>,
 
         /// Resume a saved session by id (or unique id prefix); pass with no
         /// value to pick from a list of all your saved sessions
@@ -180,32 +210,12 @@ enum Commands {
         /// Sampling temperature (overrides the persistent default for this call)
         #[arg(long)]
         temperature: Option<f32>,
-    },
 
-    /// Full-screen terminal UI: streaming replies, an always-live input box,
-    /// and inline tool approval. With no flags, opens the launch screen.
-    Tui {
-        /// Skip the launch screen and start a new session (starts in ask
-        /// mode; /agent enables tools from inside it)
-        #[arg(short, long, conflicts_with = "resume")]
-        session: bool,
-
-        /// Skip the launch screen and resume a saved session by id (or
-        /// unique id prefix)
-        #[arg(long, conflicts_with = "session")]
-        resume: Option<String>,
-
-        /// Model to use (overrides the persistent default for this call)
-        #[arg(short, long)]
-        model: Option<String>,
-
-        /// Maximum number of iterations per turn (agent mode only)
+        /// Reasoning effort (overrides the persistent default for this
+        /// call). Not checked against a fixed list — pass whatever your
+        /// model accepts.
         #[arg(long)]
-        max_iterations: Option<usize>,
-
-        /// Sampling temperature (overrides the persistent default for this call)
-        #[arg(long)]
-        temperature: Option<f32>,
+        effort_level: Option<String>,
     },
 
     /// Manage saved chat sessions
@@ -337,12 +347,23 @@ fn resolve_model(config: &config::Config, cli_model: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_MODEL.to_string())
 }
 
-fn resolve_max_iterations(config: &config::Config, cli_value: Option<usize>) -> usize {
-    cli_value.unwrap_or(config.max_iterations)
+/// `None` if neither the flag nor the config default is set — genuinely no
+/// value, not a hardcoded floor. `ask`/`agent`/a new `session` pass this
+/// straight through: a request goes out with no `temperature` field, and an
+/// agent-mode turn with no cap errors immediately rather than guessing one.
+fn resolve_max_iterations(config: &config::Config, cli_value: Option<usize>) -> Option<usize> {
+    cli_value.or(config.max_iterations)
 }
 
-fn resolve_temperature(config: &config::Config, cli_value: Option<f32>) -> f32 {
-    cli_value.unwrap_or(config.temperature)
+/// Same deal as [`resolve_max_iterations`].
+fn resolve_temperature(config: &config::Config, cli_value: Option<f32>) -> Option<f32> {
+    cli_value.or(config.temperature)
+}
+
+/// Same deal as [`resolve_max_iterations`] — `None` is itself a meaningful
+/// value (no effort field sent), not just "unset".
+fn resolve_effort_level(config: &config::Config, cli_value: Option<String>) -> Option<String> {
+    cli_value.or_else(|| config.effort_level.clone())
 }
 
 #[tokio::main]
@@ -350,7 +371,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => cmd_tui(false, None, None, None, None).await?,
+        None => cmd_tui().await?,
         Some(Commands::Login) => cmd_login().await?,
         Some(Commands::Logout) => cmd_logout().await?,
         Some(Commands::Status) => cmd_status().await?,
@@ -360,31 +381,41 @@ async fn main() -> Result<()> {
         Some(Commands::EffortStyle { value, clear }) => cmd_effort_style(value, clear).await?,
         Some(Commands::Headers { action }) => cmd_headers(action).await?,
         Some(Commands::Approval { action }) => cmd_approval(action).await?,
-        Some(Commands::MaxIterations { value }) => cmd_max_iterations(value).await?,
-        Some(Commands::Temperature { value }) => cmd_temperature(value).await?,
+        Some(Commands::MaxIterations { value, clear }) => cmd_max_iterations(value, clear).await?,
+        Some(Commands::Temperature { value, clear }) => cmd_temperature(value, clear).await?,
         Some(Commands::Stream { value }) => cmd_stream(value).await?,
         Some(Commands::EffortLevel { value, clear }) => cmd_effort_level(value, clear).await?,
-        Some(Commands::Ask { prompt, model }) => cmd_ask(&prompt, model).await?,
+        Some(Commands::Ask {
+            prompt,
+            model,
+            temperature,
+            effort_level,
+        }) => cmd_ask(&prompt, model, temperature, effort_level).await?,
         Some(Commands::Session {
             model,
             max_iterations,
             temperature,
+            effort_level,
             resume,
-        }) => cmd_session(model, max_iterations, temperature, resume).await?,
+        }) => cmd_session(model, max_iterations, temperature, effort_level, resume).await?,
         Some(Commands::Agent {
             task,
             model,
             verbose,
             max_iterations,
             temperature,
-        }) => cmd_agent(&task, model, verbose, max_iterations, temperature).await?,
-        Some(Commands::Tui {
-            session,
-            resume,
-            model,
-            max_iterations,
-            temperature,
-        }) => cmd_tui(session, resume, model, max_iterations, temperature).await?,
+            effort_level,
+        }) => {
+            cmd_agent(
+                &task,
+                model,
+                verbose,
+                max_iterations,
+                temperature,
+                effort_level,
+            )
+            .await?
+        }
         Some(Commands::Sessions { action }) => cmd_sessions(action).await?,
     }
 
@@ -460,8 +491,20 @@ async fn cmd_status() -> Result<()> {
         "  Default model: {}",
         config.default_model.as_deref().unwrap_or(DEFAULT_MODEL)
     );
-    println!("  Max iterations: {}", config.max_iterations);
-    println!("  Temperature: {}", config.temperature);
+    println!(
+        "  Max iterations: {}",
+        config
+            .max_iterations
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "(not set)".to_string())
+    );
+    println!(
+        "  Temperature: {}",
+        config
+            .temperature
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "(not set)".to_string())
+    );
     println!(
         "  Effort level: {}",
         config
@@ -733,8 +776,19 @@ async fn cmd_stream(value: Option<bool>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_max_iterations(value: Option<usize>) -> Result<()> {
+async fn cmd_max_iterations(value: Option<usize>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
+
+    if clear {
+        config.max_iterations = None;
+        save_config(&config)?;
+        println!(
+            "{} Default max iterations cleared — agent mode now needs one set per call \
+             (--max-iterations) or per session (/max-iterations) to run at all",
+            "✓".green()
+        );
+        return Ok(());
+    }
 
     match value {
         Some(0) => {
@@ -742,20 +796,37 @@ async fn cmd_max_iterations(value: Option<usize>) -> Result<()> {
             std::process::exit(1);
         }
         Some(value) => {
-            config.max_iterations = value;
+            config.max_iterations = Some(value);
             save_config(&config)?;
             println!("{} Default max iterations set to {}", "✓".green(), value);
         }
         None => {
-            println!("Current default max iterations: {}", config.max_iterations);
+            println!(
+                "Current default max iterations: {}",
+                config
+                    .max_iterations
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
         }
     }
 
     Ok(())
 }
 
-async fn cmd_temperature(value: Option<f32>) -> Result<()> {
+async fn cmd_temperature(value: Option<f32>, clear: bool) -> Result<()> {
     let mut config = load_config()?;
+
+    if clear {
+        config.temperature = None;
+        save_config(&config)?;
+        println!(
+            "{} Default temperature cleared — requests now have no temperature field \
+             unless set per call (--temperature) or per session (/temperature)",
+            "✓".green()
+        );
+        return Ok(());
+    }
 
     match value {
         Some(value) if !(0.0..=2.0).contains(&value) => {
@@ -763,12 +834,18 @@ async fn cmd_temperature(value: Option<f32>) -> Result<()> {
             std::process::exit(1);
         }
         Some(value) => {
-            config.temperature = value;
+            config.temperature = Some(value);
             save_config(&config)?;
             println!("{} Default temperature set to {}", "✓".green(), value);
         }
         None => {
-            println!("Current default temperature: {}", config.temperature);
+            println!(
+                "Current default temperature: {}",
+                config
+                    .temperature
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(not set)".to_string())
+            );
         }
     }
 
@@ -790,19 +867,13 @@ async fn cmd_effort_level(value: Option<String>, clear: bool) -> Result<()> {
 
     match value {
         Some(value) => {
-            let normalized = value.to_lowercase();
-            if !VALID_EFFORT_LEVELS.contains(&normalized.as_str()) {
-                eprintln!(
-                    "{} Invalid effort level '{}'. Valid values: {}",
-                    "✗".red(),
-                    value,
-                    VALID_EFFORT_LEVELS.join(", ")
-                );
-                std::process::exit(1);
-            }
-            config.effort_level = Some(normalized.clone());
+            // Not checked against a fixed low/medium/high list — models
+            // vary in what reasoning-effort values they actually accept,
+            // and this is easy to correct with another `comms effort-level`
+            // if it turns out wrong for whatever you're pointed at.
+            config.effort_level = Some(value.clone());
             save_config(&config)?;
-            println!("{} Effort level set to {}", "✓".green(), normalized);
+            println!("{} Effort level set to {}", "✓".green(), value);
         }
         None => {
             println!(
@@ -844,11 +915,16 @@ async fn cmd_models() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_ask(prompt: &str, model: Option<String>) -> Result<()> {
+async fn cmd_ask(
+    prompt: &str,
+    model: Option<String>,
+    temperature: Option<f32>,
+    effort_level: Option<String>,
+) -> Result<()> {
     let config = load_config()?;
     let model = resolve_model(&config, model);
-    let effort_level = config.effort_level.clone();
-    let temperature = config.temperature;
+    let effort_level = resolve_effort_level(&config, effort_level);
+    let temperature = resolve_temperature(&config, temperature);
     let client = Client::new(config)?;
 
     let messages = vec![ChatMessage {
@@ -891,12 +967,16 @@ fn print_transcript(messages: &[store::StoredMessage]) {
         match m.role.as_str() {
             "user" => {
                 if let Some(content) = &m.content {
-                    println!("{} {}", "❯".green().bold(), wrap::wrap(content));
+                    println!(
+                        "{} {}",
+                        "❯".green().bold(),
+                        wrap::wrap_indented(content, "  ")
+                    );
                 }
             }
             "assistant" => {
                 if let Some(content) = &m.content {
-                    println!("\n{} {}\n", "●".cyan(), wrap::wrap(content));
+                    println!("\n{} {}\n", "●".cyan(), wrap::wrap_indented(content, "  "));
                 }
             }
             _ => {}
@@ -919,10 +999,14 @@ fn user_prompts(messages: &[store::StoredMessage]) -> Vec<String> {
 /// `ui`'s live verbosity, which isn't session state) and printing a
 /// confirmation in the same "set to X" / "already X" style the TUI's status
 /// notices use, so the two front ends read the same way.
+#[allow(clippy::too_many_arguments)]
 fn apply_submission(
     submission: ui::Submission,
     session: &mut ChatSession,
     ui: &mut TerminalAgentUi,
+    default_max_iterations: Option<usize>,
+    default_temperature: Option<f32>,
+    default_effort_level: Option<String>,
 ) -> Result<()> {
     match submission {
         ui::Submission::Message(_) => unreachable!("handled by the caller"),
@@ -966,6 +1050,16 @@ fn apply_submission(
                 if changed { "set to" } else { "is" }
             );
         }
+        ui::Submission::ResetEffort => {
+            let changed = default_effort_level != session.effort_level().map(String::from);
+            session.set_effort_level(default_effort_level)?;
+            let label = session.effort_level().unwrap_or("default").to_string();
+            println!(
+                "{} Effort {} {label}",
+                "✓".green(),
+                if changed { "set to" } else { "is" }
+            );
+        }
         ui::Submission::ToggleVerbose => {
             let verbose = !session.verbose();
             session.set_verbose(verbose)?;
@@ -989,6 +1083,18 @@ fn apply_submission(
                 if changed { "set to" } else { "is" }
             );
         }
+        ui::Submission::ResetMaxIterations => {
+            let changed = default_max_iterations != session.max_iterations();
+            session.set_max_iterations(default_max_iterations)?;
+            let label = default_max_iterations
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "(not set)".to_string());
+            println!(
+                "{} Max iterations {} {label}",
+                "✓".green(),
+                if changed { "set to" } else { "is" }
+            );
+        }
         ui::Submission::SetTemperature(temperature) => {
             let changed = temperature != session.temperature();
             session.set_temperature(temperature)?;
@@ -996,6 +1102,18 @@ fn apply_submission(
                 .temperature()
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "default".to_string());
+            println!(
+                "{} Temperature {} {label}",
+                "✓".green(),
+                if changed { "set to" } else { "is" }
+            );
+        }
+        ui::Submission::ResetTemperature => {
+            let changed = default_temperature != session.temperature();
+            session.set_temperature(default_temperature)?;
+            let label = default_temperature
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "(not set)".to_string());
             println!(
                 "{} Temperature {} {label}",
                 "✓".green(),
@@ -1025,10 +1143,19 @@ async fn cmd_session(
     model: Option<String>,
     max_iterations: Option<usize>,
     temperature: Option<f32>,
+    effort_level: Option<String>,
     resume: Option<String>,
 ) -> Result<()> {
     let config = load_config()?;
     let conn = store::open_db()?;
+
+    // The merge of the global config default with any `--flag` override,
+    // used as the concrete snapshot for a brand new session below, and as
+    // the target `/max-iterations default`/`/temperature default`/
+    // `/effort default` resolve to for the rest of this run.
+    let default_max_iterations = resolve_max_iterations(&config, max_iterations);
+    let default_temperature = resolve_temperature(&config, temperature);
+    let default_effort_level = resolve_effort_level(&config, effort_level);
 
     let mut prior_prompts: Vec<String> = Vec::new();
     let mut session = match resume {
@@ -1042,18 +1169,13 @@ async fn cmd_session(
                     "note:".bright_black()
                 );
             }
-            let effort_level = summary
-                .effort_level
-                .clone()
-                .or_else(|| config.effort_level.clone());
             println!(
                 "{} Resuming session {} ({})\n",
                 "✓".green(),
                 summary.id,
                 summary.title
             );
-            let (session, history) =
-                ChatSession::resume(conn, &summary, summary.model.clone(), effort_level.clone())?;
+            let (session, history) = ChatSession::resume(conn, &summary, summary.model.clone())?;
             print_transcript(&history);
             prior_prompts = user_prompts(&history);
             session
@@ -1066,17 +1188,14 @@ async fn cmd_session(
                 conn,
                 model,
                 KIND_CHAT,
-                config.effort_level.clone(),
+                default_effort_level.clone(),
+                default_max_iterations,
+                default_temperature,
                 config.approval.clone(),
             )?
         }
     };
 
-    // Used only when the session has no `/max-iterations`/`/temperature`
-    // override of its own — read fresh each turn below, the same precedence
-    // the TUI uses.
-    let default_max_iterations = resolve_max_iterations(&config, max_iterations);
-    let default_temperature = resolve_temperature(&config, temperature);
     let client = Client::new(config)?;
 
     println!("{}\n", "Starting session (type 'exit' to quit)".blue());
@@ -1127,9 +1246,9 @@ async fn cmd_session(
                 println!();
                 let model = session.model().to_string();
                 let effort_level = session.effort_level().map(str::to_string);
-                let temperature = session.temperature().unwrap_or(default_temperature);
+                let temperature = session.temperature();
                 let turn = if session.is_agentic() {
-                    let max_iterations = session.max_iterations().unwrap_or(default_max_iterations);
+                    let max_iterations = session.max_iterations();
                     let approval = session.approval().clone();
                     agent::run_agent_turn(
                         &client,
@@ -1167,7 +1286,14 @@ async fn cmd_session(
                 }
             }
             submission => {
-                if let Err(e) = apply_submission(submission, &mut session, &mut ui) {
+                if let Err(e) = apply_submission(
+                    submission,
+                    &mut session,
+                    &mut ui,
+                    default_max_iterations,
+                    default_temperature,
+                    default_effort_level.clone(),
+                ) {
                     println!("{} {}", "✗".red(), e);
                 }
             }
@@ -1189,13 +1315,14 @@ async fn cmd_agent(
     verbose: bool,
     max_iterations: Option<usize>,
     temperature: Option<f32>,
+    effort_level: Option<String>,
 ) -> Result<()> {
     let config = load_config()?;
     let model = resolve_model(&config, model);
     let max_iterations = resolve_max_iterations(&config, max_iterations);
     let temperature = resolve_temperature(&config, temperature);
     let approval = config.approval.clone();
-    let effort_level = config.effort_level.clone();
+    let effort_level = resolve_effort_level(&config, effort_level);
     let client = Client::new(config)?;
 
     println!("{}\n", "Starting agent task...".blue());
@@ -1218,40 +1345,19 @@ async fn cmd_agent(
     Ok(())
 }
 
-async fn cmd_tui(
-    session: bool,
-    resume: Option<String>,
-    model: Option<String>,
-    max_iterations: Option<usize>,
-    temperature: Option<f32>,
-) -> Result<()> {
+async fn cmd_tui() -> Result<()> {
     let config = load_config()?;
-
-    // A `--resume` id is resolved out here so a bad id fails as a normal CLI
-    // error rather than inside the alternate screen. Everything else the TUI
-    // picks for itself.
-    let start = if let Some(id_or_prefix) = resume {
-        let conn = store::open_db()?;
-        let summary = store::find_session(&conn, &id_or_prefix)?
-            .ok_or_else(|| anyhow::anyhow!("No session found matching '{}'", id_or_prefix))?;
-        tui::Start::Resume(Box::new(summary))
-    } else if session {
-        tui::Start::New
-    } else {
-        tui::Start::Launch
-    };
 
     let context = tui::Context {
         default_model: resolve_model(&config, None),
-        model_override: model,
         effort_level: config.effort_level.clone(),
-        max_iterations: resolve_max_iterations(&config, max_iterations),
-        temperature: resolve_temperature(&config, temperature),
+        max_iterations: config.max_iterations,
+        temperature: config.temperature,
         approval: config.approval.clone(),
         client: Arc::new(Client::new(config)?),
     };
 
-    tui::run(context, start).await
+    tui::run(context).await
 }
 
 async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {

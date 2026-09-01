@@ -46,26 +46,12 @@ const TICK: Duration = Duration::from_millis(100);
 /// screen the TUI no longer receives a ready-made session.
 pub struct Context {
     pub client: Arc<Client>,
-    /// Model for new sessions; a resumed one keeps its own unless the user
-    /// passed `--model`.
+    /// Model for new sessions; a resumed one keeps its own.
     pub default_model: String,
-    pub model_override: Option<String>,
     pub effort_level: Option<String>,
-    pub max_iterations: usize,
-    pub temperature: f32,
+    pub max_iterations: Option<usize>,
+    pub temperature: Option<f32>,
     pub approval: ApprovalSettings,
-}
-
-/// Where the TUI opens.
-pub enum Start {
-    /// The launch screen (bare `comms tui`).
-    Launch,
-    /// Straight into a new session (`--session`), starting in ask mode —
-    /// same as choosing "New session" on the launch screen, minus the
-    /// naming prompt.
-    New,
-    /// Straight into a saved session (`--resume`).
-    Resume(Box<SessionSummary>),
 }
 
 enum Screen {
@@ -84,13 +70,11 @@ struct Chat {
     conversation: Conversation,
 }
 
-/// Runs the TUI until the user quits.
-pub async fn run(context: Context, start: Start) -> Result<()> {
-    let mut screen = match start {
-        Start::Launch => Screen::Launch(Picker::launch(load_sessions()?)),
-        Start::New => Screen::Chat(Box::new(open_new(&context, false, None)?)),
-        Start::Resume(summary) => Screen::Chat(Box::new(open_resumed(&context, &summary)?)),
-    };
+/// Runs the TUI until the user quits. Always opens on the launch screen —
+/// there's no flag to skip straight into a new or resumed session, so this
+/// is the one and only way in.
+pub async fn run(context: Context) -> Result<()> {
+    let mut screen = Screen::Launch(Picker::launch(load_sessions()?));
 
     let mut terminal = enter()?;
     // Restore the terminal even on the way out of an error, so a failure
@@ -116,16 +100,14 @@ fn load_sessions() -> Result<Vec<SessionRow>> {
 /// connection through every screen.
 fn open_new(context: &Context, agentic: bool, title: Option<String>) -> Result<Chat> {
     let kind = if agentic { KIND_AGENT_CHAT } else { KIND_CHAT };
-    let model = context
-        .model_override
-        .clone()
-        .unwrap_or_else(|| context.default_model.clone());
 
     let mut session = ChatSession::create(
         store::open_db()?,
-        model,
+        context.default_model.clone(),
         kind,
         context.effort_level.clone(),
+        context.max_iterations,
+        context.temperature,
         context.approval.clone(),
     )?;
     if let Some(title) = title {
@@ -144,28 +126,10 @@ fn open_new(context: &Context, agentic: bool, title: Option<String>) -> Result<C
 }
 
 fn open_resumed(context: &Context, summary: &SessionSummary) -> Result<Chat> {
-    // Prefer this session's own persisted effort — a real `/effort` switch
-    // — over the general configured default, the same way its model does.
-    let effort_level = summary
-        .effort_level
-        .clone()
-        .or_else(|| context.effort_level.clone());
-    let (session, history) = ChatSession::resume(
-        store::open_db()?,
-        summary,
-        summary.model.clone(),
-        effort_level,
-    )?;
+    let (session, history) =
+        ChatSession::resume(store::open_db()?, summary, summary.model.clone())?;
     let agentic = summary.kind == KIND_AGENT_CHAT;
-    let mut chat = start_chat(context, session, history, agentic);
-    // A resumed session keeps its own saved settings; `-m` (like any other
-    // override flag) only ever applies to a brand new one.
-    if context.model_override.is_some() {
-        chat.app.transcript.push(TranscriptItem::Notice(
-            "Ignoring --model: resumed sessions keep their saved model".to_string(),
-        ));
-    }
-    Ok(chat)
+    Ok(start_chat(context, session, history, agentic))
 }
 
 fn open_row(context: &Context, row: &SessionRow) -> Result<Chat> {
@@ -199,6 +163,7 @@ fn start_chat(
         session,
         context.max_iterations,
         context.temperature,
+        context.effort_level.clone(),
         agentic,
     );
     Chat { app, conversation }
@@ -576,12 +541,19 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                     app::Submission::SetEffort(effort_level) => {
                         conversation.send(Command::SetEffort(effort_level))
                     }
+                    app::Submission::ResetEffort => conversation.send(Command::ResetEffort),
                     app::Submission::ToggleVerbose => conversation.send(Command::ToggleVerbose),
                     app::Submission::SetMaxIterations(max_iterations) => {
                         conversation.send(Command::SetMaxIterations(max_iterations))
                     }
+                    app::Submission::ResetMaxIterations => {
+                        conversation.send(Command::ResetMaxIterations)
+                    }
                     app::Submission::SetTemperature(temperature) => {
                         conversation.send(Command::SetTemperature(temperature))
+                    }
+                    app::Submission::ResetTemperature => {
+                        conversation.send(Command::ResetTemperature)
                     }
                     app::Submission::SetApproval { category, enabled } => {
                         conversation.send(Command::SetApproval { category, enabled })

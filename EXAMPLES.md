@@ -309,6 +309,14 @@ comms agent "Design a lock-free concurrent queue in Rust"
 
 # Back off for quick, cheap responses
 comms effort-level low
+
+# Or start a single session at a different level, without changing the
+# persistent default
+comms session --effort-level high
+
+# Or, inside a session, just for that one session
+comms session
+❯ /effort high
 ```
 
 Once set, response labels show the effort level alongside the model, e.g. `anthropic/claude-opus-4.5 (high):`, so it's clear which effort level produced the output.

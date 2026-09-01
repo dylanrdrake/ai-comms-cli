@@ -4,6 +4,24 @@ use async_stream::try_stream;
 use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+/// Bounds how long connecting (DNS/TCP/TLS) may take before giving up —
+/// independent of how long a slow-to-answer provider may then take once
+/// connected, which the per-call timeouts below cover instead.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A non-streaming request has no partial progress to show, so it's given
+/// a single generous ceiling for the whole round trip — long enough for a
+/// slow reasoning model, but bounded so a stalled connection eventually
+/// surfaces as an error instead of leaving the caller waiting forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// A streaming request has no such ceiling on its *total* length — a long
+/// reply legitimately keeps sending chunks — so instead this bounds the gap
+/// between chunks: no new bytes within this window means the connection
+/// has stalled, not that the model is still thinking.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
@@ -44,7 +62,11 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<serde_json::Value>>,
-    pub temperature: f32,
+    /// Omitted entirely (not sent as `null`) when there's no temperature to
+    /// use — the provider then falls back to its own default, same as an
+    /// omitted `reasoning`/`reasoning_effort`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
     /// Flat effort field, e.g. OrcaRouter's `reasoning_effort: "high"`.
@@ -280,10 +302,14 @@ impl Client {
         let api_key = crate::config::get_api_key()?
             .ok_or_else(|| anyhow!("API key not configured. Run: comms login"))?;
 
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()?;
+
         Ok(Client {
             config,
             api_key,
-            http_client: reqwest::Client::new(),
+            http_client,
         })
     }
 
@@ -312,7 +338,7 @@ impl Client {
         &self,
         model: String,
         messages: Vec<ChatMessage>,
-        temperature: f32,
+        temperature: Option<f32>,
         tools: Option<Vec<serde_json::Value>>,
         effort_level: Option<String>,
         stream: bool,
@@ -354,7 +380,7 @@ impl Client {
         &self,
         model: String,
         messages: Vec<ChatMessage>,
-        temperature: f32,
+        temperature: Option<f32>,
         tools: Option<Vec<serde_json::Value>>,
         effort_level: Option<String>,
     ) -> Result<ChatResponse> {
@@ -363,7 +389,12 @@ impl Client {
         let req = self
             .http_client
             .post(format!("{}/chat/completions", self.config.base_url));
-        let response = self.apply_headers(req).json(&request).send().await?;
+        let response = self
+            .apply_headers(req)
+            .json(&request)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
@@ -385,7 +416,7 @@ impl Client {
         &self,
         model: String,
         messages: Vec<ChatMessage>,
-        temperature: f32,
+        temperature: Option<f32>,
         tools: Option<Vec<serde_json::Value>>,
         effort_level: Option<String>,
     ) -> impl Stream<Item = Result<StreamEvent>> + '_ {
@@ -394,7 +425,21 @@ impl Client {
 
         try_stream! {
             let req = self.http_client.post(url);
-            let response = self.apply_headers(req).json(&request).send().await?;
+            // Not `.timeout()` on the request itself — that would also
+            // bound the total time spent reading a long-but-still-arriving
+            // stream below, which is exactly what the idle timeout further
+            // down is meant to allow. This only bounds how long a first
+            // response takes to start showing up at all.
+            let response = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, self.apply_headers(req).json(&request).send()).await {
+                Ok(response) => response?,
+                Err(_) => {
+                    Err(anyhow!(
+                        "No response from provider within {}s; the connection may have stalled",
+                        STREAM_IDLE_TIMEOUT.as_secs()
+                    ))?;
+                    return;
+                }
+            };
 
             if !response.status().is_success() {
                 let error_text = response.text().await?;
@@ -406,7 +451,18 @@ impl Client {
             let mut decoder = SseDecoder::default();
             let mut accumulator = StreamAccumulator::default();
 
-            'outer: while let Some(chunk) = bytes.next().await {
+            'outer: loop {
+                let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, bytes.next()).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break 'outer,
+                    Err(_) => {
+                        Err(anyhow!(
+                            "No response from provider within {}s; the connection may have stalled",
+                            STREAM_IDLE_TIMEOUT.as_secs()
+                        ))?;
+                        return;
+                    }
+                };
                 decoder.push_bytes(&chunk?);
                 for payload in decoder.drain_payloads() {
                     if payload == "[DONE]" {

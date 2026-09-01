@@ -29,15 +29,22 @@ pub struct ChatSession {
     /// Whether this session's TUI view currently shows verbose tool detail.
     /// Purely a display setting — the agent loop never reads it.
     verbose: bool,
-    /// A `/max-iterations`-style override of the tool-calling cap per turn,
-    /// while in agent mode. `None` means "use the configured default".
+    /// This session's tool-calling iteration cap per turn, while in agent
+    /// mode. Starts as a snapshot of the configured default (merged with any
+    /// `--max-iterations` given at creation), mutable from inside it with
+    /// `/max-iterations <n>`. `/max-iterations clear` nullifies it back to
+    /// `None` — turns then fall back to whatever the configured default is
+    /// *at the time each one runs*, not frozen to what it was at creation or
+    /// at the last explicit set. `/max-iterations default` is the concrete
+    /// counterpart: it reads the currently configured default once and
+    /// saves that as a new explicit `Some` value, same as typing the number
+    /// itself.
     max_iterations: Option<usize>,
-    /// A `/temperature`-style override of the sampling temperature.
-    /// `None` means "use the configured default".
+    /// This session's sampling temperature — same deal as `max_iterations`.
     temperature: Option<f32>,
     /// This session's current tool-approval gates, always concrete (unlike
-    /// `effort_level`/`max_iterations` there's no "unset, defer to config"
-    /// state once a turn actually needs to check them).
+    /// `effort_level`/`max_iterations`/`temperature` there's no "unset,
+    /// defer to config" state once a turn actually needs to check them).
     approval: ApprovalSettings,
     messages: Vec<ChatMessage>,
     /// Whether the session has been given a title derived from a user
@@ -57,15 +64,32 @@ fn has_agent_system_prompt(messages: &[ChatMessage]) -> bool {
 }
 
 impl ChatSession {
-    /// Starts a new session, registering it in the database.
+    /// Starts a new session, registering it in the database. `effort_level`,
+    /// `max_iterations`, and `temperature` are each a snapshot of the
+    /// configured default at creation time (already merged with any
+    /// `--flag` the caller was given) — like `approval`, they're written
+    /// immediately rather than re-resolved on every resume. Any of the three
+    /// can already be `None` here, if nothing is configured anywhere; that's
+    /// still a real snapshot, not "unset by omission".
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         conn: Connection,
         model: String,
         kind: &str,
         effort_level: Option<String>,
+        max_iterations: Option<usize>,
+        temperature: Option<f32>,
         approval: ApprovalSettings,
     ) -> Result<Self> {
-        let id = store::create_session(&conn, &model, kind, &approval)?;
+        let id = store::create_session(
+            &conn,
+            &model,
+            kind,
+            effort_level.as_deref(),
+            max_iterations.map(|n| n as i64),
+            temperature.map(|n| n as f64),
+            &approval,
+        )?;
         Ok(ChatSession {
             conn,
             id,
@@ -74,8 +98,8 @@ impl ChatSession {
             kind: kind.to_string(),
             effort_level,
             verbose: false,
-            max_iterations: None,
-            temperature: None,
+            max_iterations,
+            temperature,
             approval,
             messages: Vec::new(),
             title_set: false,
@@ -85,6 +109,11 @@ impl ChatSession {
 
     /// Reopens a saved session. `model` overrides the model it was created
     /// with (a `--model` flag on resume); pass `summary.model` to keep it.
+    /// Every other setting comes straight off `summary`, the session's own
+    /// persisted value; there's no config fallback to re-resolve here — a
+    /// `None` `max_iterations`/`temperature` stays `None` (nullified, or a
+    /// row written before this was tracked; either way a caller resolves it
+    /// against the configured default per turn, not here).
     ///
     /// Returns the stored history alongside the session so a caller can
     /// render the prior transcript — including the per-message model/effort
@@ -93,7 +122,6 @@ impl ChatSession {
         conn: Connection,
         summary: &SessionSummary,
         model: String,
-        effort_level: Option<String>,
     ) -> Result<(Self, Vec<StoredMessage>)> {
         let history = store::load_messages(&conn, &summary.id)?;
         let messages: Vec<ChatMessage> = history.iter().map(|sm| sm.message.clone()).collect();
@@ -114,7 +142,7 @@ impl ChatSession {
                 title: summary.title.clone(),
                 model,
                 kind: summary.kind.clone(),
-                effort_level,
+                effort_level: summary.effort_level.clone(),
                 verbose: summary.verbose,
                 max_iterations: summary.max_iterations.map(|n| n as usize),
                 temperature: summary.temperature.map(|n| n as f32),
@@ -198,8 +226,9 @@ impl ChatSession {
     }
 
     /// Switches the tool-calling iteration cap per turn (agent mode only)
-    /// and records it. `None` clears the override, falling back to the
-    /// configured default.
+    /// and records it. `None` nullifies it (`/max-iterations clear`) — a
+    /// turn then falls back to whatever the configured default is when it
+    /// actually runs, not to anything frozen here.
     pub fn set_max_iterations(&mut self, max_iterations: Option<usize>) -> Result<()> {
         if self.max_iterations == max_iterations {
             return Ok(());
@@ -215,8 +244,7 @@ impl ChatSession {
     }
 
     /// Switches the sampling temperature for subsequent turns and records
-    /// it. `None` clears the override, falling back to the configured
-    /// default.
+    /// it. `None` nullifies it, same deal as [`Self::set_max_iterations`].
     pub fn set_temperature(&mut self, temperature: Option<f32>) -> Result<()> {
         if self.temperature == temperature {
             return Ok(());
@@ -439,6 +467,8 @@ mod tests {
             "test-model".to_string(),
             KIND_CHAT,
             Some("high".to_string()),
+            Some(20),
+            Some(0.7),
             ApprovalSettings::default(),
         )
         .unwrap()
@@ -611,7 +641,8 @@ mod tests {
     #[test]
     fn set_max_iterations_persists_and_clears() {
         let mut session = memory_session();
-        assert_eq!(session.max_iterations(), None);
+        // The 20 `memory_session` created it with — a snapshot, not "unset".
+        assert_eq!(session.max_iterations(), Some(20));
 
         session.set_max_iterations(Some(30)).unwrap();
         assert_eq!(session.max_iterations(), Some(30));
@@ -620,6 +651,9 @@ mod tests {
             .unwrap();
         assert_eq!(summary.max_iterations, Some(30));
 
+        // Nullifying is a session-layer concept again — a caller resolves
+        // `/max-iterations default` to a concrete value itself, same as any
+        // other explicit number, but `clear` passes `None` straight through.
         session.set_max_iterations(None).unwrap();
         assert_eq!(session.max_iterations(), None);
         let summary = store::find_session(&session.conn, session.id())
@@ -631,7 +665,7 @@ mod tests {
     #[test]
     fn set_temperature_persists_and_clears() {
         let mut session = memory_session();
-        assert_eq!(session.temperature(), None);
+        assert_eq!(session.temperature(), Some(0.7));
 
         session.set_temperature(Some(1.5)).unwrap();
         assert_eq!(session.temperature(), Some(1.5));
@@ -706,8 +740,7 @@ mod tests {
             .unwrap();
         let ChatSession { conn, .. } = session;
 
-        let (resumed, _) =
-            ChatSession::resume(conn, &summary, summary.model.clone(), None).unwrap();
+        let (resumed, _) = ChatSession::resume(conn, &summary, summary.model.clone()).unwrap();
         assert_eq!(resumed.title(), "hello");
         assert!(resumed.verbose());
         assert_eq!(resumed.max_iterations(), Some(30));
@@ -725,7 +758,7 @@ mod tests {
         let ChatSession { conn, .. } = session;
 
         let (resumed, _) =
-            ChatSession::resume(conn, &summary, "switched-model".to_string(), None).unwrap();
+            ChatSession::resume(conn, &summary, "switched-model".to_string()).unwrap();
         assert_eq!(resumed.model(), "switched-model");
 
         // And resuming again with no override keeps the switched model
@@ -783,7 +816,7 @@ mod tests {
         let ChatSession { conn, .. } = session;
 
         let (mut resumed, history) =
-            ChatSession::resume(conn, &summary, summary.model.clone(), None).unwrap();
+            ChatSession::resume(conn, &summary, summary.model.clone()).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(resumed.messages().len(), 2);
 

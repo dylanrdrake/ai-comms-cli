@@ -54,8 +54,6 @@ impl ApprovalSettings {
     }
 }
 
-pub const VALID_EFFORT_LEVELS: [&str; 3] = ["low", "medium", "high"];
-
 /// How `effort_level` is sent to the provider:
 /// - `flat`: top-level `reasoning_effort: "<level>"` (OrcaRouter's shape)
 /// - `nested`: `reasoning: { "effort": "<level>" }` (OpenRouter's shape)
@@ -76,10 +74,17 @@ pub struct Config {
     pub default_model: Option<String>,
     #[serde(default)]
     pub approval: ApprovalSettings,
+    /// `None` means no persistent default is configured at all — `ask`/
+    /// `agent`/a new `session` then run with no iteration cap unless
+    /// `--max-iterations` is passed for that call, which errors immediately
+    /// in agent mode rather than guessing a number.
     #[serde(default = "default_max_iterations")]
-    pub max_iterations: usize,
+    pub max_iterations: Option<usize>,
+    /// `None` means no persistent default is configured at all — a request
+    /// is then sent with no `temperature` field, and the provider uses its
+    /// own default.
     #[serde(default = "default_temperature")]
-    pub temperature: f32,
+    pub temperature: Option<f32>,
     #[serde(default)]
     pub effort_level: Option<String>,
     /// How to serialize `effort_level` for the current `base_url`'s provider.
@@ -102,12 +107,17 @@ pub fn default_base_url() -> String {
     "https://openrouter.ai/api/v1".to_string()
 }
 
-pub fn default_max_iterations() -> usize {
-    20
+/// The factory default for a fresh install (no `config.json` yet) and for
+/// migrating an old `config.json` written before this field existed. Once a
+/// user explicitly clears it with `comms max-iterations --clear`, it stays
+/// `None` — this is never consulted again after that.
+pub fn default_max_iterations() -> Option<usize> {
+    Some(20)
 }
 
-pub fn default_temperature() -> f32 {
-    0.7
+/// Same deal as [`default_max_iterations`].
+pub fn default_temperature() -> Option<f32> {
+    Some(0.7)
 }
 
 impl Default for Config {

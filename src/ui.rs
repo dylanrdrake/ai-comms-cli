@@ -111,13 +111,27 @@ pub enum Submission {
     SetModel(String),
     ShowModel,
     SetAgentic(bool),
-    /// `None` clears the override, falling back to the configured default.
+    /// `None` nullifies the override (`/effort clear`) — no effort field is
+    /// sent, regardless of the configured default, until set again.
     SetEffort(Option<String>),
+    /// `/effort default` — reads the *currently* configured default and
+    /// saves that concrete value to the session now, distinct from
+    /// [`Submission::SetEffort`]`(None)`, which nullifies instead.
+    ResetEffort,
     ToggleVerbose,
-    /// `None` clears the override, falling back to the configured default.
+    /// `None` nullifies the override (`/max-iterations clear`) — turns fall
+    /// back to whatever the configured default is at the time each one
+    /// runs, regardless of what it was when this session started.
     SetMaxIterations(Option<usize>),
-    /// `None` clears the override, falling back to the configured default.
+    /// `/max-iterations default` — reads the *currently* configured default
+    /// and saves that concrete value to the session now, distinct from
+    /// [`Submission::SetMaxIterations`]`(None)`, which nullifies instead.
+    ResetMaxIterations,
+    /// `None` nullifies the override (`/temperature clear`), same deal as
+    /// [`Submission::SetMaxIterations`].
     SetTemperature(Option<f32>),
+    /// `/temperature default` — same deal as [`Submission::ResetMaxIterations`].
+    ResetTemperature,
     /// `category` is one of "read", "write", "terminal", "all" — already
     /// validated by [`classify`], so a consumer can match on it directly.
     SetApproval {
@@ -157,16 +171,35 @@ pub fn classify(text: &str) -> Submission {
     }
 
     if let Some(value) = argument(trimmed, "/effort") {
-        return Submission::SetEffort(clear_or(value));
+        // "clear" nullifies — no effort field is sent at all, regardless of
+        // the configured default, until set again. "default" is a distinct
+        // action: it reads whatever the default currently is and saves that
+        // concrete value to the session now. Anything else is passed
+        // through as typed rather than checked against a fixed
+        // low/medium/high allowlist — models vary in what they actually
+        // accept, and this is a live per-session override, easy to correct
+        // if wrong, not worth gatekeeping the way the persistent global
+        // default is.
+        if value.eq_ignore_ascii_case("clear") {
+            return Submission::SetEffort(None);
+        }
+        if value.eq_ignore_ascii_case("default") {
+            return Submission::ResetEffort;
+        }
+        return Submission::SetEffort(Some(value.to_string()));
     }
 
     if let Some(value) = argument(trimmed, "/max-iterations") {
         if value.eq_ignore_ascii_case("clear") {
             return Submission::SetMaxIterations(None);
         }
-        // A value that isn't "clear" and isn't a positive number falls
-        // through below, same as any other malformed command — no distinct
-        // error variant, matching how the rest of `classify` degrades.
+        if value.eq_ignore_ascii_case("default") {
+            return Submission::ResetMaxIterations;
+        }
+        // A value that isn't recognized above and isn't a positive number
+        // falls through below, same as any other malformed command — no
+        // distinct error variant, matching how the rest of `classify`
+        // degrades.
         if let Ok(n) = value.parse::<usize>() {
             if n > 0 {
                 return Submission::SetMaxIterations(Some(n));
@@ -179,9 +212,13 @@ pub fn classify(text: &str) -> Submission {
         if value.eq_ignore_ascii_case("clear") {
             return Submission::SetTemperature(None);
         }
-        // A value that isn't "clear" and isn't a non-negative number falls
-        // through below, same as any other malformed command — no distinct
-        // error variant, matching how the rest of `classify` degrades.
+        if value.eq_ignore_ascii_case("default") {
+            return Submission::ResetTemperature;
+        }
+        // A value that isn't recognized above and isn't a non-negative
+        // number falls through below, same as any other malformed command —
+        // no distinct error variant, matching how the rest of `classify`
+        // degrades.
         if let Ok(n) = value.parse::<f32>() {
             if n >= 0.0 && n.is_finite() {
                 return Submission::SetTemperature(Some(n));
@@ -214,14 +251,6 @@ pub fn classify(text: &str) -> Submission {
 
 /// "clear" (case-insensitive) resets an override; anything else is the new
 /// value to set.
-fn clear_or(value: &str) -> Option<String> {
-    if value.eq_ignore_ascii_case("clear") {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
 /// Accepts the same words the CLI's own `comms approval`/`comms stream`
 /// flags do, so `/approval` in a session reads the same way.
 pub fn parse_bool(s: &str) -> Result<bool, String> {
@@ -423,9 +452,26 @@ mod tests {
             classify("/effort high"),
             Submission::SetEffort(Some("high".to_string()))
         );
+        // "clear" nullifies — no effort field is sent until set again.
         assert_eq!(classify("/effort clear"), Submission::SetEffort(None));
+        // "default" is a distinct action: it reads whatever the configured
+        // default currently is and saves that concrete value now.
+        assert_eq!(classify("/effort default"), Submission::ResetEffort);
         // Case-insensitive, like a keyword rather than a literal value.
         assert_eq!(classify("/effort CLEAR"), Submission::SetEffort(None));
+        assert_eq!(classify("/effort DEFAULT"), Submission::ResetEffort);
+
+        // Anything else passes through as typed, case included — not
+        // checked against a fixed low/medium/high list, since models vary
+        // in what reasoning-effort values they actually accept.
+        assert_eq!(
+            classify("/effort HIGH"),
+            Submission::SetEffort(Some("HIGH".to_string()))
+        );
+        assert_eq!(
+            classify("/effort minimal"),
+            Submission::SetEffort(Some("minimal".to_string()))
+        );
 
         // Bare, with nothing to act on, falls through as an ordinary
         // message rather than doing nothing silently.
@@ -446,14 +492,25 @@ mod tests {
             classify("/max-iterations 30"),
             Submission::SetMaxIterations(Some(30))
         );
+        // "clear" nullifies — turns fall back to the configured default.
         assert_eq!(
             classify("/max-iterations clear"),
             Submission::SetMaxIterations(None)
+        );
+        // "default" is a distinct action: it reads whatever the configured
+        // default currently is and saves that concrete value now.
+        assert_eq!(
+            classify("/max-iterations default"),
+            Submission::ResetMaxIterations
         );
         // Case-insensitive, like a keyword rather than a literal value.
         assert_eq!(
             classify("/max-iterations CLEAR"),
             Submission::SetMaxIterations(None)
+        );
+        assert_eq!(
+            classify("/max-iterations DEFAULT"),
+            Submission::ResetMaxIterations
         );
 
         // Zero and non-numeric values aren't valid iteration counts, so —
@@ -485,14 +542,25 @@ mod tests {
             classify("/temperature 0"),
             Submission::SetTemperature(Some(0.0))
         );
+        // "clear" nullifies — turns fall back to the configured default.
         assert_eq!(
             classify("/temperature clear"),
             Submission::SetTemperature(None)
+        );
+        // "default" is a distinct action: it reads whatever the configured
+        // default currently is and saves that concrete value now.
+        assert_eq!(
+            classify("/temperature default"),
+            Submission::ResetTemperature
         );
         // Case-insensitive, like a keyword rather than a literal value.
         assert_eq!(
             classify("/temperature CLEAR"),
             Submission::SetTemperature(None)
+        );
+        assert_eq!(
+            classify("/temperature DEFAULT"),
+            Submission::ResetTemperature
         );
 
         // Negative and non-numeric values aren't valid temperatures, so —

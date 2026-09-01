@@ -99,11 +99,14 @@ pub struct App {
     /// Mirrors the plain CLI's `-v`: gates whether tool call arguments and
     /// results are shown, not just that a tool ran. Toggled with `/verbose`.
     pub verbose: bool,
-    /// Changes with `/max-iterations`; `None` means "use the configured
-    /// default". Only takes effect in agent mode.
+    /// This session's `/max-iterations` override, changed with
+    /// `/max-iterations`/`/max-iterations default`. `None` means nullified —
+    /// turns fall back to the configured default. Only takes effect in
+    /// agent mode.
     pub max_iterations: Option<usize>,
-    /// Changes with `/temperature`; `None` means "use the configured
-    /// default".
+    /// This session's `/temperature` override, changed with
+    /// `/temperature`/`/temperature default`. `None` means nullified, same
+    /// deal as `max_iterations`.
     pub temperature: Option<f32>,
     /// Changes with `/approval`. Not shown in the status bar, but folded
     /// here so a `Notice` can report what it actually ended up as.
@@ -858,6 +861,8 @@ mod tests {
             Some(&TranscriptItem::Notice("Temperature is 1.5".to_string()))
         );
 
+        // `/temperature clear` nullifies — this app-layer label just falls
+        // back to "default", same as effort's.
         a.apply(Event::TemperatureChanged { temperature: None });
         assert_eq!(a.temperature, None);
         assert_eq!(

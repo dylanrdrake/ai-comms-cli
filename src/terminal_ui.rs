@@ -84,12 +84,18 @@ impl AgentUi for TerminalAgentUi {
                         println!("{} {}", label.cyan(), wrap::wrap(&text));
                     } else {
                         // Matches the TUI transcript's dot marker, now that
-                        // neither shows a model label on every reply.
-                        println!("{} {}", "●".cyan(), wrap::wrap(&text));
+                        // neither shows a model label on every reply — and,
+                        // like the TUI's gutter, a wrapped continuation
+                        // line lines up under the first rather than
+                        // resuming at column 0.
+                        println!("{} {}", "●".cyan(), wrap::wrap_indented(&text, "  "));
                     }
                 }
                 AgentEvent::ToolCallStarted { name, arguments } => {
-                    tool_notice("▸".yellow(), &name, &arguments);
+                    // Matches the TUI transcript's gear marker for a tool
+                    // call; completion still gets its own ✓/✗ line below,
+                    // the CLI's equivalent of the TUI's trailing status.
+                    tool_notice("⚙".magenta(), &name, &arguments);
                     if self.verbose {
                         print_fields(&tool_call_fields(&name, &arguments));
                     }
