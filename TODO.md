@@ -9,19 +9,6 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
-* a box above the prompt input showing what is waiting, not just how many.
-  It appears when the first message lands in the queue and disappears when the
-  last one leaves; messages stack in it as they are typed and pop out as they
-  are consumed — taken into the running turn in agent mode, or started as
-  their own turn in ask mode. The settings row's `N queued` says only how many
-  and can't say which, and a steered message is about to change what the model
-  does, so seeing the text before it lands is worth more than the count.
-  Design notes: the box needs its own layout constraint between the transcript
-  and the input, and a cap on height with a "+N more" line, since the queue is
-  unbounded. Popping the right entry needs the front end to know *which*
-  message left, not just that one did — `AgentEvent::Steered` carries the text
-  already, but the queue-drain path emits `Event::Queued { pending }`, a count
-  with no identity, so that event has to say what it took.
 * Websearch
 * a steered message is lost if the turn it joined is cancelled. `absorb` runs
   only on the arm where a turn completes (conversation.rs), so cancelling
