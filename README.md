@@ -394,6 +394,38 @@ one — starting a session is meant to be deliberate, so there's no untitled
 path. The session is kept from the moment you confirm it, whether or not you
 ever say anything in it.
 
+Each row also shows what that session is doing, re-read every couple of
+seconds so one you're running in another terminal stays current:
+
+| | Meaning |
+|---|---|
+| spinner, yellow | Working — a request is in flight right now. The same animation and colour a conversation shows for itself |
+| `?` yellow | Waiting on an approval nobody has answered |
+| `✗` red | The last turn ended in an error — worth resuming to see why |
+| `✓` green | The model answered; the turn ran to completion |
+| `⋯` cyan | Something was sent and nothing came back, and no process is saying otherwise |
+| `⚑` yellow | Stopped part-way — after a tool result with no answer, or on a tool call that never ran |
+| (blank) | Created, never used |
+
+…followed by a one-line preview: normally the session's last message (a tool
+call shows the tool it asked for), but a session waiting on an approval shows
+*what* it's asking about instead — `needs approval — run_terminal_command: rm
+-rf build` — since that's the row you'd want to act on.
+
+The first three come from the process running the session, which is the only
+thing that knows them: a turn's messages are only written when it *finishes*,
+so from storage alone a request in flight looks exactly like a turn that
+failed. The rest are read from the messages themselves, and are what a
+session nobody is running can tell you.
+
+Sessions started or deleted elsewhere appear and disappear as the list
+refreshes, and the cursor follows the session it was on rather than the row
+number, so rows moving underneath it can't quietly select a different
+conversation.
+
+A process killed outright leaves its last word behind until something opens
+that session again.
+
 **Launch screen**
 
 | Key | Does |

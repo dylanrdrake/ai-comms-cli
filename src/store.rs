@@ -3,6 +3,7 @@ use crate::config::{get_config_dir, ApprovalSettings};
 use crate::crypto;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Kind of session, used to distinguish plain chat from agentic chat when listing.
@@ -59,6 +60,11 @@ pub struct SessionSummary {
     /// session recorded before this was tracked — those resume wherever
     /// they're run, as they always did.
     pub working_dir: Option<String>,
+    /// What the process running this session is doing, if it said.
+    pub activity: Option<Activity>,
+    /// The line that goes with it — for an approval, the tool being asked
+    /// about. Decrypted, like `title`.
+    pub activity_detail: Option<String>,
     /// Not surfaced by the CLI, but kept for sorting and display.
     #[allow(dead_code)]
     pub created_at: i64,
@@ -98,6 +104,8 @@ pub fn open_db() -> Result<Connection> {
             sandbox            INTEGER NOT NULL DEFAULT 1,
             stream             INTEGER NOT NULL DEFAULT 1,
             working_dir        TEXT,
+            activity           TEXT,
+            activity_detail    TEXT,
             created_at      INTEGER NOT NULL,
             updated_at      INTEGER NOT NULL
         );
@@ -167,6 +175,10 @@ pub fn open_db() -> Result<Connection> {
     // written before this existed have no answer, and a migration shouldn't
     // start refusing to resume sessions that already worked.
     ensure_column(&conn, "sessions", "working_dir", "TEXT")?;
+    // What the session's process is doing right now, for anything watching
+    // the list. Null means "nothing to say" — see `Activity`.
+    ensure_column(&conn, "sessions", "activity", "TEXT")?;
+    ensure_column(&conn, "sessions", "activity_detail", "TEXT")?;
 
     Ok(conn)
 }
@@ -443,11 +455,162 @@ pub fn append_message(
     Ok(())
 }
 
+/// What a session's process is doing right now, when it's doing something
+/// worth saying so about.
+///
+/// The one thing the stored messages can't answer. A turn's messages are
+/// written when it finishes, so from the table alone a request in flight and
+/// a turn that failed look identical — both left a `user` message as the
+/// last row. This is written by the process running the session, read by
+/// anything watching the list.
+///
+/// Deliberately small. It is not a log and not a lifecycle: three states
+/// that a reader can act on, and the absence of one meaning "nothing to
+/// say, use the messages".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    /// A request is in flight.
+    Working,
+    /// Blocked on a yes/no nobody has answered.
+    AwaitingApproval,
+    /// The last turn ended in an error, and is worth coming back to.
+    Failed,
+}
+
+impl Activity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Activity::Working => "working",
+            Activity::AwaitingApproval => "approval",
+            Activity::Failed => "failed",
+        }
+    }
+
+    /// `None` for anything unrecognised as well as for nothing at all: a
+    /// value written by a newer version should fall back to the messages
+    /// rather than stop the session being listed.
+    pub fn from_stored(value: Option<&str>) -> Option<Self> {
+        match value? {
+            "working" => Some(Activity::Working),
+            "approval" => Some(Activity::AwaitingApproval),
+            "failed" => Some(Activity::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Records what a session's process is doing, or clears it with `None`.
+///
+/// `detail` is the one line worth showing alongside it — for an approval,
+/// which tool is being asked about. Cleared with the activity.
+///
+/// Does not touch `updated_at`: this changes several times a turn, and
+/// letting it reorder the list would move rows under the cursor of anyone
+/// watching.
+pub fn set_session_activity(
+    conn: &Connection,
+    session_id: &str,
+    activity: Option<Activity>,
+    detail: Option<&str>,
+) -> Result<()> {
+    // Encrypted like `title`: a detail names a file or a command the user
+    // typed about, which is conversation content rather than metadata.
+    let detail = crypto::encrypt_opt(detail)?;
+    conn.execute(
+        "UPDATE sessions SET activity = ?1, activity_detail = ?2 WHERE id = ?3",
+        params![activity.map(Activity::as_str), detail, session_id],
+    )?;
+    Ok(())
+}
+
+/// Where a session left off: the shape of its most recent message.
+///
+/// Read rather than written — nothing announces this, it's inferred from
+/// what's already stored. That has a consequence worth knowing: a turn's
+/// messages are only written when it finishes, so a session with a request
+/// in flight looks exactly like one whose turn errored. Both left a `user`
+/// message as the last thing on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastMessage {
+    pub role: String,
+    /// Whether the message asked for a tool, which distinguishes a turn that
+    /// stopped mid-work from one that answered.
+    pub has_tool_calls: bool,
+    /// A one-line summary of the message, already decrypted and trimmed.
+    /// Empty when there was nothing worth showing.
+    pub preview: String,
+}
+
+/// The most recent message in each session, keyed by session id.
+///
+/// One query for every session rather than one per session: the picker asks
+/// for this each time it's shown, and a query per row would make opening the
+/// screen scale with how many sessions you've accumulated.
+pub fn last_messages(conn: &Connection) -> Result<HashMap<String, LastMessage>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.session_id, m.role, m.content, m.tool_calls \
+         FROM messages m \
+         WHERE m.seq = (SELECT MAX(seq) FROM messages WHERE session_id = m.session_id)",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+
+    let mut last = HashMap::new();
+    for row in rows {
+        let (session_id, role, content, tool_calls) = row?;
+        let content = crypto::decrypt_opt(content)?;
+        let tool_calls = crypto::decrypt_opt(tool_calls)?;
+        let has_tool_calls = tool_calls.is_some();
+        last.insert(
+            session_id,
+            LastMessage {
+                role,
+                has_tool_calls,
+                preview: message_preview(content.as_deref(), tool_calls.as_deref()),
+            },
+        );
+    }
+    Ok(last)
+}
+
+/// A single line describing a message, for a list that has one row per
+/// session.
+///
+/// Prefers the text, since that's what a person recognises. A message with
+/// no text is a tool call, so it names the tools instead — "read_file"
+/// says more about where a session got to than an empty cell does.
+fn message_preview(content: Option<&str>, tool_calls: Option<&str>) -> String {
+    if let Some(text) = content {
+        let line = text.split('\n').map(str::trim).find(|l| !l.is_empty());
+        if let Some(line) = line {
+            return line.to_string();
+        }
+    }
+    let Some(json) = tool_calls else {
+        return String::new();
+    };
+    let Ok(calls) = serde_json::from_str::<Vec<ToolCall>>(json) else {
+        return String::new();
+    };
+    calls
+        .iter()
+        .map(|call| call.function.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Lists all sessions, most recently updated first.
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, created_at, updated_at \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at \
          FROM sessions ORDER BY updated_at DESC",
     )?;
 
@@ -469,8 +632,10 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
             sandbox: row.get(11)?,
             stream: row.get(12)?,
             working_dir: row.get(13)?,
-            created_at: row.get(14)?,
-            updated_at: row.get(15)?,
+            activity: Activity::from_stored(row.get::<_, Option<String>>(14)?.as_deref()),
+            activity_detail: row.get(15)?,
+            created_at: row.get(16)?,
+            updated_at: row.get(17)?,
         })
     })?;
 
@@ -478,6 +643,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     for row in rows {
         let mut session = row?;
         session.title = crypto::decrypt(&session.title)?;
+        session.activity_detail = crypto::decrypt_opt(session.activity_detail.take())?;
         sessions.push(session);
     }
     Ok(sessions)
@@ -487,7 +653,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
 pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, created_at, updated_at \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at \
          FROM sessions WHERE id = ?1 OR id LIKE ?2",
     )?;
 
@@ -513,8 +679,10 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
             sandbox: row.get(11)?,
             stream: row.get(12)?,
             working_dir: row.get(13)?,
-            created_at: row.get(14)?,
-            updated_at: row.get(15)?,
+            activity: Activity::from_stored(row.get::<_, Option<String>>(14)?.as_deref()),
+            activity_detail: row.get(15)?,
+            created_at: row.get(16)?,
+            updated_at: row.get(17)?,
         }))
     } else {
         Ok(None)
@@ -634,6 +802,8 @@ mod tests {
                 sandbox            INTEGER NOT NULL DEFAULT 1,
                 stream             INTEGER NOT NULL DEFAULT 1,
                 working_dir        TEXT,
+                activity           TEXT,
+                activity_detail    TEXT,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -806,6 +976,215 @@ mod tests {
             loaded[0].message.reasoning.as_deref(),
             Some("checking the file first")
         );
+    }
+
+    #[test]
+    fn the_last_message_of_each_session_comes_back_in_one_query() {
+        let conn = memory_db();
+        let session = |model: &str| {
+            create_session(
+                &conn,
+                model,
+                KIND_CHAT,
+                None,
+                Some(20),
+                Some(0.7),
+                &ApprovalSettings::default(),
+                true,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        let answered = session("model-a");
+        let waiting = session("model-b");
+        let untouched = session("model-c");
+
+        let user = |text: &str| ChatMessage {
+            role: "user".to_string(),
+            content: Some(text.to_string()),
+            ..Default::default()
+        };
+        append_message(&conn, &answered, 0, &user("ask"), "m", None).unwrap();
+        append_message(
+            &conn,
+            &answered,
+            1,
+            &ChatMessage {
+                role: "assistant".to_string(),
+                content: Some("first line\nsecond line".to_string()),
+                ..Default::default()
+            },
+            "m",
+            None,
+        )
+        .unwrap();
+        append_message(&conn, &waiting, 0, &user("still going"), "m", None).unwrap();
+
+        let last = last_messages(&conn).unwrap();
+
+        // The newest message wins, not the first.
+        let answered = &last[&answered];
+        assert_eq!(answered.role, "assistant");
+        assert!(!answered.has_tool_calls);
+        // One line, so a row stays a row.
+        assert_eq!(answered.preview, "first line");
+
+        assert_eq!(last[&waiting].role, "user");
+        assert_eq!(last[&waiting].preview, "still going");
+
+        // A session nobody has said anything in simply isn't there.
+        assert!(!last.contains_key(&untouched));
+    }
+
+    #[test]
+    fn a_tool_call_previews_as_the_tool_it_asked_for() {
+        // An assistant message that only asks for a tool has no text, and an
+        // empty cell says less than the tool's name does.
+        let conn = memory_db();
+        let id = create_session(
+            &conn,
+            "m",
+            KIND_AGENT_CHAT,
+            None,
+            Some(20),
+            Some(0.7),
+            &ApprovalSettings::default(),
+            true,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        append_message(
+            &conn,
+            &id,
+            0,
+            &ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: function_call_type(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            "m",
+            None,
+        )
+        .unwrap();
+
+        let last = last_messages(&conn).unwrap();
+        assert_eq!(last[&id].preview, "read_file");
+        assert!(last[&id].has_tool_calls);
+    }
+
+    #[test]
+    fn an_activity_written_by_one_process_is_readable_by_another() {
+        // The whole reason this column exists: it's how a session running
+        // somewhere else says what it's doing. And it must not reorder the
+        // list — it changes several times a turn, and rows moving under
+        // someone watching them would make the view unusable.
+        let conn = memory_db();
+        let session = |model: &str| {
+            create_session(
+                &conn,
+                model,
+                KIND_CHAT,
+                None,
+                Some(20),
+                Some(0.7),
+                &ApprovalSettings::default(),
+                true,
+                false,
+                true,
+                None,
+            )
+            .unwrap()
+        };
+        let watched = session("model-a");
+        let _other = session("model-b");
+
+        let before: Vec<String> = list_sessions(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+
+        set_session_activity(
+            &conn,
+            &watched,
+            Some(Activity::AwaitingApproval),
+            Some("run_terminal_command: rm -rf build"),
+        )
+        .unwrap();
+
+        let after = list_sessions(&conn).unwrap();
+        assert_eq!(
+            after.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            before,
+            "an activity change must not reorder the list"
+        );
+
+        let row = after.iter().find(|s| s.id == watched).unwrap();
+        assert_eq!(row.activity, Some(Activity::AwaitingApproval));
+        // Stored encrypted, and handed back in the clear like the title.
+        assert_eq!(
+            row.activity_detail.as_deref(),
+            Some("run_terminal_command: rm -rf build")
+        );
+
+        // Cleared when the turn moves on, detail and all.
+        set_session_activity(&conn, &watched, None, None).unwrap();
+        let row = list_sessions(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == watched)
+            .unwrap();
+        assert_eq!(row.activity, None);
+        assert_eq!(row.activity_detail, None);
+    }
+
+    #[test]
+    fn an_activity_detail_is_not_stored_in_the_clear() {
+        // It names a file or a command the user typed about, so it gets the
+        // same treatment as message content and titles.
+        let conn = memory_db();
+        let id = create_session(
+            &conn,
+            "m",
+            KIND_CHAT,
+            None,
+            Some(20),
+            Some(0.7),
+            &ApprovalSettings::default(),
+            true,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        set_session_activity(
+            &conn,
+            &id,
+            Some(Activity::AwaitingApproval),
+            Some("run_terminal_command: deploy --prod"),
+        )
+        .unwrap();
+
+        let raw: String = conn
+            .query_row(
+                "SELECT activity_detail FROM sessions WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!raw.contains("deploy --prod"), "{raw}");
     }
 
     #[test]

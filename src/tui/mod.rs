@@ -43,6 +43,10 @@ use std::time::Duration;
 
 /// How often the screen redraws while idle, driving the spinner.
 const TICK: Duration = Duration::from_millis(100);
+/// How often the picker screen re-reads where each session left off. Slower
+/// than the animation tick on purpose: it's a database read, and a session's
+/// last message doesn't change faster than a turn takes.
+const SESSION_REFRESH: Duration = Duration::from_secs(2);
 
 /// Everything needed to start conversations on demand, since with a launch
 /// screen the TUI no longer receives a ready-made session.
@@ -100,9 +104,17 @@ pub async fn run(context: Context) -> Result<()> {
 
 fn load_sessions() -> Result<Vec<SessionRow>> {
     let conn = store::open_db()?;
+    // Every session's last message in one query, then matched up here —
+    // a query per row would make opening the picker scale with how many
+    // sessions have accumulated.
+    let mut last = store::last_messages(&conn)?;
     Ok(store::list_sessions(&conn)?
         .into_iter()
-        .map(SessionRow::from)
+        .map(|summary| {
+            let mut row = SessionRow::from(summary);
+            row.last = last.remove(&row.id);
+            row
+        })
         .collect())
 }
 
@@ -112,10 +124,13 @@ fn load_sessions() -> Result<Vec<SessionRow>> {
 /// The launch screen, grouped by whether each session belongs to the
 /// directory the process is in right now.
 fn launch_picker() -> Result<Picker> {
-    let cwd = std::env::current_dir()
+    Ok(Picker::launch(load_sessions()?, current_dir().as_deref()))
+}
+
+fn current_dir() -> Option<String> {
+    std::env::current_dir()
         .ok()
-        .map(|dir| dir.display().to_string());
-    Ok(Picker::launch(load_sessions()?, cwd.as_deref()))
+        .map(|dir| dir.display().to_string())
 }
 
 fn open_new(context: &Context, agentic: bool, title: String) -> Result<Chat> {
@@ -397,6 +412,7 @@ fn draw(terminal: &mut Tui, screen: &Screen, tick: usize) -> Result<()> {
             p,
             "comms",
             "↑/↓ move · Enter open · r rename · d delete · q quit",
+            tick,
         ),
         Screen::NameSession { input } => picker::draw_naming(frame, input),
         Screen::Chat(chat) => render::draw(frame, &chat.app, tick),
@@ -407,6 +423,7 @@ fn draw(terminal: &mut Tui, screen: &Screen, tick: usize) -> Result<()> {
 async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) -> Result<()> {
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
+    let mut last_refresh = std::time::Instant::now();
     let mut tick = 0usize;
     let mut quit = false;
 
@@ -451,6 +468,24 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
                 if matches!(screen, Screen::Chat(chat) if chat.app.busy) {
                     tick = tick.wrapping_add(1);
                     dirty = true;
+                }
+                // The picker animates too, but only while it has something
+                // to animate: a list of idle sessions shouldn't repaint ten
+                // times a second for nothing.
+                if matches!(screen, Screen::Launch(p) if p.has_working_session()) {
+                    tick = tick.wrapping_add(1);
+                    dirty = true;
+                }
+                // Sessions move on while the picker is open — including ones
+                // running in another terminal — so it re-reads rather than
+                // showing whatever was true when it was opened.
+                if let Screen::Launch(p) = screen {
+                    if last_refresh.elapsed() >= SESSION_REFRESH {
+                        last_refresh = std::time::Instant::now();
+                        if p.refresh(load_sessions()?, current_dir().as_deref()) {
+                            dirty = true;
+                        }
+                    }
                 }
             }
         }

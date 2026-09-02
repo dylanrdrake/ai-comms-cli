@@ -14,6 +14,30 @@ use colored::*;
 use std::future::Future;
 use std::io::{self, Write};
 
+/// Writes what the session is doing while a turn runs, for anything watching
+/// the list of sessions.
+///
+/// Holds its own database handle rather than borrowing the session: the turn
+/// already has that borrowed mutably for the whole call, and an approval
+/// prompt happens in the middle of it.
+pub struct ActivityWriter {
+    conn: rusqlite::Connection,
+    session_id: String,
+}
+
+impl ActivityWriter {
+    pub fn new(session_id: String) -> Result<Self> {
+        Ok(ActivityWriter {
+            conn: crate::store::open_db()?,
+            session_id,
+        })
+    }
+
+    fn set(&self, activity: Option<crate::store::Activity>, detail: Option<&str>) {
+        let _ = crate::store::set_session_activity(&self.conn, &self.session_id, activity, detail);
+    }
+}
+
 pub struct TerminalAgentUi {
     /// Mirrors the `-v` flag: gates the full argument/result dump. The
     /// marker-and-name notice below it — matching what the TUI always shows
@@ -27,6 +51,9 @@ pub struct TerminalAgentUi {
     show_model_label: bool,
     /// Live only between `RequestStarted` and `RequestFinished`.
     spinner: Option<Spinner>,
+    /// Set for a `session`, which is watchable from the picker; `None` for a
+    /// one-shot `agent`, which nobody is monitoring.
+    activity: Option<ActivityWriter>,
     /// The call's arguments, held from `ToolCallStarted` to whichever event
     /// settles it, so the notice that settles it can still name the file
     /// or command being acted on, and so `ToolCallCompleted` can tell a
@@ -50,6 +77,12 @@ pub struct TerminalAgentUi {
 }
 
 impl TerminalAgentUi {
+    /// Starts reporting what this session is doing while turns run, so a
+    /// CLI session shows up in the picker the way a TUI one does.
+    pub fn watch(&mut self, activity: ActivityWriter) {
+        self.activity = Some(activity);
+    }
+
     pub fn new(verbose: bool, show_model_label: bool) -> Self {
         TerminalAgentUi {
             verbose,
@@ -58,6 +91,7 @@ impl TerminalAgentUi {
             pending_arguments: None,
             tool_header_open: false,
             approval_shown: false,
+            activity: None,
         }
     }
 
@@ -215,6 +249,23 @@ impl TerminalAgentUi {
     /// The blocking stdin prompt behind [`AgentUi::approve`], kept separate
     /// so the async wrapper stays trivial.
     fn prompt_approval(&mut self, request: ApprovalRequest) -> Result<bool> {
+        // Announced before the prompt blocks on stdin: this is exactly the
+        // state worth seeing from another terminal, and it's the one a
+        // blocking loop would otherwise never report.
+        if let Some(activity) = &self.activity {
+            activity.set(
+                Some(crate::store::Activity::AwaitingApproval),
+                Some(&crate::ui::approval_summary(&request)),
+            );
+        }
+        let answered = self.ask_approval(request);
+        if let Some(activity) = &self.activity {
+            activity.set(Some(crate::store::Activity::Working), None);
+        }
+        answered
+    }
+
+    fn ask_approval(&mut self, request: ApprovalRequest) -> Result<bool> {
         // Closes the tool-call header with a trailing `?`, matching the
         // TUI transcript's `AwaitingApproval` marker, before the prompt
         // itself — which has no TUI transcript equivalent (that lives in

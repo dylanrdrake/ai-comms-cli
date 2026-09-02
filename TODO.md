@@ -9,7 +9,6 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
-* ready, thinking/working, approval pending, done check, tool call. do we need to poll the messages table?
 * steering: send while a turn is running and have it join that turn, not the next
   one. Inject drained messages as user messages at the TOP of a run_agent_turn
   iteration only — never between an assistant's tool_calls and its tool results,
@@ -20,6 +19,17 @@ NEXT:
   model call, not mid-request. TUI first: it already accepts input mid-turn.
   Show it: a growing list of pending messages above the message input, so what
   is waiting to join the turn is visible rather than implied by a count.
+* picker refresh decrypts every session title and every session's last message
+  every 2s, regardless of how many rows are on screen. Fine now — it scales with
+  how many sessions you've accumulated, not with the screen — but that's the
+  thing that would eventually want attention. Options if it does: only decrypt
+  rows that are visible, or cache by (session id, updated_at) so an unchanged
+  session isn't decrypted again.
+* the client's timeouts are hardcoded in client.rs and can't be configured:
+  CONNECT_TIMEOUT 20s, REQUEST_TIMEOUT 300s, STREAM_IDLE_TIMEOUT 90s, plus
+  tools.rs's 30s default for a terminal command when the model doesn't give one.
+  The 90s stream idle one has stalled real turns twice. Would follow the same
+  shape as sandbox/verbose: seeded config fields, `comms <name> <value>`.
 * Websearch
 * project-scoped sessions via a .comms/ folder, like .git: walk up from cwd to
   find it, sessions live there. Bigger than storing working_dir (which is done):

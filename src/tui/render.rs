@@ -6,7 +6,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 /// Spinner frames, reused from the CLI's so both front ends feel the same.
-const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Shared with the picker's working badge, so a busy session animates the
+/// same way wherever it's shown.
+pub(super) const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Most rows the message box will grow to before it scrolls internally,
 /// so a long paste can't squeeze the conversation off the screen.

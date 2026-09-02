@@ -1441,6 +1441,17 @@ async fn cmd_session(
     // Seeded from the session rather than hardcoded, so a resumed session
     // that had `/verbose` on comes back showing detail.
     let mut ui = TerminalAgentUi::new(session.verbose(), false);
+    // Lets a CLI session report approvals the way a TUI one does — the
+    // prompt blocks on stdin, so without this it would look merely busy to
+    // anyone watching the picker.
+    match terminal_ui::ActivityWriter::new(session.id().to_string()) {
+        Ok(activity) => ui.watch(activity),
+        // Not being watchable is no reason to refuse to run.
+        Err(e) => eprintln!(
+            "{} Session activity won't be reported: {e}",
+            "note:".bright_black()
+        ),
+    }
 
     loop {
         let readline = rl.readline(&format!("{} ", "❯".green().bold()));
@@ -1479,6 +1490,11 @@ async fn cmd_session(
                 let effort_level = session.effort_level().map(str::to_string);
                 let temperature = session.temperature();
                 let session_stream = session.stream();
+                // Coarser than the TUI's, which sees approvals through its
+                // worker: a blocking loop has no such seam. Working and
+                // failed are still the two that a list of sessions most
+                // needs, and both are visible from here.
+                session.set_activity(Some(store::Activity::Working), None);
                 let turn = if session.is_agentic() {
                     let max_iterations = session.max_iterations();
                     let gates = SessionGates::new(session.approval().clone(), session.sandbox());
@@ -1507,6 +1523,7 @@ async fn cmd_session(
                     .await
                 };
 
+                let failed = turn.is_err();
                 match turn {
                     // The reply itself, and its trailing blank line, are
                     // printed by the UI now — one blank line after every
@@ -1514,6 +1531,7 @@ async fn cmd_session(
                     Ok(Some(_)) | Ok(None) => {}
                     Err(e) => println!("{} {}\n", "✗".red(), e),
                 }
+                session.set_activity(failed.then_some(store::Activity::Failed), None);
 
                 if let Err(e) = session.persist_pending() {
                     eprintln!("{} Failed to save message: {}", "✗".red(), e);

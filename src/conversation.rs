@@ -14,6 +14,7 @@ use crate::agent;
 use crate::client::Client;
 use crate::config::{ApprovalSettings, SessionGates};
 use crate::session::ChatSession;
+use crate::store::Activity;
 use crate::ui::{AgentEvent, AgentUi, ApprovalRequest, Submission};
 use anyhow::Result;
 use std::collections::VecDeque;
@@ -336,8 +337,11 @@ impl Worker {
             }
         }
 
-        // The front end has gone; if the conversation was never actually
-        // used, don't leave an empty session behind.
+        // The front end has gone. Clear any activity first: a `working` left
+        // behind would show as busy forever in everyone else's list.
+        self.session.set_activity(None, None);
+        // If the conversation was never actually used, don't leave an empty
+        // session behind.
         let _ = self.session.discard_if_unused();
     }
 
@@ -350,10 +354,12 @@ impl Worker {
         self.session.push_user(text.clone());
         let _ = self.events.send(Event::UserMessage(text));
         let _ = self.events.send(Event::Busy(true));
+        self.session.set_activity(Some(Activity::Working), None);
 
         // The agent loop runs on its own task so commands stay responsive
         // while it works; `approvals` carries decisions back into it.
-        let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<oneshot::Sender<bool>>();
+        let (approval_tx, mut approval_rx) =
+            mpsc::unbounded_channel::<(ApprovalRequest, oneshot::Sender<bool>)>();
         let ui = ChannelUi {
             events: self.events.clone(),
             approvals: approval_tx,
@@ -404,6 +410,9 @@ impl Worker {
         // A oneshot waiting on the user's answer to an approval prompt, if
         // one is currently outstanding.
         let mut pending_approval: Option<oneshot::Sender<bool>> = None;
+        // Outlives the turn as an activity, so a session that broke can be
+        // found from the list rather than only from its transcript.
+        let mut failed = false;
 
         let outcome = loop {
             tokio::select! {
@@ -414,11 +423,13 @@ impl Worker {
                 finished = &mut turn => {
                     match finished {
                         Ok((result, messages)) => {
+                            failed = result.is_err();
                             self.absorb(result, messages);
                             break TurnOutcome::Completed;
                         }
                         Err(e) if e.is_cancelled() => break TurnOutcome::Cancelled,
                         Err(e) => {
+                            failed = true;
                             let _ = self.events.send(Event::Agent(AgentEvent::Error {
                                 message: format!("Turn failed: {e}"),
                             }));
@@ -428,7 +439,14 @@ impl Worker {
                 }
 
                 request = approval_rx.recv() => {
-                    if let Some(responder) = request {
+                    if let Some((request, responder)) = request {
+                        // Recorded with the request itself: a list of
+                        // sessions is far more useful saying *what* is being
+                        // asked than merely that something is.
+                        self.session.set_activity(
+                            Some(Activity::AwaitingApproval),
+                            Some(&crate::ui::approval_summary(&request)),
+                        );
                         pending_approval = Some(responder);
                     }
                 }
@@ -441,6 +459,7 @@ impl Worker {
                         }
                         Some(Command::Approve(allowed)) => {
                             if let Some(responder) = pending_approval.take() {
+                                self.session.set_activity(Some(Activity::Working), None);
                                 let _ = responder.send(allowed);
                             }
                         }
@@ -491,6 +510,10 @@ impl Worker {
         };
 
         self.persist();
+        // Cleared on success: the stored messages already say what happened,
+        // and this column only speaks when they can't.
+        self.session
+            .set_activity(failed.then_some(Activity::Failed), None);
         let _ = self.events.send(Event::Busy(false));
         outcome
     }
@@ -697,7 +720,7 @@ enum TurnOutcome {
 /// the worker resolves once the user answers.
 struct ChannelUi {
     events: mpsc::UnboundedSender<Event>,
-    approvals: mpsc::UnboundedSender<oneshot::Sender<bool>>,
+    approvals: mpsc::UnboundedSender<(ApprovalRequest, oneshot::Sender<bool>)>,
 }
 
 impl AgentUi for ChannelUi {
@@ -714,8 +737,8 @@ impl AgentUi for ChannelUi {
             // Announce the request, then register the responder, so a front
             // end can never see the prompt before we're able to take its
             // answer.
-            let _ = events.send(Event::ApprovalRequested(request));
-            if approvals.send(tx).is_err() {
+            let _ = events.send(Event::ApprovalRequested(request.clone()));
+            if approvals.send((request, tx)).is_err() {
                 return Ok(false);
             }
             // A dropped responder (front end gone, turn cancelled) denies,

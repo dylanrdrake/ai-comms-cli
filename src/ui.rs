@@ -273,6 +273,22 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
     ]
 }
 
+/// One line naming what an approval is asking about, for a list that has a
+/// row per session.
+///
+/// Shared by both front ends deliberately: a session shows the same row in
+/// the picker whether it's being run from the TUI or the CLI, and two copies
+/// of this would eventually disagree about what that row says. The tool
+/// alone is too vague to act on — `write_file` is a different decision
+/// depending on the file — so it carries the same file-or-command the
+/// transcript shows.
+pub fn approval_summary(request: &ApprovalRequest) -> String {
+    match primary_argument(&request.arguments) {
+        Some(detail) => format!("{}: {detail}", request.tool_name),
+        None => request.tool_name.clone(),
+    }
+}
+
 /// How this session's name reads back to the user.
 pub fn title_notice(title: &str, changed: bool) -> String {
     let verb = if changed { "renamed to" } else { "is" };
@@ -1176,6 +1192,36 @@ mod tests {
         assert_eq!(
             classify("/session title  Fix  the   parser  "),
             Submission::SetTitle("Fix  the   parser".to_string())
+        );
+    }
+
+    #[test]
+    fn an_approval_summary_names_what_is_being_asked() {
+        // A row that says only "needs approval" tells you nothing you can
+        // act on; the file or command is the decision.
+        let request = |tool: &str, arguments: &str| ApprovalRequest {
+            tool_name: tool.to_string(),
+            category: "write",
+            arguments: arguments.to_string(),
+        };
+
+        assert_eq!(
+            approval_summary(&request("write_file", r#"{"filepath":"src/main.rs"}"#)),
+            "write_file: src/main.rs"
+        );
+        assert_eq!(
+            approval_summary(&request(
+                "run_terminal_command",
+                r#"{"command":"rm -rf build"}"#
+            )),
+            "run_terminal_command: rm -rf build"
+        );
+        // Arguments with nothing worth naming fall back to the tool alone
+        // rather than to something misleading.
+        assert_eq!(approval_summary(&request("list_files", "{}")), "list_files");
+        assert_eq!(
+            approval_summary(&request("read_file", "not json")),
+            "read_file"
         );
     }
 

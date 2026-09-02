@@ -353,6 +353,13 @@ impl ChatSession {
         self.stream
     }
 
+    /// Says what this session's process is doing, for anything watching the
+    /// list, or clears it with `None`. Best-effort: failing to announce a
+    /// state is no reason to interrupt the turn producing it.
+    pub fn set_activity(&self, activity: Option<store::Activity>, detail: Option<&str>) {
+        let _ = store::set_session_activity(&self.conn, &self.id, activity, detail);
+    }
+
     /// The directory this session was started in, if it recorded one.
     pub fn working_dir(&self) -> Option<&str> {
         self.working_dir.as_deref()
@@ -545,6 +552,8 @@ mod tests {
                 sandbox            INTEGER NOT NULL DEFAULT 1,
                 stream             INTEGER NOT NULL DEFAULT 1,
                 working_dir        TEXT,
+                activity           TEXT,
+                activity_detail    TEXT,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
