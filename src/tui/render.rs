@@ -25,17 +25,23 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
         Some(request) => approval_lines(request).len() as u16 + 2,
         None => input_lines(&app.input, frame.area().width.saturating_sub(2)).len() as u16,
     };
+    // Messages waiting to be sent get a box of their own above the prompt,
+    // and no space at all when nothing is waiting.
+    let pending_rows = pending_height(app.pending.len());
+
     let input_rows = content_rows
         .clamp(1, MAX_INPUT_ROWS)
         // Never take so much that the conversation has nowhere to go. The
         // reserve covers the title row, the rule under it, the input box's
-        // own two border rows, and the settings/key-binding rows below it.
-        .min(frame.area().height.saturating_sub(7).max(1));
+        // own two border rows, the settings/key-binding rows below it, and
+        // whatever the pending box is using.
+        .min(frame.area().height.saturating_sub(7 + pending_rows).max(1));
 
     let areas = Layout::vertical([
         Constraint::Length(1),              // session title
         Constraint::Length(1),              // rule
         Constraint::Min(1),                 // chat history
+        Constraint::Length(pending_rows),   // messages waiting, if any
         Constraint::Length(input_rows + 2), // message prompt, bordered, plus its borders
         Constraint::Length(1),              // settings: ask/agent, model, effort, temp, verbose
         Constraint::Length(1),              // key bindings
@@ -45,9 +51,94 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
     draw_title(frame, areas[0], app);
     draw_rule(frame, areas[1], None);
     let scrolled = draw_transcript(frame, areas[2], app);
-    draw_input(frame, areas[3], app, scrolled);
-    draw_settings(frame, areas[4], app, tick);
-    draw_keybindings(frame, areas[5]);
+    if pending_rows > 0 {
+        draw_pending(frame, areas[3], app);
+    }
+    draw_input(frame, areas[4], app, scrolled);
+    draw_settings(frame, areas[5], app, tick);
+    draw_keybindings(frame, areas[6]);
+}
+
+/// At most this many waiting messages are listed; the rest are summarised.
+const PENDING_ROWS: usize = 5;
+
+/// How tall the pending box is for `waiting` messages — its rows, its two
+/// borders, and a blank row above it so it doesn't sit flush against the last
+/// line of the conversation. Zero when nothing is waiting, so the box
+/// disappears rather than sitting there empty.
+fn pending_height(waiting: usize) -> u16 {
+    if waiting == 0 {
+        return 0;
+    }
+    let listed = waiting.min(PENDING_ROWS);
+    let overflow = usize::from(waiting > PENDING_ROWS);
+    (listed + overflow) as u16 + 2 + PENDING_GAP
+}
+
+/// The blank row between the transcript and the box.
+const PENDING_GAP: u16 = 1;
+
+/// The messages typed while a turn is running, in the order they will be
+/// taken.
+///
+/// The title says where they are headed, which differs by mode: in agent
+/// mode the next iteration takes them into the turn already running, and in
+/// ask mode they wait for it to finish. It reads the session's current mode,
+/// so switching with `/agent` mid-turn makes the title disagree with where a
+/// message will actually go until that turn ends — rare, and cheaper to live
+/// with than threading the turn's own captured mode out to the front end.
+fn draw_pending(frame: &mut Frame, area: Rect, app: &App) {
+    let title = if app.agentic {
+        " joining this turn "
+    } else {
+        " next turn "
+    };
+    let width = area.width.saturating_sub(2).max(1) as usize;
+
+    let mut lines: Vec<Line> = app
+        .pending
+        .iter()
+        .take(PENDING_ROWS)
+        .map(|text| Line::from(Span::styled(clip(text, width), Style::new().dark_gray())))
+        .collect();
+    if app.pending.len() > PENDING_ROWS {
+        lines.push(Line::from(Span::styled(
+            format!("+{} more", app.pending.len() - PENDING_ROWS),
+            Style::new().dark_gray().italic(),
+        )));
+    }
+
+    // The gap `pending_height` reserved is simply left unpainted.
+    let box_area = Rect {
+        y: area.y + PENDING_GAP,
+        height: area.height.saturating_sub(PENDING_GAP),
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().dark_gray())
+                .title(Span::styled(title, Style::new().dark_gray().italic())),
+        ),
+        box_area,
+    );
+}
+
+/// One row's worth of a message: newlines flattened so a multi-line message
+/// stays one entry, and clipped with an ellipsis to fit.
+fn clip(text: &str, width: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' { ' ' } else { c })
+        .collect();
+    if flat.chars().count() <= width {
+        return flat;
+    }
+    match width {
+        0 => String::new(),
+        _ => format!("{}…", flat.chars().take(width - 1).collect::<String>()),
+    }
 }
 
 /// The session's title, plain — no border, no "comms -" prefix.
@@ -432,9 +523,10 @@ fn temperature_style(temperature: Option<f32>) -> Style {
 }
 
 /// Every controllable setting in one row below the message prompt: ready/
-/// busy, ask/agent mode, model, effort, temperature, verbose, and how many
-/// messages are queued — everything `/model`, `/agent`, `/effort`,
-/// `/temperature`, `/verbose`, etc. can change.
+/// busy, ask/agent mode, model, effort, temperature and verbose — everything
+/// `/model`, `/agent`, `/effort`, `/temperature`, `/verbose`, etc. can
+/// change. What is waiting to be sent is its own box above the prompt, since
+/// a count can't say which message is about to land.
 fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let mut spans = Vec::new();
 
@@ -480,13 +572,6 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
             Style::new().dark_gray()
         },
     ));
-
-    if app.queued > 0 {
-        spans.push(Span::styled(
-            format!("· {} queued ", app.queued),
-            Style::new().dark_gray(),
-        ));
-    }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1082,13 +1167,89 @@ mod tests {
     }
 
     #[test]
-    fn busy_state_shows_spinner_and_queue_depth() {
+    fn busy_state_shows_the_spinner() {
         let mut app = sample_app();
         app.busy = true;
-        app.queued = 2;
         let out = render_to_string(&app, 80, 15);
         assert!(out.contains("working"), "{out}");
-        assert!(out.contains("2 queued"), "{out}");
+    }
+
+    #[test]
+    fn nothing_waiting_means_no_box_at_all() {
+        let app = sample_app();
+        let out = render_to_string(&app, 80, 15);
+        assert!(!out.contains("joining this turn"), "{out}");
+        assert!(!out.contains("next turn"), "{out}");
+    }
+
+    #[test]
+    fn waiting_messages_are_listed_above_the_prompt() {
+        let mut app = sample_app();
+        app.busy = true;
+        app.agentic = true;
+        app.pending
+            .push_back("check the Windows path too".to_string());
+        app.pending.push_back("and skip the slow tests".to_string());
+
+        let out = render_to_string(&app, 80, 18);
+        assert!(out.contains("joining this turn"), "{out}");
+        assert!(out.contains("check the Windows path too"), "{out}");
+        assert!(out.contains("and skip the slow tests"), "{out}");
+        // The count moved out of the settings row and into the box.
+        assert!(!out.contains("queued"), "{out}");
+    }
+
+    #[test]
+    fn the_title_says_where_a_waiting_message_is_headed() {
+        let mut app = sample_app();
+        app.agentic = false;
+        app.pending.push_back("run it again".to_string());
+        let out = render_to_string(&app, 80, 18);
+        assert!(out.contains("next turn"), "{out}");
+        assert!(!out.contains("joining this turn"), "{out}");
+    }
+
+    #[test]
+    fn a_long_queue_is_summarised_rather_than_filling_the_screen() {
+        let mut app = sample_app();
+        for n in 0..8 {
+            app.pending.push_back(format!("message {n}"));
+        }
+        let out = render_to_string(&app, 80, 22);
+        assert!(out.contains("message 0"), "{out}");
+        assert!(out.contains("message 4"), "{out}");
+        assert!(!out.contains("message 5"), "{out}");
+        assert!(out.contains("+3 more"), "{out}");
+    }
+
+    #[test]
+    fn the_box_yields_before_the_transcript_does() {
+        // Eight waiting messages want more rows than a short terminal has.
+        // Whatever gives, the conversation keeps a row and nothing panics.
+        let mut app = sample_app();
+        for n in 0..8 {
+            app.pending.push_back(format!("message {n}"));
+        }
+        let out = render_to_string(&app, 60, 10);
+        assert!(out.contains("hi there"), "{out}");
+    }
+
+    #[test]
+    fn pending_box_is_only_as_tall_as_it_needs() {
+        assert_eq!(pending_height(0), 0, "no box when nothing waits");
+        assert_eq!(pending_height(1), 4, "one row, two borders, the gap");
+        assert_eq!(pending_height(PENDING_ROWS), PENDING_ROWS as u16 + 3);
+        // Past the cap it stops growing except for the "+N more" line.
+        assert_eq!(pending_height(PENDING_ROWS + 1), PENDING_ROWS as u16 + 4);
+        assert_eq!(pending_height(100), PENDING_ROWS as u16 + 4);
+    }
+
+    #[test]
+    fn a_waiting_message_is_one_row_however_it_was_typed() {
+        assert_eq!(clip("two\nlines", 20), "two lines");
+        assert_eq!(clip("abcdefgh", 4), "abc…");
+        assert_eq!(clip("abcd", 4), "abcd");
+        assert_eq!(clip("abc", 0), "");
     }
 
     #[test]

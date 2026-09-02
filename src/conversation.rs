@@ -94,9 +94,17 @@ pub enum Event {
     /// A turn began or ended. Front ends use this to show busy state and to
     /// decide whether a new message sends immediately or queues.
     Busy(bool),
-    /// A message was accepted but won't be sent until the current turn ends.
+    /// A message was accepted while a turn was running, so it is waiting
+    /// rather than being sent. Carries the text so a front end can show what
+    /// is waiting, not only how many: in agent mode this message is about to
+    /// change what the model does next.
+    ///
+    /// There is no matching "dequeued" event. A waiting message leaves by
+    /// being taken into the running turn ([`AgentEvent::Steered`]) or by
+    /// starting one of its own ([`Event::UserMessage`]), and both already
+    /// carry the text.
     Queued {
-        pending: usize,
+        text: String,
     },
     /// The in-flight turn was cancelled.
     Cancelled,
@@ -313,13 +321,9 @@ impl Worker {
                     // work, which is why this drains rather than runs once.
                     queue.push_back(text);
                     while let Some(text) = queue.pop_front() {
-                        // The count is what is still waiting, so it has to
-                        // fall as each one is taken, not only rise as they
-                        // are added — otherwise the indicator sticks at the
-                        // high-water mark for the rest of the session.
-                        let _ = self.events.send(Event::Queued {
-                            pending: queue.len(),
-                        });
+                        // Nothing to announce: `run_turn` emits UserMessage
+                        // for the message it is starting, which is how a
+                        // front end knows it stopped waiting.
                         match self.run_turn(text, &mut commands, &mut queue).await {
                             TurnOutcome::Completed => {}
                             TurnOutcome::Cancelled => {
@@ -493,13 +497,12 @@ impl Worker {
                             // the message joins the running turn. Ask mode is
                             // a single request with no seam, so it waits and
                             // becomes a turn of its own.
-                            let pending = if agentic {
-                                queue.len() + self.steering.push(text)
+                            let _ = self.events.send(Event::Queued { text: text.clone() });
+                            if agentic {
+                                self.steering.push(text);
                             } else {
                                 queue.push_back(text);
-                                queue.len()
-                            };
-                            let _ = self.events.send(Event::Queued { pending });
+                            }
                         }
                         // These apply from the next turn on; the running
                         // one already captured its model/mode/effort.
@@ -539,13 +542,10 @@ impl Worker {
         // reached, the turn failed, or it was cancelled — and losing one
         // that was typed is the worst outcome available here. Anything the
         // loop never took becomes its own turn instead.
+        // Nothing is announced: as far as a front end is concerned these
+        // never stopped waiting, only the store holding them changed.
         for text in self.steering.take() {
             queue.push_back(text);
-        }
-        if !queue.is_empty() {
-            let _ = self.events.send(Event::Queued {
-                pending: queue.len(),
-            });
         }
 
         self.persist();

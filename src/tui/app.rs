@@ -8,6 +8,7 @@ use crate::config::ApprovalSettings;
 use crate::conversation::Event;
 pub use crate::ui::{classify, Submission};
 use crate::ui::{AgentEvent, ApprovalRequest};
+use std::collections::VecDeque;
 
 /// One rendered block of the conversation.
 ///
@@ -85,7 +86,10 @@ pub struct App {
     pub cursor: usize,
     pub focus: Focus,
     pub busy: bool,
-    pub queued: usize,
+    /// Messages typed while a turn was running, in the order they will be
+    /// taken. Held as the text rather than a count so the box above the
+    /// prompt can show what is waiting; the count is just its length.
+    pub pending: VecDeque<String>,
     pub pending_approval: Option<ApprovalRequest>,
     /// Lines scrolled up from the bottom. 0 means pinned to the newest
     /// content, which is where it stays unless the user scrolls back.
@@ -147,7 +151,7 @@ impl App {
             cursor: 0,
             focus: Focus::Input,
             busy: false,
-            queued: 0,
+            pending: VecDeque::new(),
             pending_approval: None,
             scroll_back: 0,
             model,
@@ -180,7 +184,12 @@ impl App {
     /// Folds one worker event into the view.
     pub fn apply(&mut self, event: Event) {
         match event {
-            Event::UserMessage(text) => self.transcript.push(TranscriptItem::User(text)),
+            Event::UserMessage(text) => {
+                // A message that was waiting has started its own turn. Does
+                // nothing for one sent while idle, which never waited.
+                self.take_pending(&text);
+                self.transcript.push(TranscriptItem::User(text));
+            }
             Event::Busy(busy) => {
                 self.busy = busy;
                 if !busy {
@@ -190,10 +199,10 @@ impl App {
                     self.finish_streaming();
                 }
             }
-            Event::Queued { pending } => self.queued = pending,
+            Event::Queued { text } => self.pending.push_back(text),
             Event::Cancelled => {
                 self.finish_streaming();
-                self.queued = 0;
+                self.pending.clear();
                 self.pending_approval = None;
                 self.focus = Focus::Input;
                 // Any tool frozen mid-flight is no longer going to resolve.
@@ -373,10 +382,8 @@ impl App {
             }
             AgentEvent::Steered { text } => {
                 self.finish_streaming();
+                self.take_pending(&text);
                 self.transcript.push(TranscriptItem::User(text));
-                // The count was raised when the message was accepted; the
-                // loop has now taken this one, so it is no longer waiting.
-                self.queued = self.queued.saturating_sub(1);
             }
             // Busy state is driven by Event::Busy, which brackets the whole
             // turn rather than each request within it.
@@ -384,6 +391,18 @@ impl App {
             | AgentEvent::RequestFinished
             | AgentEvent::IterationStarted { .. }
             | AgentEvent::TurnFinished => {}
+        }
+    }
+
+    /// Drops the first message waiting with this text, if any.
+    ///
+    /// Matched by text rather than by an id threaded through `Command`,
+    /// `Event` and `Steering`. Two identical messages waiting at once would
+    /// come out in the wrong order, which is invisible for exactly the
+    /// reason it can happen: they are identical.
+    fn take_pending(&mut self, text: &str) {
+        if let Some(at) = self.pending.iter().position(|waiting| waiting == text) {
+            self.pending.remove(at);
         }
     }
 
@@ -581,11 +600,25 @@ impl App {
 #[cfg(test)]
 mod tests {
 
+    fn queued(text: &str) -> Event {
+        Event::Queued {
+            text: text.to_string(),
+        }
+    }
+
     #[test]
-    fn a_steered_message_lands_in_the_transcript_and_leaves_the_count() {
+    fn waiting_messages_stack_in_the_order_they_will_be_taken() {
         let mut a = app();
-        a.apply(Event::Queued { pending: 2 });
-        assert_eq!(a.queued, 2);
+        a.apply(queued("check Windows too"));
+        a.apply(queued("and the seam"));
+        assert_eq!(a.pending, ["check Windows too", "and the seam"]);
+    }
+
+    #[test]
+    fn a_steered_message_leaves_the_queue_and_lands_in_the_transcript() {
+        let mut a = app();
+        a.apply(queued("check Windows too"));
+        a.apply(queued("and the seam"));
 
         a.apply(Event::Agent(AgentEvent::Steered {
             text: "check Windows too".to_string(),
@@ -599,13 +632,27 @@ mod tests {
             "{:?}",
             a.transcript.last()
         );
-        assert_eq!(a.queued, 1, "one taken, one still waiting");
-
-        a.apply(Event::Agent(AgentEvent::Steered {
-            text: "and the seam".to_string(),
-        }));
-        assert_eq!(a.queued, 0);
+        assert_eq!(a.pending, ["and the seam"], "the rest keep waiting");
     }
+
+    #[test]
+    fn a_waiting_message_leaves_when_it_starts_its_own_turn() {
+        let mut a = app();
+        a.apply(queued("run it again"));
+        a.apply(Event::UserMessage("run it again".to_string()));
+        assert!(a.pending.is_empty());
+    }
+
+    #[test]
+    fn a_message_sent_while_idle_never_waited() {
+        let mut a = app();
+        a.apply(queued("still waiting"));
+        // Nothing was queued for this one, so it must not consume an entry
+        // that belongs to a different message.
+        a.apply(Event::UserMessage("typed just now".to_string()));
+        assert_eq!(a.pending, ["still waiting"]);
+    }
+
     use super::*;
 
     fn app() -> App {
@@ -803,7 +850,7 @@ mod tests {
         ));
         assert_eq!(a.transcript[2], TranscriptItem::Notice("Cancelled".into()));
         assert_eq!(a.focus, Focus::Input);
-        assert_eq!(a.queued, 0);
+        assert!(a.pending.is_empty(), "cancelling drops what was waiting");
     }
 
     #[test]

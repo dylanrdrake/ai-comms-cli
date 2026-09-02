@@ -9,17 +9,32 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
-* drain the queue as soon as the message is sent. Look at the queue system and make sure it is getting drained propertly. especially when getting completely drained to 0 in-queue
-* steering: send while a turn is running and have it join that turn, not the next
-  one. Inject drained messages as user messages at the TOP of a run_agent_turn
-  iteration only — never between an assistant's tool_calls and its tool results,
-  which breaks tool_use/tool_result pairing. Shared handle like SessionGates.
-  Falls back to queueing in ask mode (no loop to inject into), at the
-  max_iterations boundary, and for anything left undrained when a turn ends —
-  losing a typed message is the worst failure here. Takes effect at the next
-  model call, not mid-request. TUI first: it already accepts input mid-turn.
-  Show it: a growing list of pending messages above the message input, so what
-  is waiting to join the turn is visible rather than implied by a count.
+* a box above the prompt input showing what is waiting, not just how many.
+  It appears when the first message lands in the queue and disappears when the
+  last one leaves; messages stack in it as they are typed and pop out as they
+  are consumed — taken into the running turn in agent mode, or started as
+  their own turn in ask mode. The settings row's `N queued` says only how many
+  and can't say which, and a steered message is about to change what the model
+  does, so seeing the text before it lands is worth more than the count.
+  Design notes: the box needs its own layout constraint between the transcript
+  and the input, and a cap on height with a "+N more" line, since the queue is
+  unbounded. Popping the right entry needs the front end to know *which*
+  message left, not just that one did — `AgentEvent::Steered` carries the text
+  already, but the queue-drain path emits `Event::Queued { pending }`, a count
+  with no identity, so that event has to say what it took.
+* Websearch
+* a steered message is lost if the turn it joined is cancelled. `absorb` runs
+  only on the arm where a turn completes (conversation.rs), so cancelling
+  discards everything the task accumulated — which is intended, except that a
+  steered message is the one *user* message in that set. The turn's opening
+  message is pushed onto the session before the task spawns and survives; a
+  steered one lives only in the task's copy and does not. On screen you see
+  both, in the database only the first, and a resume shows the difference.
+  Low severity (explicit cancel only, and the turn was discarded anyway) but
+  asymmetric. The obvious fix — have the worker push onto the session when it
+  accepts the message — collides with `absorb`, which reconciles by skipping
+  the messages the session already has and taking the rest from the task's
+  copy; pushing in both places double-counts. Needs thought, not a patch.
 * think about being able to access the same session from 2 different terminals/processes
 * picker refresh decrypts every session title and every session's last message
   every 2s, regardless of how many rows are on screen. Fine now — it scales with
@@ -43,7 +58,6 @@ NEXT:
   tools.rs's 30s default for a terminal command when the model doesn't give one.
   The 90s stream idle one has stalled real turns twice. Would follow the same
   shape as sandbox/verbose: seeded config fields, `comms <name> <value>`.
-* Websearch
 * project-scoped sessions via a .comms/ folder, like .git: walk up from cwd to
   find it, sessions live there. Bigger than storing working_dir (which is done):
   it changes WHERE state lives. Costs to weigh first — storage splits from one

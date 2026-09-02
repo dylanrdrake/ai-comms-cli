@@ -607,10 +607,26 @@ finishes. The same fallback applies in agent mode if the turn ends before the
 loop takes what you typed — the iteration cap was reached, the turn failed,
 or you cancelled.
 
-The settings row shows `· N queued` for messages that are waiting. That count
-drops as the loop takes them, and each one appears in the transcript at the
-point it actually joined, so the conversation reads in the order the model
-saw it. Cancelling a turn with `Esc` drops anything still waiting.
+A box appears above the message input as soon as something is waiting, and
+disappears when the last one leaves. It lists the messages in the order they
+will be taken, and its title says where they are headed — `joining this turn`
+in agent mode, `next turn` in ask mode:
+
+```
+╭─ joining this turn ────────────────────────╮
+│check the Windows path too                  │
+│and skip the slow tests                     │
+╰────────────────────────────────────────────╯
+╭────────────────────────────────────────────╮
+│                                            │
+╰────────────────────────────────────────────╯
+ ⠋ working · agent · sonnet-5 · 🧠 high
+```
+
+Each message drops out of the box as it is consumed and appears in the
+transcript at the point it actually joined, so the conversation reads in the
+order the model saw it. Past five waiting, the rest are summarised as
+`+N more`. Cancelling a turn with `Esc` drops anything still waiting.
 
 ### Where a setting lives
 
