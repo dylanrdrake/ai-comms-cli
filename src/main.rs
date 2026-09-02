@@ -1504,6 +1504,10 @@ async fn cmd_session(
                         &gates,
                         effort_level,
                         session_stream,
+                        // Nowhere to type while this loop runs — it reads a
+                        // line, works, then reads the next one. The TUI is
+                        // where a message can join a turn in progress.
+                        &agent::Steering::default(),
                     )
                     .await
                 } else {

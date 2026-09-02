@@ -8,9 +8,11 @@
 //! channels and never touches the loop directly.
 //!
 //! The design assumes exactly one turn in flight at a time. Sending while
-//! busy queues; cancelling aborts the in-flight turn and drains the queue.
+//! busy joins that turn in agent mode, where the loop has iterations to
+//! inject between, and queues in ask mode, where a single request has no
+//! seam; cancelling aborts the in-flight turn and drops both.
 
-use crate::agent;
+use crate::agent::{self, Steering};
 use crate::client::Client;
 use crate::config::{ApprovalSettings, SessionGates};
 use crate::session::ChatSession;
@@ -230,6 +232,7 @@ impl Conversation {
             // Built before the session moves in, and shared with every turn
             // this worker spawns so a mid-turn `/approval` reaches it.
             gates: SessionGates::new(session.approval().clone(), session.sandbox()),
+            steering: Steering::default(),
             session,
             max_iterations,
             temperature,
@@ -289,6 +292,11 @@ struct Worker {
     /// typed mid-turn applies to the turn's next tool call — see
     /// [`ApprovalGates`].
     gates: SessionGates,
+    /// Messages typed while a turn is running. Like `gates`, a running turn
+    /// holds a clone, so what is typed reaches the turn already in progress
+    /// rather than the one after it. Only agent mode can use it: a single
+    /// request has no seam to inject at, so ask mode queues instead.
+    steering: Steering,
     events: mpsc::UnboundedSender<Event>,
 }
 
@@ -305,6 +313,13 @@ impl Worker {
                     // work, which is why this drains rather than runs once.
                     queue.push_back(text);
                     while let Some(text) = queue.pop_front() {
+                        // The count is what is still waiting, so it has to
+                        // fall as each one is taken, not only rise as they
+                        // are added — otherwise the indicator sticks at the
+                        // high-water mark for the rest of the session.
+                        let _ = self.events.send(Event::Queued {
+                            pending: queue.len(),
+                        });
                         match self.run_turn(text, &mut commands, &mut queue).await {
                             TurnOutcome::Completed => {}
                             TurnOutcome::Cancelled => {
@@ -372,6 +387,7 @@ impl Worker {
         let max_iterations = self.session.max_iterations();
         let temperature = self.session.temperature();
         let gates = self.gates.clone();
+        let steering = self.steering.clone();
         // Snapshotted per turn, like model and effort: streaming shapes how
         // the next request is made, not what a running tool may do.
         let stream = self.session.stream();
@@ -390,6 +406,7 @@ impl Worker {
                     &gates,
                     effort_level,
                     stream,
+                    &steering,
                 )
                 .await
             } else {
@@ -472,8 +489,17 @@ impl Worker {
                             break TurnOutcome::Cancelled;
                         }
                         Some(Command::Send(text)) => {
-                            queue.push_back(text);
-                            let _ = self.events.send(Event::Queued { pending: queue.len() });
+                            // Agent mode has iterations to inject between, so
+                            // the message joins the running turn. Ask mode is
+                            // a single request with no seam, so it waits and
+                            // becomes a turn of its own.
+                            let pending = if agentic {
+                                queue.len() + self.steering.push(text)
+                            } else {
+                                queue.push_back(text);
+                                queue.len()
+                            };
+                            let _ = self.events.send(Event::Queued { pending });
                         }
                         // These apply from the next turn on; the running
                         // one already captured its model/mode/effort.
@@ -508,6 +534,19 @@ impl Worker {
                 }
             }
         };
+
+        // A turn can end with messages still waiting — the iteration cap was
+        // reached, the turn failed, or it was cancelled — and losing one
+        // that was typed is the worst outcome available here. Anything the
+        // loop never took becomes its own turn instead.
+        for text in self.steering.take() {
+            queue.push_back(text);
+        }
+        if !queue.is_empty() {
+            let _ = self.events.send(Event::Queued {
+                pending: queue.len(),
+            });
+        }
 
         self.persist();
         // Cleared on success: the stored messages already say what happened,

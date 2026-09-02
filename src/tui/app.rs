@@ -371,6 +371,13 @@ impl App {
                 self.finish_streaming();
                 self.transcript.push(TranscriptItem::Error(message));
             }
+            AgentEvent::Steered { text } => {
+                self.finish_streaming();
+                self.transcript.push(TranscriptItem::User(text));
+                // The count was raised when the message was accepted; the
+                // loop has now taken this one, so it is no longer waiting.
+                self.queued = self.queued.saturating_sub(1);
+            }
             // Busy state is driven by Event::Busy, which brackets the whole
             // turn rather than each request within it.
             AgentEvent::RequestStarted
@@ -573,6 +580,32 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_steered_message_lands_in_the_transcript_and_leaves_the_count() {
+        let mut a = app();
+        a.apply(Event::Queued { pending: 2 });
+        assert_eq!(a.queued, 2);
+
+        a.apply(Event::Agent(AgentEvent::Steered {
+            text: "check Windows too".to_string(),
+        }));
+
+        // It reads as the user's message, at the point the loop took it —
+        // not at the end of the turn, which is when it would otherwise have
+        // been sent.
+        assert!(
+            matches!(a.transcript.last(), Some(TranscriptItem::User(text)) if text == "check Windows too"),
+            "{:?}",
+            a.transcript.last()
+        );
+        assert_eq!(a.queued, 1, "one taken, one still waiting");
+
+        a.apply(Event::Agent(AgentEvent::Steered {
+            text: "and the seam".to_string(),
+        }));
+        assert_eq!(a.queued, 0);
+    }
     use super::*;
 
     fn app() -> App {

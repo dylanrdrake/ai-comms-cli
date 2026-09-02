@@ -752,6 +752,10 @@ pub enum AgentEvent {
     ToolCallDenied { name: String },
     /// A tool ran (or failed); `result` is the JSON handed back to the model.
     ToolCallCompleted { name: String, result: String },
+    /// A message typed while the turn was running has joined it, and will
+    /// be part of the next request. Emitted in place of the usual
+    /// `UserMessage`, which only brackets the start of a turn.
+    Steered { text: String },
     /// The model answered without requesting tools, so the turn is over.
     TurnFinished,
 }

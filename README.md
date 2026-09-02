@@ -444,7 +444,7 @@ the current one instead, repointing the session there — the same thing
 
 | Key | Does |
 |---|---|
-| `Enter` | Send. If a reply is still streaming, the message is queued and sent when it finishes |
+| `Enter` | Send. If a turn is already running, see **Sending while a turn is running** below — in agent mode the message joins that turn; in ask mode it waits and becomes the next one |
 | `Esc` | Cancel the in-flight turn (kills a running tool command too) |
 | `Alt-Enter` / `Shift-Enter` | Insert a newline instead of sending. `Alt-Enter` works everywhere; `Shift-Enter` needs a terminal that supports the kitty keyboard protocol (kitty, WezTerm, Ghostty, foot, recent Alacritty), because the older input protocol can't tell `Shift-Enter` apart from `Enter` at all |
 | `↑` / `↓` | Recall previous messages into the input box |
@@ -531,6 +531,102 @@ comms sessions show a1b2c3d4
 # Delete a saved session
 comms sessions delete a1b2c3d4
 ```
+
+## Concepts
+
+Five nouns do most of the work in this codebase, and they nest. Getting them
+straight explains why some settings take effect immediately and others wait,
+why a running turn is invisible in the database, and where a message typed
+mid-turn can legally go.
+
+### The ladder
+
+**Message** — the atom. A role (`user`, `assistant`, `tool`), content, and
+optionally `tool_calls` or the `tool_call_id` answering one. Stored as a row
+per message, ordered by `seq` within its session.
+
+**Request** — one HTTP POST to `/chat/completions`. Stateless, which is the
+load-bearing part: it carries the *entire* message array every time, because
+the provider remembers nothing between calls. This is the unit that gets
+billed, times out, and rejects malformed message shapes.
+
+**Iteration** — one lap of the agent loop: a request, plus running whatever
+tools it asked for, plus appending those results to the array. Capped by
+`max-iterations`. Agent mode only — ask mode makes a single request and has
+no loop.
+
+**Turn** — one thing you typed, through to a final answer. One request in ask
+mode; one to `max-iterations` iterations in agent mode, ending when the model
+stops asking for tools, the cap is reached, or you cancel. A turn is also the
+persistence unit: its messages are written when it *finishes*, which is why a
+turn in progress leaves no trace in the messages table and why sessions carry
+a separate `activity` column for the picker to read.
+
+**Session** — a saved conversation: its messages, plus a title, a model, a
+mode, a settings snapshot, and the directory it belongs to. Survives exit,
+resumes by id.
+
+So messages make up a request, requests make up an iteration, iterations make
+up a turn, and turns make up a session.
+
+### Alongside them
+
+**Conversation** — the runtime that drives a session: it takes commands,
+emits events, and runs the agent loop on its own task so the interface stays
+responsive while a turn works. The session is the state; the conversation is
+the thing moving it. It exists only while the process runs, and nothing stops
+two processes from driving one session — see the note in TODO.
+
+**Activity** — the only thing stored about a turn that hasn't finished:
+working, awaiting approval, failed, or null for "nothing to say, read the
+messages."
+
+### Sending while a turn is running
+
+You do not have to wait for a turn to finish before typing. What happens next
+depends on whether there is a loop to join.
+
+In **agent mode**, the message joins the turn already running. A turn is many
+requests, and the message array for each one is built fresh, so the loop takes
+whatever you have typed at the top of its next iteration and includes it in
+that request. The model sees it before deciding what to do next, which means
+you can redirect work in progress — "actually, skip the tests", "check the
+Windows path too" — rather than waiting for it to finish and correcting it
+afterwards.
+
+The timing is bounded by what the turn is doing. If a tool call is running,
+your message lands as soon as that call finishes and the loop comes back
+around, because that is the first legal place to put it: a message carrying
+tool calls must be followed by their results, and nothing may come between.
+It never interrupts a request already in flight — there is no such thing in
+an OpenAI-compatible API.
+
+In **ask mode** there is one request and no loop, so there is no seam to
+inject into. The message waits and becomes its own turn when the current one
+finishes. The same fallback applies in agent mode if the turn ends before the
+loop takes what you typed — the iteration cap was reached, the turn failed,
+or you cancelled.
+
+The settings row shows `· N queued` for messages that are waiting. That count
+drops as the loop takes them, and each one appears in the transcript at the
+point it actually joined, so the conversation reads in the order the model
+saw it. Cancelling a turn with `Esc` drops anything still waiting.
+
+### Where a setting lives
+
+| Scope | Changed by | Read |
+|---|---|---|
+| Global default | `comms <setting> <value>` | when a session is created |
+| Session | `/model`, `/temperature`, … | stored on the session row |
+| Per-turn snapshot | — | once, when a turn starts |
+| Live gates | `/approval`, `/sandbox` | before every tool call |
+
+The last two rows are the distinction worth knowing. Model, effort,
+temperature and streaming are snapshotted when a turn starts, so changing one
+mid-turn applies to the *next* turn. Approval and sandbox are re-read before
+every single tool call, so changing one mid-turn applies to the turn that is
+running — which is the entire point, since revoking permission is not much
+use if it waits politely for the current work to finish.
 
 ## Agentic Tools
 

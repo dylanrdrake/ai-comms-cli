@@ -114,6 +114,12 @@ impl TerminalAgentUi {
     /// identically because both land here.
     pub async fn render_agent_event(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::Steered { text } => {
+                // Echoed back the way the prompt would have shown it, so the
+                // transcript reads in the order the model saw it rather than
+                // the message appearing to have come from nowhere.
+                println!("\n{} {}", "❯".green().bold(), text);
+            }
             AgentEvent::IterationStarted { iteration } => {
                 if self.verbose {
                     println!("{}", format!("\n[Iteration {}]", iteration).bright_black());

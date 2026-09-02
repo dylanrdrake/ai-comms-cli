@@ -5,6 +5,8 @@ use crate::ui::{AgentEvent, AgentUi, ApprovalRequest};
 use anyhow::Result;
 use futures_util::{pin_mut, StreamExt};
 use serde_json::json;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 /// Seeds a continuous agent-chat session so the model treats the growing
 /// transcript as history to build on, not a backlog of tasks to redo.
@@ -67,6 +69,7 @@ pub async fn run_agent(
         gates,
         effort_level,
         stream,
+        &Steering::default(),
     )
     .await
 }
@@ -244,6 +247,44 @@ pub async fn run_chat_turn(
 /// drives the CLI, a GUI, or a test harness unchanged.
 // See `run_agent`'s note on why this isn't bundled into a params struct.
 #[allow(clippy::too_many_arguments)]
+/// Messages typed while a turn is running, waiting to join it.
+///
+/// A turn is many requests, and the array sent with each one is built fresh,
+/// so a message can be added between them without disturbing anything in
+/// flight. The loop takes everything waiting at the top of each iteration,
+/// which is the first legal place to put it: the previous iteration's tool
+/// results have completed their pairing with the calls that produced them,
+/// and the next request has not been built yet. Slipping a user message
+/// between a `tool_calls` message and its results would make the request
+/// invalid.
+///
+/// Empty for callers with nowhere to type — a one-shot `comms agent` task
+/// has no seam to steer through, and passing an idle handle is how they say
+/// so.
+///
+/// Cheap to clone: every clone reads and writes the same queue.
+#[derive(Clone, Debug, Default)]
+pub struct Steering {
+    pending: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl Steering {
+    /// Adds a message and reports how many are now waiting.
+    pub fn push(&self, text: String) -> usize {
+        let mut pending = self.pending.lock().expect("steering queue poisoned");
+        pending.push_back(text);
+        pending.len()
+    }
+
+    /// Takes everything waiting, leaving the handle empty. Returns owned
+    /// values rather than a guard so the lock is never held across an await.
+    pub fn take(&self) -> Vec<String> {
+        let mut pending = self.pending.lock().expect("steering queue poisoned");
+        pending.drain(..).collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_turn(
     client: &Client,
     ui: &mut impl AgentUi,
@@ -254,6 +295,7 @@ pub async fn run_agent_turn(
     gates: &SessionGates,
     effort_level: Option<String>,
     stream: bool,
+    steering: &Steering,
 ) -> Result<Option<String>> {
     // Unlike `temperature`/`effort_level`, there's no provider to fall back
     // to a default for this — it never leaves the process, so a missing cap
@@ -272,6 +314,20 @@ pub async fn run_agent_turn(
 
     while iteration < max_iterations {
         iteration += 1;
+
+        // Anything typed since the last request joins the turn here, so it
+        // reaches the model on this iteration's call rather than waiting for
+        // the turn to finish and starting one of its own.
+        for text in steering.take() {
+            ui.event(AgentEvent::Steered { text: text.clone() }).await;
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(text),
+                tool_calls: None,
+                tool_call_id: None,
+                ..Default::default()
+            });
+        }
 
         ui.event(AgentEvent::IterationStarted { iteration }).await;
 
@@ -384,6 +440,83 @@ pub async fn run_agent_turn(
 
 #[cfg(test)]
 mod tests {
+
+    /// The drain happens before the request is built, so a request that
+    /// fails still proves the message was injected — and where.
+    #[tokio::test]
+    async fn a_steered_message_joins_the_turn_as_a_user_message() {
+        let config = crate::config::Config {
+            // Refused immediately, so the loop reaches its request, fails,
+            // and returns without this test touching the network.
+            base_url: "http://127.0.0.1:1/v1".to_string(),
+            ..crate::config::Config::default()
+        };
+        let client = Client::for_test(config);
+        let mut ui = SilentUi;
+        let mut messages = vec![user("start the work")];
+
+        let steering = Steering::default();
+        steering.push("actually, check Windows too".to_string());
+
+        let _ = run_agent_turn(
+            &client,
+            &mut ui,
+            &mut messages,
+            "test-model",
+            Some(1),
+            None,
+            &SessionGates::default(),
+            None,
+            false,
+            &steering,
+        )
+        .await;
+
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(
+            messages[1].content.as_deref(),
+            Some("actually, check Windows too")
+        );
+        // Taken, not copied: the next iteration must not send it again.
+        assert!(steering.take().is_empty());
+    }
+
+    #[test]
+    fn steering_is_shared_between_clones() {
+        // The whole mechanism rests on this: the turn runs on another task
+        // holding a clone, so a push on the worker's handle has to be
+        // visible to the loop's.
+        let worker = Steering::default();
+        let loop_side = worker.clone();
+
+        assert_eq!(worker.push("stop and check the tests".to_string()), 1);
+        assert_eq!(worker.push("then keep going".to_string()), 2);
+
+        assert_eq!(
+            loop_side.take(),
+            vec![
+                "stop and check the tests".to_string(),
+                "then keep going".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn taking_drains_so_a_message_joins_exactly_one_iteration() {
+        let steering = Steering::default();
+        steering.push("one".to_string());
+        assert_eq!(steering.take(), vec!["one".to_string()]);
+        // A second iteration must not re-inject what the first already sent.
+        assert!(steering.take().is_empty());
+    }
+
+    #[test]
+    fn an_idle_handle_yields_nothing() {
+        // What `comms agent` and the CLI's blocking loop pass: no way to
+        // type mid-turn, so every iteration takes an empty list.
+        assert!(Steering::default().take().is_empty());
+    }
     use super::*;
     use crate::client::{function_call_type, FunctionCall, ToolCall};
 
@@ -420,6 +553,7 @@ mod tests {
             &SessionGates::default(),
             None,
             false,
+            &Steering::default(),
         )
         .await
         .expect_err("no cap is an error, not a default");
