@@ -170,6 +170,11 @@ pub enum Submission {
     /// changing any of them. Named for `comms status`, which does the same
     /// job one scope out: global configuration there, this session here.
     ShowStatus,
+    /// Renames this session. `/session` is the namespace for acting on the
+    /// session itself, as opposed to the settings it runs with.
+    SetTitle(String),
+    /// Prints/shows this session's name without changing it.
+    ShowTitle,
     /// A line that named a known command (`/effort`, `/max-iterations`,
     /// `/temperature`/`/temp`, `/approval`, `/sandbox`) but wasn't a valid
     /// invocation of
@@ -266,6 +271,12 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
             ),
         ),
     ]
+}
+
+/// How this session's name reads back to the user.
+pub fn title_notice(title: &str, changed: bool) -> String {
+    let verb = if changed { "renamed to" } else { "is" };
+    format!("Session {verb} {title}")
 }
 
 /// How the streaming setting reads back to the user.
@@ -436,6 +447,27 @@ pub fn classify(text: &str) -> Submission {
         }
     }
 
+    // Compared exactly rather than with `bare_command`, which treats any
+    // trailing text as ignorable — fine for `/agent`, wrong for a namespace
+    // where the trailing text is the subcommand.
+    if trimmed == "/session" {
+        return Submission::ShowTitle;
+    }
+
+    if let Some(rest) = argument(trimmed, "/session") {
+        // `/session title` reads the name; anything after it sets one. A
+        // blank title is refused the same way the naming screen refuses it —
+        // a session always has a name.
+        if rest.trim() == "title" {
+            return Submission::ShowTitle;
+        }
+        if let Some(title) = rest.strip_prefix("title") {
+            if title.starts_with(char::is_whitespace) && !title.trim().is_empty() {
+                return Submission::SetTitle(title.trim().to_string());
+            }
+        }
+    }
+
     if let Some(rest) = trimmed.strip_prefix("/status") {
         if rest.trim().is_empty() {
             return Submission::ShowStatus;
@@ -502,7 +534,7 @@ fn command_word(trimmed: &str) -> Option<&str> {
 /// Every command word [`classify`] knows, for spotting a near miss. The four
 /// that always parse are here too: `/mdoel` should still be caught as a
 /// typo for `/model` even though `/model` itself can't be invoked wrongly.
-const KNOWN_COMMANDS: [&str; 12] = [
+const KNOWN_COMMANDS: [&str; 13] = [
     "model",
     "agent",
     "ask",
@@ -512,6 +544,7 @@ const KNOWN_COMMANDS: [&str; 12] = [
     "temp",
     "approval",
     "sandbox",
+    "session",
     "status",
     "stream",
     "verbose",
@@ -611,6 +644,7 @@ fn command_usage(word: &str) -> Option<String> {
         "sandbox" | "verbose" | "stream" => format!("/{word} <on|off>"),
         // Takes no argument at all, so anything after it is a mistake.
         "status" => format!("/{word}"),
+        "session" => format!("/{word} title <new title>"),
         _ => return None,
     })
 }
@@ -1104,6 +1138,56 @@ mod tests {
         assert_eq!(
             stream_notice(false, true),
             "Streaming set to off — replies arrive whole"
+        );
+    }
+
+    #[test]
+    fn classify_recognizes_the_session_command() {
+        assert_eq!(
+            classify("/session title Fix the parser"),
+            Submission::SetTitle("Fix the parser".to_string())
+        );
+        // Bare, either way round, reads the name.
+        assert_eq!(classify("/session"), Submission::ShowTitle);
+        assert_eq!(classify("  /session   "), Submission::ShowTitle);
+        assert_eq!(classify("/session title"), Submission::ShowTitle);
+        assert_eq!(classify("/session title   "), Submission::ShowTitle);
+
+        // An unknown subcommand is a failed command, not a message.
+        assert_eq!(
+            classify("/session rename x"),
+            Submission::UnknownCommand(
+                "Unrecognized /session usage. Usage: /session title <new title>".to_string()
+            )
+        );
+        // "titles" is not "title".
+        assert_eq!(
+            classify("/session titles"),
+            Submission::UnknownCommand(
+                "Unrecognized /session usage. Usage: /session title <new title>".to_string()
+            )
+        );
+        assert_eq!(nearest_command("sesion"), Some("session"));
+    }
+
+    #[test]
+    fn a_title_keeps_the_spacing_inside_it() {
+        // Only the ends are trimmed: the name is whatever was typed.
+        assert_eq!(
+            classify("/session title  Fix  the   parser  "),
+            Submission::SetTitle("Fix  the   parser".to_string())
+        );
+    }
+
+    #[test]
+    fn title_notice_distinguishes_a_rename_from_a_read() {
+        assert_eq!(
+            title_notice("Fix the parser", false),
+            "Session is Fix the parser"
+        );
+        assert_eq!(
+            title_notice("Fix the parser", true),
+            "Session renamed to Fix the parser"
         );
     }
 

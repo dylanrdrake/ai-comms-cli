@@ -10,7 +10,6 @@
 
 NEXT:
 * ready, thinking/working, approval pending, done check, tool call. do we need to poll the messages table?
-* need a --title arg for the comms session command to name the command on creation from the terminal and a /session title <new title> in-session command
 * steering: send while a turn is running and have it join that turn, not the next
   one. Inject drained messages as user messages at the TOP of a run_agent_turn
   iteration only — never between an assistant's tool_calls and its tool results,
@@ -35,7 +34,6 @@ NEXT:
   working_dir is the data you'd migrate from.
 * session claimed flag on session table in case 2 comms processes open the same session. What would that do? is that ok?
 * should messages table be expanded to include tool calls, errors, etc.. OR errors logged somewhere
-* workin dir needs to be svaed as a session setting. or does it matter?
 * need a model browser/search/picker
 * [agent/ask] [verbose]
  <current os user>: 

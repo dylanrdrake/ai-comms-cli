@@ -310,6 +310,7 @@ exactly:
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
 | `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
+| `/session title <new title>` | Rename this session. Bare `/session` (or `/session title`) shows its current name |
 
 A mistyped invocation of one of these (`/effort` with no value, `/approval
 bogus off`), or a misspelled command name (`/mode` for `/model`), is
@@ -447,6 +448,7 @@ the current one instead, repointing the session there — the same thing
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
 | `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
+| `/session title <new title>` | Rename this session. Bare `/session` (or `/session title`) shows its current name |
 
 Only recognized commands are intercepted — including a *mistyped* one.
 `/approval bogus off`, or a bare `/effort` with no value, is reported as an

@@ -1253,6 +1253,13 @@ fn apply_submission(
             session.set_sandbox(sandbox)?;
             println!("{}", ui::sandbox_notice(sandbox, true).blue());
         }
+        ui::Submission::SetTitle(title) => {
+            session.set_title(title)?;
+            println!("{}", ui::title_notice(session.title(), true).blue());
+        }
+        ui::Submission::ShowTitle => {
+            println!("{}", ui::title_notice(session.title(), false).blue());
+        }
         ui::Submission::ShowStatus => {
             let approval = session.approval().clone();
             let rows = ui::session_settings_rows(&ui::SessionSettings {

@@ -51,6 +51,8 @@ pub enum Command {
     SetVerbose(bool),
     /// Stream replies token-by-token for this session, or wait for the whole reply.
     SetStream(bool),
+    /// Rename this session.
+    SetTitle(String),
     /// Confine the agent's file writes to the working directory, or let
     /// them go anywhere.
     SetSandbox(bool),
@@ -172,6 +174,7 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         Submission::ResetEffort => Some(Command::ResetEffort),
         Submission::SetVerbose(verbose) => Some(Command::SetVerbose(*verbose)),
         Submission::SetStream(stream) => Some(Command::SetStream(*stream)),
+        Submission::SetTitle(title) => Some(Command::SetTitle(title.clone())),
         Submission::SetSandbox(sandbox) => Some(Command::SetSandbox(*sandbox)),
         Submission::SetMaxIterations(max_iterations) => {
             Some(Command::SetMaxIterations(*max_iterations))
@@ -194,6 +197,7 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         | Submission::ShowStatus
         | Submission::ShowVerbose
         | Submission::ShowStream
+        | Submission::ShowTitle
         | Submission::ShowTemperature
         | Submission::UnknownCommand(_) => None,
     }
@@ -317,6 +321,7 @@ impl Worker {
                 Command::ResetEffort => self.reset_effort(),
                 Command::SetVerbose(verbose) => self.set_verbose(verbose),
                 Command::SetStream(stream) => self.set_stream(stream),
+                Command::SetTitle(title) => self.rename(title),
                 Command::SetSandbox(sandbox) => self.set_sandbox(sandbox),
                 Command::SetMaxIterations(max_iterations) => {
                     self.set_max_iterations(max_iterations)
@@ -459,6 +464,7 @@ impl Worker {
                         Some(Command::ResetEffort) => self.reset_effort(),
                         Some(Command::SetVerbose(verbose)) => self.set_verbose(verbose),
                         Some(Command::SetStream(stream)) => self.set_stream(stream),
+                        Some(Command::SetTitle(title)) => self.rename(title),
                         // Like approval, this reaches the running turn: it
                         // decides what a tool may do, not what the next
                         // request looks like.
@@ -580,6 +586,18 @@ impl Worker {
             }));
         }
         let _ = self.events.send(Event::StreamChanged { stream });
+    }
+
+    fn rename(&mut self, title: String) {
+        if let Err(e) = self.session.set_title(title) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to rename the session: {e}"),
+            }));
+            return;
+        }
+        let _ = self.events.send(Event::TitleChanged {
+            title: self.session.title().to_string(),
+        });
     }
 
     /// Switches the tool-calling iteration cap and tells the front end what

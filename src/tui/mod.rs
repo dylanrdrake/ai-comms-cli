@@ -737,6 +737,11 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                                     crate::ui::temperature_notice(app.temperature, false),
                                 ));
                             }
+                            app::Submission::ShowTitle => {
+                                app.transcript.push(TranscriptItem::Notice(
+                                    crate::ui::title_notice(&app.title, false),
+                                ));
+                            }
                             app::Submission::ShowStream => {
                                 app.transcript.push(TranscriptItem::Notice(
                                     crate::ui::stream_notice(app.stream, false),
@@ -767,6 +772,7 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                             | app::Submission::ResetEffort
                             | app::Submission::SetVerbose(_)
                             | app::Submission::SetStream(_)
+                            | app::Submission::SetTitle(_)
                             | app::Submission::SetSandbox(_)
                             | app::Submission::SetMaxIterations(_)
                             | app::Submission::ResetMaxIterations
