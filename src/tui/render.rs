@@ -1,6 +1,6 @@
 //! Drawing the TUI. Pure presentation over [`App`] — no state changes here.
 
-use super::app::{App, Focus, ToolStatus, TranscriptItem};
+use super::app::{App, ToolStatus, TranscriptItem};
 use crate::ui::{json_fields, summarize, tool_call_fields, ApprovalRequest};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -15,32 +15,41 @@ pub(super) const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴",
 const MAX_INPUT_ROWS: u16 = 10;
 
 pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
-    // The message box grows with what's in it instead of staying at one
-    // row — normally what's been typed, or, while a tool call is waiting on
-    // a decision, the approval prompt that takes over the same box instead
-    // of floating a separate modal over the conversation.
-    let content_rows = match &app.pending_approval {
-        // The typed-answer line plus the blank line under it, ahead of the
-        // tool/argument detail — see `draw_approval`.
-        Some(request) => approval_lines(request).len() as u16 + 2,
-        None => input_lines(&app.input, frame.area().width.saturating_sub(2)).len() as u16,
-    };
+    // The message box grows with what's been typed into it, and with nothing
+    // else. An approval used to take the box over — borrowing the input as
+    // its answer buffer — so a decision arriving mid-sentence displaced what
+    // you were writing and answering it consumed the draft. It has its own
+    // box now.
+    let content_rows = input_lines(&app.input, frame.area().width.saturating_sub(2)).len() as u16;
     // Messages waiting to be sent get a box of their own above the prompt,
     // and no space at all when nothing is waiting.
     let pending_rows = pending_height(app.pending.len());
+    // Nearest the transcript, above anything to do with what you're typing:
+    // it is the thing waiting on you, not the thing you are writing.
+    let approval_rows = match &app.pending_approval {
+        Some(request) => approval_height(request, frame.area().width),
+        None => 0,
+    };
 
     let input_rows = content_rows
         .clamp(1, MAX_INPUT_ROWS)
         // Never take so much that the conversation has nowhere to go. The
         // reserve covers the title row, the rule under it, the input box's
         // own two border rows, the settings/key-binding rows below it, and
-        // whatever the pending box is using.
-        .min(frame.area().height.saturating_sub(7 + pending_rows).max(1));
+        // whatever the pending and approval boxes are using.
+        .min(
+            frame
+                .area()
+                .height
+                .saturating_sub(7 + pending_rows + approval_rows)
+                .max(1),
+        );
 
     let areas = Layout::vertical([
         Constraint::Length(1),              // session title
         Constraint::Length(1),              // rule
         Constraint::Min(1),                 // chat history
+        Constraint::Length(approval_rows),  // a tool waiting on a decision
         Constraint::Length(pending_rows),   // messages waiting, if any
         Constraint::Length(input_rows + 2), // message prompt, bordered, plus its borders
         Constraint::Length(1),              // settings: ask/agent, model, effort, temp, verbose
@@ -51,12 +60,39 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
     draw_title(frame, areas[0], app);
     draw_rule(frame, areas[1], None);
     let scrolled = draw_transcript(frame, areas[2], app);
-    if pending_rows > 0 {
-        draw_pending(frame, areas[3], app);
+    if let Some(request) = &app.pending_approval {
+        draw_approval(frame, areas[3], request);
     }
-    draw_input(frame, areas[4], app, scrolled);
-    draw_settings(frame, areas[5], app, tick);
-    draw_keybindings(frame, areas[6]);
+    if pending_rows > 0 {
+        draw_pending(frame, areas[4], app);
+    }
+    draw_input(frame, areas[5], app, scrolled);
+    draw_settings(frame, areas[6], app, tick);
+    draw_keybindings(frame, areas[7], app);
+}
+
+/// The blank row between the transcript and the approval box, matching the
+/// pending box's.
+const APPROVAL_GAP: u16 = 1;
+
+/// Past this the box stops growing and scrolls instead, so one enormous
+/// argument can't swallow the conversation behind it.
+const MAX_APPROVAL_ROWS: u16 = 12;
+
+/// How tall the approval box is, measured against the width it will actually
+/// be drawn at.
+///
+/// Sized from the *wrapped* height rather than the number of lines: a long
+/// `content` or `command` value wraps, and sizing by line count alone left
+/// the tail of it below the bottom edge, where it silently disappeared —
+/// which is the half of the request you most need to read before allowing
+/// it.
+fn approval_height(request: &ApprovalRequest, width: u16) -> u16 {
+    let inner = width.saturating_sub(2).max(1);
+    let wrapped = Paragraph::new(Text::from(approval_lines(request)))
+        .wrap(Wrap { trim: false })
+        .line_count(inner) as u16;
+    wrapped.min(MAX_APPROVAL_ROWS) + 2 + APPROVAL_GAP
 }
 
 /// At most this many waiting messages are listed; the rest are summarised.
@@ -408,11 +444,6 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
 /// top border, right-aligned — the same edge the transcript's own border
 /// used to show it on, back when it had one.
 fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
-    if let Some(request) = &app.pending_approval {
-        draw_approval(frame, area, app, request, scrolled);
-        return;
-    }
-
     let width = area.width.saturating_sub(2).max(1);
     let rows = input_lines(&app.input, width);
     let (cursor_row, cursor_col) = input_cursor(&app.input, app.cursor, width);
@@ -444,12 +475,10 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
     .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
 
-    if app.focus == Focus::Input {
-        frame.set_cursor_position((
-            area.x + 1 + cursor_col,
-            area.y + 1 + cursor_row.saturating_sub(scroll),
-        ));
-    }
+    frame.set_cursor_position((
+        area.x + 1 + cursor_col,
+        area.y + 1 + cursor_row.saturating_sub(scroll),
+    ));
 }
 
 /// Splits the input into the rows it occupies: on explicit newlines, and
@@ -580,14 +609,18 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
 /// Dimmed a step further than the rest of the muted (dark_gray) text
 /// elsewhere, so it recedes into the background rather than competing with
 /// the settings row right above it.
-fn draw_keybindings(frame: &mut Frame, area: Rect) {
+fn draw_keybindings(frame: &mut Frame, area: Rect, app: &App) {
     // A shade darker than the plain `dark_gray()` used elsewhere — `.dim()`
     // alone isn't reliable across terminals (some ignore the SGR faint
     // attribute entirely), so the color itself carries the extra dimness.
     const KEYBIND_GRAY: Color = Color::Rgb(90, 90, 90);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " Enter send · Esc cancel · PgUp/PgDn scroll · Ctrl-B back · Ctrl-C quit",
+            if app.pending_approval.is_some() {
+                " Ctrl-Y allow · Ctrl-N deny · Enter send · Esc cancel · Ctrl-B back · Ctrl-C quit"
+            } else {
+                " Enter send · Esc cancel · PgUp/PgDn scroll · Ctrl-B back · Ctrl-C quit"
+            },
             Style::new().fg(KEYBIND_GRAY).dim(),
         ))),
         area,
@@ -606,51 +639,35 @@ fn draw_keybindings(frame: &mut Frame, area: Rect) {
 /// That's why this deliberately doesn't `.wrap(..)`: a field long enough to
 /// overflow the box just gets clipped at the edge instead, which loses
 /// characters but never the interactive prompt beneath it.
-fn draw_approval(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
-    request: &ApprovalRequest,
-    scrolled: bool,
-) {
+fn draw_approval(frame: &mut Frame, area: Rect, request: &ApprovalRequest) {
     let category = match request.category {
         "read" => "Read from disk",
         "write" => "Write to disk",
         "terminal" => "Terminal command",
         _ => "Unknown action",
     };
-    let title = format!(" {category} — type y or yes to allow, Enter to deny, Esc to cancel ");
+    // The keys live in the title because they are the only place they can be
+    // discovered: answering no longer takes over the input box, so there is
+    // nothing in the way to suggest that a decision is owed.
+    let title = format!(" {category} — Ctrl-Y allow · Ctrl-N deny ");
 
-    let detail = approval_lines(request);
-    let prompt_row = detail.len() as u16 + 1;
-
-    let mut lines = detail;
-    lines.push(Line::raw(""));
-    let prompt = "Allow?  ";
-    lines.push(Line::from(vec![
-        Span::styled(prompt, Style::new().yellow().bold()),
-        Span::raw(app.input.clone()),
-    ]));
-
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().yellow())
-        .title(Span::styled(title, Style::new().yellow().bold()));
-    if scrolled {
-        block = block.title(
-            Line::from(Span::styled(
-                " scrolled — End to follow ",
-                Style::new().yellow(),
-            ))
-            .right_aligned(),
-        );
-    }
-
-    let paragraph = Paragraph::new(Text::from(lines)).block(block);
-    frame.render_widget(paragraph, area);
-
-    let col = prompt.chars().count() as u16 + app.input[..app.cursor].chars().count() as u16;
-    frame.set_cursor_position((area.x + 1 + col, area.y + 1 + prompt_row));
+    // The gap `approval_rows` reserved is left unpainted.
+    let box_area = Rect {
+        y: area.y + APPROVAL_GAP,
+        height: area.height.saturating_sub(APPROVAL_GAP),
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(approval_lines(request)))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().yellow())
+                    .title(Span::styled(title, Style::new().yellow().bold())),
+            ),
+        box_area,
+    );
 }
 
 /// The tool and its arguments, field by field — matching how the CLI
@@ -1253,60 +1270,84 @@ mod tests {
     }
 
     #[test]
-    fn approval_takes_over_the_input_box_instead_of_a_modal() {
+    fn an_approval_gets_its_own_box_and_leaves_the_input_alone() {
         let mut app = sample_app();
+        for c in "half a thought".chars() {
+            app.insert_char(c);
+        }
         app.pending_approval = Some(ApprovalRequest {
             tool_name: "write_file".into(),
             category: "write",
             arguments: r#"{"filepath":"/tmp/a.txt"}"#.into(),
         });
-        let out = render_to_string(&app, 70, 20);
+
+        let out = render_to_string(&app, 70, 22);
         assert!(out.contains("Write to disk"), "{out}");
         assert!(out.contains("write_file"), "{out}");
         assert!(out.contains("/tmp/a.txt"), "{out}");
-        assert!(out.contains("allow"), "{out}");
-        // No separate floating box — the same message box that would
-        // otherwise show "message" now shows the approval prompt.
-        assert!(!out.contains("message"), "{out}");
+        // The whole point: what was being typed is still there and still
+        // editable while the decision waits.
+        assert!(out.contains("half a thought"), "{out}");
     }
 
     #[test]
-    fn approval_prompt_shows_what_was_typed_into_it() {
+    fn the_approval_box_names_the_keys_that_answer_it() {
+        // Answering no longer takes over the input, so nothing else would
+        // tell you a decision is owed or how to give it.
         let mut app = sample_app();
+        app.pending_approval = Some(ApprovalRequest {
+            tool_name: "run_terminal_command".into(),
+            category: "terminal",
+            arguments: r#"{"command":"ls"}"#.into(),
+        });
+        let out = render_to_string(&app, 78, 22);
+        assert!(out.contains("Ctrl-Y allow"), "{out}");
+        assert!(out.contains("Ctrl-N deny"), "{out}");
+        assert!(out.contains("Terminal command"), "{out}");
+    }
+
+    #[test]
+    fn the_keybinding_row_answers_the_question_the_box_raises() {
+        let mut app = sample_app();
+        let idle = render_to_string(&app, 78, 22);
+        assert!(!idle.contains("Ctrl-Y"), "{idle}");
+
         app.pending_approval = Some(ApprovalRequest {
             tool_name: "write_file".into(),
             category: "write",
             arguments: "{}".into(),
         });
-        app.focus = Focus::Approval;
-        for c in "yes".chars() {
-            app.insert_char(c);
-        }
-        let out = render_to_string(&app, 70, 20);
-        assert!(out.contains("yes"), "{out}");
-        assert!(out.contains("Enter to deny"), "{out}");
+        let waiting = render_to_string(&app, 78, 22);
+        assert!(waiting.contains("Ctrl-Y allow"), "{waiting}");
+        assert!(waiting.contains("Ctrl-N deny"), "{waiting}");
     }
 
     #[test]
-    fn approval_box_puts_the_tool_detail_above_the_capitalized_prompt() {
+    fn the_approval_sits_between_the_transcript_and_the_input() {
         let mut app = sample_app();
+        for c in "typing on".chars() {
+            app.insert_char(c);
+        }
         app.pending_approval = Some(ApprovalRequest {
             tool_name: "write_file".into(),
             category: "write",
-            arguments: r#"{"filepath":"/tmp/a.txt"}"#.into(),
+            arguments: "{}".into(),
         });
-        let out = render_to_string(&app, 70, 20);
-        assert!(out.contains("Allow?"), "{out}");
-        let tool_at = out.find("write_file").expect("tool name shown");
-        let prompt_at = out.find("Allow?").expect("prompt shown");
-        assert!(tool_at < prompt_at, "{out}");
+        let out = render_to_string(&app, 70, 22);
+
+        let reply_at = out.find("hi there").expect("transcript shown");
+        let approval_at = out.find("Write to disk").expect("approval shown");
+        let input_at = out.find("typing on").expect("input shown");
+        assert!(reply_at < approval_at, "{out}");
+        assert!(approval_at < input_at, "{out}");
     }
 
     #[test]
     fn approval_prompt_stays_visible_when_a_field_is_too_long_to_fit_one_row() {
-        // A `content` value long enough that, with wrapping, it would spill
-        // onto a second row the box's height wasn't sized for — pushing the
-        // "Allow?" prompt past the bottom edge where it silently disappears.
+        // A `content` value long enough to wrap. The box is sized from the
+        // wrapped height, so the tail of the value stays on screen instead
+        // of falling below the bottom edge — it is the half of the request
+        // you most need to read before allowing it.
         let mut app = sample_app();
         app.pending_approval = Some(ApprovalRequest {
             tool_name: "write_file".into(),
@@ -1316,8 +1357,10 @@ mod tests {
                 "x".repeat(90)
             ),
         });
-        let out = render_to_string(&app, 80, 20);
-        assert!(out.contains("Allow?"), "{out}");
+        let out = render_to_string(&app, 80, 24);
+        // The value wraps onto a second row, and that row is inside the box.
+        assert!(out.contains(&"x".repeat(40)), "{out}");
+        assert!(out.contains("Write to disk"), "{out}");
     }
 
     #[test]

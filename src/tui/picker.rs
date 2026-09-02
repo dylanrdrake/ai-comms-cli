@@ -576,10 +576,6 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str, tick: u
         match item {
             LaunchItem::NewSession => {
                 spans.push(Span::styled("New session", base.green()));
-                spans.push(Span::styled(
-                    "  starts in ask mode; /agent enables tools",
-                    Style::new().dark_gray(),
-                ));
             }
             LaunchItem::Header(label) => {
                 in_current_dir = *label == HERE_SECTION;

@@ -70,21 +70,11 @@ pub enum ToolStatus {
     Done { result: String },
 }
 
-/// What the input box does when Enter is pressed.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Focus {
-    /// Normal typing; Enter sends or queues.
-    Input,
-    /// A tool is waiting on y/n; keystrokes answer it instead of typing.
-    Approval,
-}
-
 pub struct App {
     pub transcript: Vec<TranscriptItem>,
     pub input: String,
     /// Byte index of the cursor within `input`. Kept on a char boundary.
     pub cursor: usize,
-    pub focus: Focus,
     pub busy: bool,
     /// Messages typed while a turn was running, in the order they will be
     /// taken. Held as the text rather than a count so the box above the
@@ -149,7 +139,6 @@ impl App {
             transcript: Vec::new(),
             input: String::new(),
             cursor: 0,
-            focus: Focus::Input,
             busy: false,
             pending: VecDeque::new(),
             pending_approval: None,
@@ -204,7 +193,6 @@ impl App {
                 self.finish_streaming();
                 self.pending.clear();
                 self.pending_approval = None;
-                self.focus = Focus::Input;
                 // Any tool frozen mid-flight is no longer going to resolve.
                 for item in self.transcript.iter_mut().rev() {
                     if let TranscriptItem::ToolCall { status, .. } = item {
@@ -222,7 +210,6 @@ impl App {
                 // correct that now that we know it's gated on the user.
                 self.set_last_tool_status(ToolStatus::AwaitingApproval);
                 self.pending_approval = Some(request);
-                self.focus = Focus::Approval;
             }
             Event::ModelChanged {
                 model,
@@ -369,12 +356,10 @@ impl App {
             AgentEvent::ToolCallDenied { .. } => {
                 self.set_last_tool_status(ToolStatus::Denied);
                 self.pending_approval = None;
-                self.focus = Focus::Input;
             }
             AgentEvent::ToolCallCompleted { result, .. } => {
                 self.set_last_tool_status(ToolStatus::Done { result });
                 self.pending_approval = None;
-                self.focus = Focus::Input;
             }
             AgentEvent::Error { message } => {
                 self.finish_streaming();
@@ -472,7 +457,6 @@ impl App {
     /// showing as "awaiting" the moment they decide.
     pub fn approval_answered(&mut self, allowed: bool) {
         self.pending_approval = None;
-        self.focus = Focus::Input;
         if allowed {
             self.set_last_tool_status(ToolStatus::Running);
         }
@@ -492,11 +476,7 @@ impl App {
     /// per-character delivery is what let a pasted newline be read as a
     /// real Enter and submit each line as its own message; bracketed paste
     /// (enabled around the event loop) is what routes it here instead.
-    /// Ignored while an approval prompt has focus, like ordinary typing.
     pub fn paste(&mut self, text: &str) {
-        if self.focus != Focus::Input {
-            return;
-        }
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         self.input.insert_str(self.cursor, &normalized);
         self.cursor += normalized.len();
@@ -553,14 +533,6 @@ impl App {
     /// answer is meaningful (it denies, matching a conventional `[y/N]:`
     /// prompt) rather than swallowed as a stray Enter, and it isn't added to
     /// prompt history — a "y" or "n" isn't a message worth recalling later.
-    pub fn take_approval_answer(&mut self) -> String {
-        let text = std::mem::take(&mut self.input);
-        self.cursor = 0;
-        self.history_cursor = None;
-        self.draft.clear();
-        text
-    }
-
     /// Recalls an older entry into the input box. The first press stashes
     /// whatever was being typed so Down can return to it later.
     pub fn history_up(&mut self) {
@@ -765,7 +737,6 @@ mod tests {
         ));
 
         a.approval_answered(true);
-        assert_eq!(a.focus, Focus::Input);
         assert!(a.pending_approval.is_none());
         assert!(matches!(
             &a.transcript[0],
@@ -788,13 +759,12 @@ mod tests {
             category: "write",
             arguments: "{}".into(),
         }));
-        assert_eq!(a.focus, Focus::Approval);
+        assert!(a.pending_approval.is_some());
 
         a.apply(Event::Agent(AgentEvent::ToolCallCompleted {
             name: "write_file".into(),
             result: r#"{"success":true}"#.into(),
         }));
-        assert_eq!(a.focus, Focus::Input);
         assert!(a.pending_approval.is_none());
         assert!(matches!(
             &a.transcript[0],
@@ -849,7 +819,7 @@ mod tests {
             }
         ));
         assert_eq!(a.transcript[2], TranscriptItem::Notice("Cancelled".into()));
-        assert_eq!(a.focus, Focus::Input);
+        assert!(a.pending_approval.is_none());
         assert!(a.pending.is_empty(), "cancelling drops what was waiting");
     }
 
@@ -1207,24 +1177,6 @@ mod tests {
     }
 
     #[test]
-    fn take_approval_answer_clears_input_without_touching_history() {
-        let mut a = app();
-        for c in "yes".chars() {
-            a.insert_char(c);
-        }
-        assert_eq!(a.take_approval_answer(), "yes");
-        assert!(a.input.is_empty());
-        assert_eq!(a.cursor, 0);
-        assert!(a.input_history.is_empty());
-    }
-
-    #[test]
-    fn take_approval_answer_returns_a_blank_answer_rather_than_none() {
-        let mut a = app();
-        assert_eq!(a.take_approval_answer(), "");
-    }
-
-    #[test]
     fn paste_inserts_multiline_text_without_submitting() {
         let mut a = app();
         a.insert_char('x');
@@ -1241,11 +1193,29 @@ mod tests {
     }
 
     #[test]
-    fn paste_is_ignored_while_an_approval_prompt_has_focus() {
+    fn typing_survives_an_approval_arriving() {
+        // The approval used to borrow the input box as its answer buffer,
+        // so a draft in progress was consumed by answering. It has its own
+        // box now and the input is left alone.
         let mut a = app();
-        a.focus = Focus::Approval;
-        a.paste("sneaky\nmessage");
-        assert_eq!(a.input, "");
+        for c in "half a thou".chars() {
+            a.insert_char(c);
+        }
+
+        a.apply(Event::ApprovalRequested(ApprovalRequest {
+            tool_name: "write_file".into(),
+            category: "write",
+            arguments: "{}".into(),
+        }));
+        a.paste("ght");
+        assert_eq!(a.input, "half a thought");
+
+        a.approval_answered(true);
+        assert_eq!(
+            a.input, "half a thought",
+            "answering must not eat the draft"
+        );
+        assert_eq!(a.cursor, a.input.len());
     }
 
     #[test]

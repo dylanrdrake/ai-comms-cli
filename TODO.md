@@ -9,8 +9,6 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
-* space between last row in transcript and approval prompt
-* If a user is typing in the prompt input and an approval comes through, the prmopt input is taken over (by my design) and interrupts what you were typing. How can we allow the user to keep typing their prompt, even send it and have it added to the queue/sent if possible? while still being able to approve/deny the approval. I guess i need to talk through a little rework of that component
 * $ for running terminal commands
 * a steered message is lost if the turn it joined is cancelled. `absorb` runs
   only on the arm where a turn completes (conversation.rs), so cancelling
@@ -66,3 +64,6 @@ NEXT:
 * [model] [effort]
   AI:
 * confirmation modal for deleting session where you type in name of session
+
+FUTURE:
+* android/ios app?

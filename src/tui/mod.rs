@@ -22,9 +22,9 @@ use crate::config::ApprovalSettings;
 use crate::conversation::{command_for, Command, Conversation};
 use crate::session::{self, ChatSession};
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
-use crate::ui::{parse_yes_no, response_label};
+use crate::ui::response_label;
 use anyhow::Result;
-use app::{App, Focus, TranscriptItem};
+use app::{App, TranscriptItem};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -691,27 +691,32 @@ fn is_typed_char(key: &KeyEvent) -> bool {
 /// Handles a keypress in the conversation. Returns whether to leave it and
 /// go back to the launch screen.
 fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) -> bool {
-    if app.focus == Focus::Approval {
-        match key.code {
-            KeyCode::Enter => {
-                let allowed = parse_yes_no(&app.take_approval_answer());
-                conversation.send(Command::Approve(allowed));
-                app.approval_answered(allowed);
-            }
-            KeyCode::Esc => conversation.send(Command::Cancel),
-            KeyCode::Backspace => app.backspace(),
-            KeyCode::Left => app.move_left(),
-            KeyCode::Right => app.move_right(),
-            KeyCode::Char(c) if is_typed_char(&key) => app.insert_char(c),
-            _ => {}
-        }
-        return false;
-    }
-
     // Ctrl-B backs out to the launch screen; plain Esc stays reserved for
     // cancelling a turn, which is needed far more often.
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('b')) {
         return true;
+    }
+
+    // Answering an approval, from anywhere. Deliberately a chord rather than
+    // a bare y/n: the input box stays live while a decision is owed, so a
+    // plain letter has to keep meaning the letter. This is why the approval
+    // no longer needs a mode of its own.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && app.pending_approval.is_some() {
+        if let KeyCode::Char(c) = key.code {
+            match c {
+                'y' => {
+                    conversation.send(Command::Approve(true));
+                    app.approval_answered(true);
+                    return false;
+                }
+                'n' => {
+                    conversation.send(Command::Approve(false));
+                    app.approval_answered(false);
+                    return false;
+                }
+                _ => {}
+            }
+        }
     }
 
     match key.code {

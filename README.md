@@ -448,7 +448,7 @@ the current one instead, repointing the session there — the same thing
 | `Esc` | Cancel the in-flight turn (kills a running tool command too) |
 | `Alt-Enter` / `Shift-Enter` | Insert a newline instead of sending. `Alt-Enter` works everywhere; `Shift-Enter` needs a terminal that supports the kitty keyboard protocol (kitty, WezTerm, Ghostty, foot, recent Alacritty), because the older input protocol can't tell `Shift-Enter` apart from `Enter` at all |
 | `↑` / `↓` | Recall previous messages into the input box |
-| type an answer, `Enter` | Answer a tool approval prompt — `y`/`yes` allows, anything else (including blank) denies |
+| `Ctrl-Y` / `Ctrl-N` | Allow or deny a tool approval. The approval gets its own box above the prompt rather than taking the prompt over, so you can keep typing — and keep sending — while a decision waits. A chord rather than bare `y`/`n` precisely because the input box stays live |
 | `PgUp` / `PgDn` / `End` | Scroll the transcript; `End` re-pins to the newest |
 | Mouse wheel | Also scrolls the transcript — `↑`/`↓` stay dedicated to prompt history |
 | `Ctrl-Shift-V` / `Shift-Insert` / middle-click | Paste, using your terminal's own paste binding. Multi-line pastes land in the input box as text rather than sending a message per line. `Ctrl-V` is **not** a paste key in most terminals — it never reaches your clipboard |
