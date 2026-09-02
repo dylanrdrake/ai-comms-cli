@@ -9,6 +9,7 @@
 //! having to fork the loop just to render it differently: it implements this
 //! trait instead. [`crate::terminal_ui`] is the CLI's implementation.
 
+use crate::config::ApprovalSettings;
 use anyhow::Result;
 use std::future::Future;
 
@@ -150,6 +151,10 @@ pub enum Submission {
     /// Prints/shows whether writes are currently confined, without changing
     /// it.
     ShowSandbox,
+    /// Prints/shows every setting this session is running with, without
+    /// changing any of them. Named for `comms status`, which does the same
+    /// job one scope out: global configuration there, this session here.
+    ShowStatus,
     /// A line that named a known command (`/effort`, `/max-iterations`,
     /// `/temperature`/`/temp`, `/approval`, `/sandbox`) but wasn't a valid
     /// invocation of
@@ -161,6 +166,79 @@ pub enum Submission {
     /// by the front end as an error instead. Carries a usage hint for
     /// whichever command was misused.
     UnknownCommand(String),
+}
+
+/// Everything `/status` reports, gathered from whichever front end is
+/// asking. Both hold the same state — the TUI in its `App`, the CLI in its
+/// `ChatSession` — so the shape lives here and the rendering is shared,
+/// rather than each growing its own list that drifts from the other.
+pub struct SessionSettings<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub model: &'a str,
+    pub agentic: bool,
+    pub effort_level: Option<&'a str>,
+    pub temperature: Option<f32>,
+    pub max_iterations: Option<usize>,
+    pub verbose: bool,
+    pub sandbox: bool,
+    pub approval: &'a ApprovalSettings,
+}
+
+/// `/status` as label/value rows, ready for either front end to draw.
+///
+/// A setting that isn't set says what that *means* rather than showing an
+/// empty cell — a nullified temperature sends no field at all, which is a
+/// different thing from one that happens to equal the default.
+pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)> {
+    let on_off = |value: bool| if value { "on" } else { "off" }.to_string();
+    let gate = |enabled: bool| if enabled { "Ask" } else { "Auto" };
+
+    vec![
+        ("ID".to_string(), settings.id.to_string()),
+        ("Title".to_string(), settings.title.to_string()),
+        (
+            "Mode".to_string(),
+            if settings.agentic {
+                "agent — tools enabled".to_string()
+            } else {
+                "ask — no tools".to_string()
+            },
+        ),
+        ("Model".to_string(), settings.model.to_string()),
+        (
+            "Effort".to_string(),
+            settings
+                .effort_level
+                .map(str::to_string)
+                .unwrap_or_else(|| "none sent".to_string()),
+        ),
+        (
+            "Temperature".to_string(),
+            settings
+                .temperature
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none sent".to_string()),
+        ),
+        (
+            "Max iterations".to_string(),
+            settings
+                .max_iterations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "not set".to_string()),
+        ),
+        ("Sandbox".to_string(), on_off(settings.sandbox)),
+        ("Verbose".to_string(), on_off(settings.verbose)),
+        (
+            "Approval".to_string(),
+            format!(
+                "read {} · write {} · terminal {}",
+                gate(settings.approval.read_disk),
+                gate(settings.approval.write_disk),
+                gate(settings.approval.terminal),
+            ),
+        ),
+    ]
 }
 
 /// How the sandbox setting reads back to the user. `changed` picks "set to"
@@ -270,6 +348,12 @@ pub fn classify(text: &str) -> Submission {
         }
     }
 
+    if let Some(rest) = trimmed.strip_prefix("/status") {
+        if rest.trim().is_empty() {
+            return Submission::ShowStatus;
+        }
+    }
+
     if let Some(value) = argument(trimmed, "/sandbox") {
         if let Ok(enabled) = parse_bool(value) {
             return Submission::SetSandbox(enabled);
@@ -330,7 +414,7 @@ fn command_word(trimmed: &str) -> Option<&str> {
 /// Every command word [`classify`] knows, for spotting a near miss. The four
 /// that always parse are here too: `/mdoel` should still be caught as a
 /// typo for `/model` even though `/model` itself can't be invoked wrongly.
-const KNOWN_COMMANDS: [&str; 10] = [
+const KNOWN_COMMANDS: [&str; 11] = [
     "model",
     "agent",
     "ask",
@@ -340,6 +424,7 @@ const KNOWN_COMMANDS: [&str; 10] = [
     "temp",
     "approval",
     "sandbox",
+    "status",
     "verbose",
 ];
 
@@ -435,6 +520,8 @@ fn command_usage(word: &str) -> Option<String> {
         }
         "approval" => format!("/{word} <read|write|terminal|all> <on|off>"),
         "sandbox" => format!("/{word} <on|off>"),
+        // Takes no argument at all, so anything after it is a mistake.
+        "status" => format!("/{word}"),
         _ => return None,
     })
 }
@@ -862,6 +949,87 @@ mod tests {
         // settings instead of falling through, matching `/model`.
         assert_eq!(classify("/approval"), Submission::ShowApproval);
         assert_eq!(classify("  /approval   "), Submission::ShowApproval);
+    }
+
+    #[test]
+    fn classify_recognizes_the_status_command() {
+        assert_eq!(classify("/status"), Submission::ShowStatus);
+        assert_eq!(classify("  /status   "), Submission::ShowStatus);
+        // It takes no argument, so anything after it is a mistake rather
+        // than a message.
+        assert_eq!(
+            classify("/status verbose"),
+            Submission::UnknownCommand("Unrecognized /status usage. Usage: /status".to_string())
+        );
+        assert_eq!(nearest_command("statu"), Some("status"));
+    }
+
+    #[test]
+    fn session_settings_rows_say_what_unset_means() {
+        // A nullified setting isn't blank — it does something specific, and
+        // the readout has to distinguish "sends nothing" from "happens to
+        // match the default".
+        let approval = ApprovalSettings::default();
+        let rows = session_settings_rows(&SessionSettings {
+            id: "abc123",
+            title: "Untitled",
+            model: "openrouter/auto",
+            agentic: false,
+            effort_level: None,
+            temperature: None,
+            max_iterations: None,
+            verbose: false,
+            sandbox: true,
+            approval: &approval,
+        });
+        let value = |label: &str| {
+            rows.iter()
+                .find(|(l, _)| l == label)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no {label} row"))
+        };
+
+        assert_eq!(value("ID"), "abc123");
+        assert_eq!(value("Mode"), "ask — no tools");
+        assert_eq!(value("Effort"), "none sent");
+        assert_eq!(value("Temperature"), "none sent");
+        assert_eq!(value("Max iterations"), "not set");
+        assert_eq!(value("Sandbox"), "on");
+        assert_eq!(value("Approval"), "read Ask · write Ask · terminal Ask");
+    }
+
+    #[test]
+    fn session_settings_rows_report_a_configured_session() {
+        let approval = ApprovalSettings {
+            read_disk: false,
+            write_disk: true,
+            terminal: true,
+        };
+        let rows = session_settings_rows(&SessionSettings {
+            id: "abc123",
+            title: "Fix the parser",
+            model: "anthropic/claude-sonnet-5",
+            agentic: true,
+            effort_level: Some("high"),
+            temperature: Some(0.7),
+            max_iterations: Some(20),
+            verbose: true,
+            sandbox: false,
+            approval: &approval,
+        });
+        let value = |label: &str| {
+            rows.iter()
+                .find(|(l, _)| l == label)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+
+        assert_eq!(value("Mode"), "agent — tools enabled");
+        assert_eq!(value("Effort"), "high");
+        assert_eq!(value("Sandbox"), "off");
+        assert_eq!(value("Verbose"), "on");
+        // An auto-approved category reads differently from a gated one.
+        assert_eq!(value("Approval"), "read Auto · write Ask · terminal Ask");
     }
 
     #[test]

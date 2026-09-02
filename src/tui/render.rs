@@ -217,6 +217,22 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
                 ]));
                 lines.push(Line::raw(""));
             }
+            TranscriptItem::SessionStatus(rows) => {
+                lines.push(Line::from(vec![
+                    Span::styled("— ", Style::new().dark_gray().italic()),
+                    Span::styled("Session:", Style::new().dark_gray().italic()),
+                ]));
+                // Values line up under each other, so the column of labels
+                // reads as a list rather than as ragged prose.
+                let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+                for (label, value) in rows {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("      {label:<width$}  "), Style::new().dark_gray()),
+                        Span::raw(value.clone()),
+                    ]));
+                }
+                lines.push(Line::raw(""));
+            }
             TranscriptItem::ApprovalStatus { approval, changed } => {
                 lines.push(Line::from(vec![
                     Span::styled("— ", Style::new().dark_gray().italic()),
@@ -1262,6 +1278,24 @@ mod tests {
         assert!(out.contains("Terminal commands:"), "{out}");
         assert!(out.contains("✗ Auto"), "{out}");
         assert!(out.contains("✓ Ask"), "{out}");
+    }
+
+    #[test]
+    fn session_status_lists_every_setting() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript.push(TranscriptItem::SessionStatus(vec![
+            ("Model".to_string(), "openrouter/auto".to_string()),
+            ("Temperature".to_string(), "none sent".to_string()),
+        ]));
+
+        let out = render_to_string(&app, 70, 14);
+        assert!(out.contains("Session:"), "{out}");
+        assert!(out.contains("Model"), "{out}");
+        assert!(out.contains("openrouter/auto"), "{out}");
+        assert!(out.contains("none sent"), "{out}");
+        // Unlike thinking, this is a direct answer to a question the user
+        // just asked, so it shows regardless of verbose.
+        assert!(!app.verbose);
     }
 
     #[test]

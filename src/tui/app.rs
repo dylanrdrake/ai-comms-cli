@@ -43,6 +43,11 @@ pub enum TranscriptItem {
     },
     Error(String),
     Notice(String),
+    /// Every setting this session is running with, from `/session`. Held as
+    /// rendered rows rather than as the settings themselves: the values are
+    /// a snapshot of the moment it was asked for, and shouldn't quietly
+    /// change under the reader when a later `/effort` scrolls past.
+    SessionStatus(Vec<(String, String)>),
     /// This session's approval gates, pretty-printed the same way `comms
     /// approval` shows them in the CLI rather than packed into one
     /// `Notice` line. Shown both after `/approval <category> <on|off>`

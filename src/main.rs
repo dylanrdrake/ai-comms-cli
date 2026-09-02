@@ -1177,6 +1177,29 @@ fn apply_submission(
             session.set_sandbox(sandbox)?;
             println!("{}", ui::sandbox_notice(sandbox, true).blue());
         }
+        ui::Submission::ShowStatus => {
+            let approval = session.approval().clone();
+            let rows = ui::session_settings_rows(&ui::SessionSettings {
+                id: session.short_id(),
+                title: session.title(),
+                model: session.model(),
+                agentic: session.is_agentic(),
+                effort_level: session.effort_level(),
+                temperature: session.temperature(),
+                max_iterations: session.max_iterations(),
+                verbose: session.verbose(),
+                sandbox: session.sandbox(),
+                approval: &approval,
+            });
+            let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+            println!("\n{}", "Session:".blue());
+            for (label, value) in rows {
+                // Padded before colouring: the escape codes count toward a
+                // format width, so colouring first misaligns the column.
+                println!("  {}  {value}", format!("{label:<width$}").bright_black());
+            }
+            println!();
+        }
         ui::Submission::ShowSandbox => {
             println!("{}", ui::sandbox_notice(session.sandbox(), false).blue());
         }

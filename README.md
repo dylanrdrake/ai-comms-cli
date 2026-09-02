@@ -294,6 +294,7 @@ exactly:
 | `/approval` | Show the approval gates currently in use |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory and home, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
+| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, approval gates. The session-scoped counterpart to `comms status` |
 
 A mistyped invocation of one of these (`/effort` with no value, `/approval
 bogus off`), or a misspelled command name (`/mode` for `/model`), is
@@ -417,6 +418,7 @@ first message.
 | `/approval` | Show the approval gates currently in use |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory and home, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
+| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, approval gates. The session-scoped counterpart to `comms status` |
 
 Only recognized commands are intercepted — including a *mistyped* one.
 `/approval bogus off`, or a bare `/effort` with no value, is reported as an

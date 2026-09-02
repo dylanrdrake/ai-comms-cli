@@ -605,6 +605,24 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                     }
                     // A read of state the UI already holds — no round trip
                     // through the worker, same as `/approval` bare.
+                    // Read from state the UI already holds, like the other
+                    // show-only commands.
+                    app::Submission::ShowStatus => {
+                        let approval = app.approval.clone();
+                        let rows = crate::ui::session_settings_rows(&crate::ui::SessionSettings {
+                            id: &app.session_id,
+                            title: &app.title,
+                            model: &app.model,
+                            agentic: app.agentic,
+                            effort_level: app.effort_level.as_deref(),
+                            temperature: app.temperature,
+                            max_iterations: app.max_iterations,
+                            verbose: app.verbose,
+                            sandbox: app.sandbox,
+                            approval: &approval,
+                        });
+                        app.transcript.push(TranscriptItem::SessionStatus(rows));
+                    }
                     app::Submission::ShowSandbox => {
                         app.transcript
                             .push(TranscriptItem::Notice(crate::ui::sandbox_notice(
