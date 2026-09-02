@@ -25,6 +25,11 @@ NEXT:
   thing that would eventually want attention. Options if it does: only decrypt
   rows that are visible, or cache by (session id, updated_at) so an unchanged
   session isn't decrypted again.
+* the picker renders every row into a fixed area with no scrolling, so once the
+  list is taller than the terminal the extra sessions are simply not drawn —
+  and there's no indication they exist. The two blank lines between sections
+  cost two more rows. Wants a scroll offset that follows the selection, and
+  probably some hint that the list continues past the edge.
 * the client's timeouts are hardcoded in client.rs and can't be configured:
   CONNECT_TIMEOUT 20s, REQUEST_TIMEOUT 300s, STREAM_IDLE_TIMEOUT 90s, plus
   tools.rs's 30s default for a terminal command when the model doesn't give one.

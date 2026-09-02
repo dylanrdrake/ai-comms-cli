@@ -10,7 +10,7 @@
 //! [`Activation`] returned when a row is chosen.
 
 use super::render::draw_rule;
-use crate::store::{Activity, LastMessage, SessionSummary, KIND_AGENT_CHAT};
+use crate::store::{mode_label, Activity, LastMessage, SessionSummary, KIND_AGENT_CHAT};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -460,11 +460,12 @@ const HERE_SECTION: &str = "In this directory";
 
 // Fixed columns, so the preview can be given whatever the line has left.
 const MARKER_WIDTH: usize = 2 + BADGE_WIDTH + 1; // marker, badge, gap
-const ID_WIDTH: usize = 9;
 const KIND_WIDTH: usize = 7;
 const TITLE_WIDTH: usize = 24;
 const DIR_WIDTH: usize = 24;
 /// Below this a preview says too little to be worth the clutter.
+const WHEN_WIDTH: usize = 8;
+
 const MIN_PREVIEW: usize = 12;
 /// Every badge is a single cell — see `state_badge` — and padded to this so
 /// the column stays straight.
@@ -498,6 +499,8 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str, tick: u
     // noise — and it's the column that was squeezing the preview off the
     // end of the line.
     let mut in_current_dir = false;
+    // Whether this section has already named its directory on an earlier row.
+    let mut here_dir_shown = false;
     let width = areas[2].width as usize;
     for (index, item) in picker.items.iter().enumerate() {
         let selected = index == picker.selected;
@@ -519,6 +522,12 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str, tick: u
             }
             LaunchItem::Header(label) => {
                 in_current_dir = *label == HERE_SECTION;
+                here_dir_shown = false;
+                // A blank line before every section label, which puts one
+                // under "New session" and one between the two groups —
+                // enough to read the screen as three lists rather than one
+                // long one.
+                lines.push(Line::raw(""));
                 // Replaces its own marker: a section label isn't a choice,
                 // so it shouldn't look like one the cursor skipped.
                 spans.clear();
@@ -531,37 +540,36 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str, tick: u
                 let (glyph, style) = state_badge(row.last_state(), tick);
                 spans.push(Span::styled(format!("{glyph} "), style));
                 spans.push(Span::styled(
-                    format!("{:<9}", row.short_id()),
-                    Style::new().dark_gray(),
-                ));
-                spans.push(Span::styled(
-                    format!("{:<7}", if row.is_agentic() { "agent" } else { "chat" }),
+                    column(mode_label(row.is_agentic()), KIND_WIDTH),
                     if row.is_agentic() {
                         Style::new().yellow()
                     } else {
                         Style::new().cyan()
                     },
                 ));
-                let title = truncate(&row.title, TITLE_WIDTH);
-                spans.push(Span::styled(format!("{title:<TITLE_WIDTH$}"), base));
-                let when = relative_time(row.updated_at);
+                spans.push(Span::styled(column(&row.title, TITLE_WIDTH), base));
+
+                // Under "In this directory" every row shares one path, so it
+                // is spelled out on the first row and stood in for below.
+                // The column keeps its slot either way, so what follows it
+                // stays aligned down the whole section.
+                let dir = match (&row.working_dir, in_current_dir && here_dir_shown) {
+                    (_, true) => "…".to_string(),
+                    (Some(dir), false) => home_relative(dir),
+                    (None, false) => "dir not recorded".to_string(),
+                };
+                here_dir_shown |= in_current_dir;
                 spans.push(Span::styled(
-                    format!("  {when:<8}"),
+                    column(&dir, DIR_WIDTH),
                     Style::new().dark_gray(),
                 ));
 
-                // Only worth saying for a session that lives somewhere else:
-                // the rows above the "Elsewhere" header all share the
-                // directory named in their own header.
-                let mut used = MARKER_WIDTH + ID_WIDTH + KIND_WIDTH + TITLE_WIDTH + 10;
-                if !in_current_dir {
-                    let dir = match &row.working_dir {
-                        Some(dir) => truncate(&home_relative(dir), DIR_WIDTH),
-                        None => "dir not recorded".to_string(),
-                    };
-                    used += dir.chars().count() + 2;
-                    spans.push(Span::styled(format!("  {dir}"), Style::new().dark_gray()));
-                }
+                spans.push(Span::styled(
+                    column(&relative_time(row.updated_at), WHEN_WIDTH),
+                    Style::new().dark_gray(),
+                ));
+
+                let used = MARKER_WIDTH + KIND_WIDTH + TITLE_WIDTH + DIR_WIDTH + WHEN_WIDTH;
 
                 // Whatever is left of the line goes to what was last said,
                 // so the row describes where the session got to rather than
@@ -683,15 +691,28 @@ pub fn draw_naming(frame: &mut Frame, input: &str) {
     );
 }
 
+/// One cell of the row grid: the text truncated to fit and padded out to
+/// `width`, always leaving a two-space gutter so a full-width value can't
+/// run into the column after it.
+fn column(text: &str, width: usize) -> String {
+    let text = truncate(text, width.saturating_sub(2));
+    format!("{text:<width$}")
+}
+
+/// At most `max` characters, the ellipsis included — it replaces the last
+/// character kept rather than being added past the limit, so a caller that
+/// sized a column or the room left on a line gets something that fits it.
 fn truncate(text: &str, max: usize) -> String {
     let flat: String = text
         .chars()
         .map(|c| if c == '\n' { ' ' } else { c })
         .collect();
-    if flat.chars().count() > max {
-        format!("{}…", flat.chars().take(max).collect::<String>())
-    } else {
-        flat
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    match max {
+        0 => String::new(),
+        _ => format!("{}…", flat.chars().take(max - 1).collect::<String>()),
     }
 }
 
@@ -714,6 +735,54 @@ fn relative_time(timestamp: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_kind_column_says_ask_not_chat() {
+        // The stored kind is "chat"; the word everywhere a user reads it is
+        // "ask", matching /ask and /agent.
+        let ask = row("00000001", crate::store::KIND_CHAT, "t");
+        let agent = row("00000002", KIND_AGENT_CHAT, "t");
+        assert_eq!(
+            column(mode_label(ask.is_agentic()), KIND_WIDTH).trim_end(),
+            "ask"
+        );
+        assert_eq!(
+            column(mode_label(agent.is_agentic()), KIND_WIDTH).trim_end(),
+            "agent"
+        );
+    }
+
+    #[test]
+    fn truncate_never_exceeds_its_limit() {
+        // The ellipsis takes the place of a kept character. Returning max + 1
+        // used to be enough to wrap a row whose preview was sized to the
+        // space left on the line.
+        assert_eq!(truncate("abcdefgh", 4).chars().count(), 4);
+        assert_eq!(truncate("abcdefgh", 4), "abc…");
+        assert_eq!(truncate("abcd", 4), "abcd");
+        assert_eq!(truncate("abc", 4), "abc");
+        assert_eq!(truncate("abc", 1), "…");
+        assert_eq!(truncate("abc", 0), "");
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        assert_eq!(truncate("ünïcödé test", 6).chars().count(), 6);
+    }
+
+    #[test]
+    fn truncate_flattens_newlines() {
+        assert_eq!(truncate("two\nlines", 20), "two lines");
+    }
+
+    #[test]
+    fn column_pads_short_values_and_keeps_a_gutter() {
+        assert_eq!(column("chat", 7), "chat   ");
+        // A value wider than its column still can't touch the next one.
+        let cell = column("~/code/some/very/long/path", 24);
+        assert_eq!(cell.chars().count(), 24);
+        assert!(cell.ends_with("  "), "no gutter left in {cell:?}");
+    }
     #[test]
     fn a_notice_replaces_the_key_hints() {
         // A session that can't be opened has to say so where the user still

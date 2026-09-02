@@ -10,6 +10,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const KIND_CHAT: &str = "chat";
 pub const KIND_AGENT_CHAT: &str = "agent_chat";
 
+/// What a session's mode is called wherever one is shown: the picker, the
+/// CLI's resume list, and the in-session settings bar. The stored kind is
+/// still `chat`, but "ask" is the word the commands use (`/ask`, `/agent`),
+/// so it's the word the listings should use too.
+pub fn mode_label(agentic: bool) -> &'static str {
+    if agentic {
+        "agent"
+    } else {
+        "ask"
+    }
+}
+
 /// A message as loaded from history, along with the model and effort level
 /// that were active when it was recorded (both `None` for rows written
 /// before this tracking was added).

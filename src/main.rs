@@ -339,11 +339,7 @@ fn resolve_resume_target(
 
     println!("{}\n", "Select a session to resume:".blue());
     for (i, s) in sessions.iter().enumerate() {
-        let mode = if s.kind == KIND_AGENT_CHAT {
-            "agent"
-        } else {
-            "chat"
-        };
+        let mode = store::mode_label(s.kind == KIND_AGENT_CHAT);
         println!(
             "  {}. {}  {:<6}{}",
             i + 1,
@@ -1637,7 +1633,7 @@ async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
                 println!(
                     "  {}  {}  {}  {}",
                     (&s.id[..8]).bright_black(),
-                    format!("[{}]", s.kind).bright_black(),
+                    format!("[{}]", store::mode_label(s.kind == KIND_AGENT_CHAT)).bright_black(),
                     s.model,
                     s.title
                 );
@@ -1652,7 +1648,7 @@ async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
                 "{} {} ({}, {})\n",
                 "Session:".blue(),
                 summary.id,
-                summary.kind,
+                store::mode_label(summary.kind == KIND_AGENT_CHAT),
                 summary.model
             );
             print_transcript(&messages);

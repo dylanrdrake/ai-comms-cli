@@ -452,7 +452,7 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         Style::new().dark_gray(),
     ));
     spans.push(Span::styled(
-        format!("· {} ", if app.agentic { "agent" } else { "ask" }),
+        format!("· {} ", crate::store::mode_label(app.agentic)),
         if app.agentic {
             Style::new().yellow()
         } else {
