@@ -57,6 +57,11 @@ pub struct Context {
     /// The configured default for confining the agent's file writes, taken
     /// as this session's starting value.
     pub sandbox: bool,
+    /// The configured default for showing full tool-call detail, taken as
+    /// this session's starting value.
+    pub verbose: bool,
+    /// The configured default for streaming replies, same deal.
+    pub stream: bool,
 }
 
 enum Screen {
@@ -115,6 +120,8 @@ fn open_new(context: &Context, agentic: bool, title: Option<String>) -> Result<C
         context.temperature,
         context.approval.clone(),
         context.sandbox,
+        context.verbose,
+        context.stream,
     )?;
     if let Some(title) = title {
         session.set_title(title)?;
@@ -163,6 +170,7 @@ fn start_chat(
     app.temperature = session.temperature();
     app.approval = session.approval().clone();
     app.sandbox = session.sandbox();
+    app.stream = session.stream();
     app.title = session.title().to_string();
     seed_transcript(&mut app, &history);
 
@@ -613,9 +621,25 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                                         max_iterations: app.max_iterations,
                                         verbose: app.verbose,
                                         sandbox: app.sandbox,
+                                        stream: app.stream,
                                         approval: &approval,
                                     });
                                 app.transcript.push(TranscriptItem::SessionStatus(rows));
+                            }
+                            app::Submission::ShowVerbose => {
+                                app.transcript.push(TranscriptItem::Notice(
+                                    crate::ui::verbose_notice(app.verbose, false),
+                                ));
+                            }
+                            app::Submission::ShowTemperature => {
+                                app.transcript.push(TranscriptItem::Notice(
+                                    crate::ui::temperature_notice(app.temperature, false),
+                                ));
+                            }
+                            app::Submission::ShowStream => {
+                                app.transcript.push(TranscriptItem::Notice(
+                                    crate::ui::stream_notice(app.stream, false),
+                                ));
                             }
                             app::Submission::ShowSandbox => {
                                 app.transcript.push(TranscriptItem::Notice(
@@ -640,7 +664,8 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                             | app::Submission::SetAgentic(_)
                             | app::Submission::SetEffort(_)
                             | app::Submission::ResetEffort
-                            | app::Submission::ToggleVerbose
+                            | app::Submission::SetVerbose(_)
+                            | app::Submission::SetStream(_)
                             | app::Submission::SetSandbox(_)
                             | app::Submission::SetMaxIterations(_)
                             | app::Submission::ResetMaxIterations

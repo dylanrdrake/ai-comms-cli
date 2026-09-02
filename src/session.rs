@@ -49,6 +49,9 @@ pub struct ChatSession {
     /// directory. Always concrete, like `approval` — a tool about to write
     /// needs a yes or no, not "defer to config".
     sandbox: bool,
+    /// Whether this session streams replies token-by-token. Snapshotted from
+    /// the configured default at creation, like `sandbox`.
+    stream: bool,
     messages: Vec<ChatMessage>,
     /// Whether the session has been given a title derived from a user
     /// message yet. Sessions start as "Untitled".
@@ -76,6 +79,8 @@ impl ChatSession {
         temperature: Option<f32>,
         approval: ApprovalSettings,
         sandbox: bool,
+        verbose: bool,
+        stream: bool,
     ) -> Result<Self> {
         let id = store::create_session(
             &conn,
@@ -86,6 +91,8 @@ impl ChatSession {
             temperature.map(|n| n as f64),
             &approval,
             sandbox,
+            verbose,
+            stream,
         )?;
         Ok(ChatSession {
             conn,
@@ -94,11 +101,12 @@ impl ChatSession {
             model,
             kind: kind.to_string(),
             effort_level,
-            verbose: false,
+            verbose,
             max_iterations,
             temperature,
             approval,
             sandbox,
+            stream,
             messages: Vec::new(),
             title_set: false,
             saved_len: 0,
@@ -144,6 +152,7 @@ impl ChatSession {
                 verbose: summary.verbose,
                 max_iterations: summary.max_iterations.map(|n| n as usize),
                 sandbox: summary.sandbox,
+                stream: summary.stream,
                 temperature: summary.temperature.map(|n| n as f32),
                 approval: summary.approval.clone(),
                 messages,
@@ -282,6 +291,21 @@ impl ChatSession {
     /// directory.
     pub fn sandbox(&self) -> bool {
         self.sandbox
+    }
+
+    /// Switches whether this session streams replies, and records it.
+    pub fn set_stream(&mut self, stream: bool) -> Result<()> {
+        if self.stream == stream {
+            return Ok(());
+        }
+        store::set_session_stream(&self.conn, &self.id, stream)?;
+        self.stream = stream;
+        Ok(())
+    }
+
+    /// Whether this session streams replies token-by-token.
+    pub fn stream(&self) -> bool {
+        self.stream
     }
 
     /// The session's current title — "Untitled" until the first user
@@ -440,7 +464,7 @@ mod tests {
 
     /// An in-memory database with the same schema `store::open_db` builds,
     /// so sessions can be exercised without touching the real one.
-    fn memory_session() -> ChatSession {
+    fn memory_conn() -> Connection {
         crate::crypto::seed_test_key();
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -458,6 +482,7 @@ mod tests {
                 approval_write     INTEGER NOT NULL DEFAULT 1,
                 approval_terminal  INTEGER NOT NULL DEFAULT 1,
                 sandbox            INTEGER NOT NULL DEFAULT 1,
+                stream             INTEGER NOT NULL DEFAULT 1,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -477,14 +502,20 @@ mod tests {
             ",
         )
         .unwrap();
+        conn
+    }
+
+    fn memory_session() -> ChatSession {
         ChatSession::create(
-            conn,
+            memory_conn(),
             "test-model".to_string(),
             KIND_CHAT,
             Some("high".to_string()),
             Some(20),
             Some(0.7),
             ApprovalSettings::default(),
+            true,
+            false,
             true,
         )
         .unwrap()
@@ -688,6 +719,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.temperature, None);
+    }
+
+    #[test]
+    fn a_new_session_snapshots_the_configured_verbose_default() {
+        // The configured default is a starting value, not a live one: it is
+        // written into the session at creation, and `/verbose` from then on
+        // changes the session rather than the configuration.
+        let conn = memory_conn();
+        let session = ChatSession::create(
+            conn,
+            "test-model".to_string(),
+            KIND_CHAT,
+            None,
+            Some(20),
+            Some(0.7),
+            ApprovalSettings::default(),
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert!(session.verbose());
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert!(
+            summary.verbose,
+            "it has to survive a reload, not just live in memory"
+        );
     }
 
     #[test]

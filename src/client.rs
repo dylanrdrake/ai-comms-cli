@@ -556,6 +556,19 @@ pub struct Client {
 }
 
 impl Client {
+    /// A client with no credentials, for testing request construction.
+    /// `new` reads the OS keychain, which a test can't rely on — and none of
+    /// what's exercised here (which fields a config does and doesn't put on
+    /// the wire) needs a key.
+    #[cfg(test)]
+    pub fn for_test(config: Config) -> Self {
+        Client {
+            config,
+            api_key: String::new(),
+            http_client: reqwest::Client::new(),
+        }
+    }
+
     pub fn new(config: Config) -> Result<Self> {
         let api_key = crate::config::get_api_key()?
             .ok_or_else(|| anyhow!("API key not configured. Run: comms login"))?;
@@ -569,13 +582,6 @@ impl Client {
             api_key,
             http_client,
         })
-    }
-
-    /// Whether responses should stream, per the user's `comms stream`
-    /// setting. Callers pick [`Client::chat_stream`] or [`Client::chat`]
-    /// accordingly.
-    pub fn streaming_enabled(&self) -> bool {
-        self.config.stream
     }
 
     /// Applies the `Authorization` header plus any user-configured
@@ -791,6 +797,7 @@ impl Client {
 #[cfg(test)]
 mod deser_tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn chat_message_deserializes_without_tool_call_id() {
@@ -1172,6 +1179,86 @@ mod deser_tests {
         ] {
             assert!(!skeleton.contains(secret), "{skeleton}");
         }
+    }
+
+    fn request_json(config: Config, temperature: Option<f32>, effort: Option<String>) -> Value {
+        let request = Client::for_test(config).build_request(
+            "m".to_string(),
+            vec![],
+            temperature,
+            None,
+            effort,
+            false,
+        );
+        serde_json::to_value(&request).unwrap()
+    }
+
+    #[test]
+    fn a_null_temperature_sends_no_temperature_field() {
+        // The contract `comms temperature --clear` promises: not a zero, not
+        // a default — no field at all, so the provider uses its own.
+        let json = request_json(Config::default(), None, None);
+        assert!(
+            json.get("temperature").is_none(),
+            "temperature must be absent, got {json}"
+        );
+
+        // Present when set. Compared with a tolerance because the field is
+        // an `f32`: 0.7 reaches the wire as 0.699999988079071, which is the
+        // same sampling temperature to any provider but not the same JSON
+        // number.
+        let json = request_json(Config::default(), Some(0.7), None);
+        let sent = json["temperature"].as_f64().expect("a number");
+        assert!((sent - 0.7).abs() < 1e-6, "{json}");
+    }
+
+    #[test]
+    fn a_null_effort_sends_neither_effort_field() {
+        // Both shapes have to stay off the wire, since a provider that
+        // rejects unknown fields would fail on either.
+        let json = request_json(Config::default(), None, None);
+        assert!(json.get("reasoning").is_none(), "{json}");
+        assert!(json.get("reasoning_effort").is_none(), "{json}");
+    }
+
+    #[test]
+    fn effort_style_decides_which_shape_an_effort_takes() {
+        let nested = Config {
+            effort_style: Some("nested".to_string()),
+            ..Config::default()
+        };
+        let json = request_json(nested, None, Some("high".to_string()));
+        assert_eq!(json["reasoning"]["effort"], "high", "{json}");
+        assert!(json.get("reasoning_effort").is_none(), "{json}");
+
+        let flat = Config {
+            effort_style: Some("flat".to_string()),
+            ..Config::default()
+        };
+        let json = request_json(flat, None, Some("high".to_string()));
+        assert_eq!(json["reasoning_effort"], "high", "{json}");
+        assert!(json.get("reasoning").is_none(), "{json}");
+
+        // "none" is the escape hatch for providers that reject both.
+        let off = Config {
+            effort_style: Some("none".to_string()),
+            ..Config::default()
+        };
+        let json = request_json(off, None, Some("high".to_string()));
+        assert!(json.get("reasoning").is_none(), "{json}");
+        assert!(json.get("reasoning_effort").is_none(), "{json}");
+    }
+
+    #[test]
+    fn an_unset_effort_style_falls_back_to_the_seeded_shape() {
+        // A config written before `effort_style` was seeded holds `null`
+        // there; requests still have to take a shape.
+        let unset = Config {
+            effort_style: None,
+            ..Config::default()
+        };
+        let json = request_json(unset, None, Some("high".to_string()));
+        assert_eq!(json["reasoning"]["effort"], "high", "{json}");
     }
 
     #[test]

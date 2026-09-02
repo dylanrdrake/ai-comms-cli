@@ -110,6 +110,9 @@ pub struct App {
     /// Whether the agent's file writes are confined to the working
     /// directory. Changed with `/sandbox`.
     pub sandbox: bool,
+    /// Whether this session streams replies token-by-token. Changed with
+    /// `/stream`.
+    pub stream: bool,
     /// This session's `/max-iterations` override, changed with
     /// `/max-iterations`/`/max-iterations default`. `None` means nullified —
     /// turns fall back to the configured default. Only takes effect in
@@ -152,6 +155,7 @@ impl App {
             agentic: false,
             verbose: false,
             sandbox: true,
+            stream: true,
             max_iterations: None,
             temperature: None,
             approval: ApprovalSettings::default(),
@@ -245,6 +249,16 @@ impl App {
                 } else {
                     format!("Effort is {label}")
                 }));
+            }
+            Event::StreamChanged { stream } => {
+                let changed = stream != self.stream;
+                self.stream = stream;
+                if changed {
+                    self.transcript
+                        .push(TranscriptItem::Notice(crate::ui::stream_notice(
+                            stream, true,
+                        )));
+                }
             }
             Event::SandboxChanged { sandbox } => {
                 let changed = sandbox != self.sandbox;

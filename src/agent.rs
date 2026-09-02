@@ -47,6 +47,7 @@ pub async fn run_agent(
     temperature: Option<f32>,
     gates: &SessionGates,
     effort_level: Option<String>,
+    stream: bool,
 ) -> Result<Option<String>> {
     let mut messages = vec![ChatMessage {
         role: "user".to_string(),
@@ -65,6 +66,7 @@ pub async fn run_agent(
         temperature,
         gates,
         effort_level,
+        stream,
     )
     .await
 }
@@ -76,6 +78,9 @@ pub async fn run_agent(
 /// [`AgentEvent::AssistantDelta`] as text arrives, so a front end that can
 /// re-render (a TUI) shows it live while one that can't (the CLI) simply
 /// ignores the deltas and renders the finished message.
+// Same reasoning as `run_agent`: the parameters are the turn's inputs,
+// and a struct would only move the argument list somewhere else.
+#[allow(clippy::too_many_arguments)]
 async fn request_turn(
     client: &Client,
     ui: &mut impl AgentUi,
@@ -84,10 +89,13 @@ async fn request_turn(
     temperature: Option<f32>,
     tools: Option<Vec<serde_json::Value>>,
     effort_level: Option<String>,
+    stream: bool,
 ) -> Result<ChatMessage> {
     normalize_system_prompt(&mut messages, tools.is_some());
 
-    let mut message = if client.streaming_enabled() {
+    // Passed in rather than read off the client: streaming is a per-session
+    // setting now, and one client is shared by every session in a process.
+    let mut message = if stream {
         let stream = client.chat_stream(
             model.to_string(),
             messages,
@@ -191,6 +199,7 @@ pub async fn run_chat_turn(
     model: &str,
     temperature: Option<f32>,
     effort_level: Option<String>,
+    stream: bool,
 ) -> Result<Option<String>> {
     ui.event(AgentEvent::RequestStarted).await;
     let turn = request_turn(
@@ -201,6 +210,7 @@ pub async fn run_chat_turn(
         temperature,
         None,
         effort_level.clone(),
+        stream,
     )
     .await;
     ui.event(AgentEvent::RequestFinished).await;
@@ -243,6 +253,7 @@ pub async fn run_agent_turn(
     temperature: Option<f32>,
     gates: &SessionGates,
     effort_level: Option<String>,
+    stream: bool,
 ) -> Result<Option<String>> {
     // Unlike `temperature`/`effort_level`, there's no provider to fall back
     // to a default for this — it never leaves the process, so a missing cap
@@ -274,6 +285,7 @@ pub async fn run_agent_turn(
             temperature,
             Some(tool_definitions.clone()),
             effort_level.clone(),
+            stream,
         )
         .await;
         ui.event(AgentEvent::RequestFinished).await;
@@ -374,6 +386,53 @@ pub async fn run_agent_turn(
 mod tests {
     use super::*;
     use crate::client::{function_call_type, FunctionCall, ToolCall};
+
+    /// An [`AgentUi`] that renders nothing, for exercising the loop's own
+    /// decisions without a front end.
+    struct SilentUi;
+
+    impl AgentUi for SilentUi {
+        async fn event(&mut self, _event: AgentEvent) {}
+
+        async fn approve(&mut self, _request: ApprovalRequest) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_mode_refuses_to_run_without_an_iteration_cap() {
+        // `comms max-iterations --clear` leaves no cap anywhere, and agent
+        // mode fails loudly rather than picking a number on the user's
+        // behalf — the one setting where null is an error instead of
+        // "send nothing". Checked before any request goes out, which is why
+        // a credential-free client is enough to test it.
+        let client = Client::for_test(crate::config::Config::default());
+        let mut ui = SilentUi;
+        let mut messages = vec![user("do the thing")];
+
+        let error = run_agent_turn(
+            &client,
+            &mut ui,
+            &mut messages,
+            "test-model",
+            None,
+            None,
+            &SessionGates::default(),
+            None,
+            false,
+        )
+        .await
+        .expect_err("no cap is an error, not a default");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("No max-iterations cap is set"),
+            "{message}"
+        );
+        // Says both ways out, since the fix differs by where you are.
+        assert!(message.contains("/max-iterations"), "{message}");
+        assert!(message.contains("comms max-iterations"), "{message}");
+    }
 
     #[test]
     fn categorizes_known_tools() {

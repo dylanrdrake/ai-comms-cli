@@ -122,7 +122,22 @@ pub enum Submission {
     /// saves that concrete value to the session now, distinct from
     /// [`Submission::SetEffort`]`(None)`, which nullifies instead.
     ResetEffort,
-    ToggleVerbose,
+    /// Shows full tool-call detail for this session, or stops. Bare
+    /// `/verbose` reads it rather than flipping it — every other setting
+    /// answers a bare command with its current value, and a toggle can't be
+    /// written down as an instruction without knowing where it started.
+    SetVerbose(bool),
+    /// Prints/shows whether this session is showing full detail, without
+    /// changing it.
+    ShowVerbose,
+    /// Prints/shows this session's sampling temperature without changing it.
+    ShowTemperature,
+    /// Streams replies token-by-token for this session, or waits for the
+    /// whole reply. The configured default seeds it; this changes the
+    /// session, like `/verbose` and `/sandbox`.
+    SetStream(bool),
+    /// Prints/shows whether this session streams, without changing it.
+    ShowStream,
     /// `None` nullifies the override (`/max-iterations clear`) — turns fall
     /// back to whatever the configured default is at the time each one
     /// runs, regardless of what it was when this session started.
@@ -182,6 +197,7 @@ pub struct SessionSettings<'a> {
     pub max_iterations: Option<usize>,
     pub verbose: bool,
     pub sandbox: bool,
+    pub stream: bool,
     pub approval: &'a ApprovalSettings,
 }
 
@@ -229,6 +245,7 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
         ),
         ("Sandbox".to_string(), on_off(settings.sandbox)),
         ("Verbose".to_string(), on_off(settings.verbose)),
+        ("Streaming".to_string(), on_off(settings.stream)),
         (
             "Approval".to_string(),
             format!(
@@ -239,6 +256,39 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
             ),
         ),
     ]
+}
+
+/// How the streaming setting reads back to the user.
+pub fn stream_notice(stream: bool, changed: bool) -> String {
+    let verb = if changed { "set to" } else { "is" };
+    let state = if stream {
+        "on — replies arrive token by token"
+    } else {
+        "off — replies arrive whole"
+    };
+    format!("Streaming {verb} {state}")
+}
+
+/// How the verbose setting reads back to the user.
+pub fn verbose_notice(verbose: bool, changed: bool) -> String {
+    let verb = if changed { "set to" } else { "is" };
+    let state = if verbose {
+        "on — showing tool call detail and the model's thinking"
+    } else {
+        "off — showing a one-line notice per tool call"
+    };
+    format!("Verbose {verb} {state}")
+}
+
+/// How the temperature reads back to the user. `None` is a real value —
+/// requests go out with no temperature field — so it says that rather than
+/// showing a blank.
+pub fn temperature_notice(temperature: Option<f32>, changed: bool) -> String {
+    let verb = if changed { "set to" } else { "is" };
+    match temperature {
+        Some(value) => format!("Temperature {verb} {value}"),
+        None => format!("Temperature {verb} none sent — the provider uses its own default"),
+    }
 }
 
 /// How the sandbox setting reads back to the user. `changed` picks "set to"
@@ -276,8 +326,16 @@ pub fn classify(text: &str) -> Submission {
     if bare_command(trimmed, "/ask") {
         return Submission::SetAgentic(false);
     }
-    if bare_command(trimmed, "/verbose") {
-        return Submission::ToggleVerbose;
+    if let Some(rest) = trimmed.strip_prefix("/verbose") {
+        if rest.trim().is_empty() {
+            return Submission::ShowVerbose;
+        }
+    }
+
+    if let Some(value) = argument(trimmed, "/verbose") {
+        if let Ok(enabled) = parse_bool(value) {
+            return Submission::SetVerbose(enabled);
+        }
     }
 
     if let Some(value) = argument(trimmed, "/effort") {
@@ -318,6 +376,14 @@ pub fn classify(text: &str) -> Submission {
     }
 
     // "/temp" is accepted as a shorthand for "/temperature".
+    for name in ["/temperature", "/temp"] {
+        if let Some(rest) = trimmed.strip_prefix(name) {
+            if rest.trim().is_empty() {
+                return Submission::ShowTemperature;
+            }
+        }
+    }
+
     if let Some(value) = argument(trimmed, "/temperature").or_else(|| argument(trimmed, "/temp")) {
         if value.eq_ignore_ascii_case("clear") {
             return Submission::SetTemperature(None);
@@ -339,6 +405,18 @@ pub fn classify(text: &str) -> Submission {
     if let Some(rest) = trimmed.strip_prefix("/approval") {
         if rest.trim().is_empty() {
             return Submission::ShowApproval;
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("/stream") {
+        if rest.trim().is_empty() {
+            return Submission::ShowStream;
+        }
+    }
+
+    if let Some(value) = argument(trimmed, "/stream") {
+        if let Ok(enabled) = parse_bool(value) {
+            return Submission::SetStream(enabled);
         }
     }
 
@@ -414,7 +492,7 @@ fn command_word(trimmed: &str) -> Option<&str> {
 /// Every command word [`classify`] knows, for spotting a near miss. The four
 /// that always parse are here too: `/mdoel` should still be caught as a
 /// typo for `/model` even though `/model` itself can't be invoked wrongly.
-const KNOWN_COMMANDS: [&str; 11] = [
+const KNOWN_COMMANDS: [&str; 12] = [
     "model",
     "agent",
     "ask",
@@ -425,6 +503,7 @@ const KNOWN_COMMANDS: [&str; 11] = [
     "approval",
     "sandbox",
     "status",
+    "stream",
     "verbose",
 ];
 
@@ -519,7 +598,7 @@ fn command_usage(word: &str) -> Option<String> {
             format!("/{word} <n> | clear | default (n must be 0 or greater)")
         }
         "approval" => format!("/{word} <read|write|terminal|all> <on|off>"),
-        "sandbox" => format!("/{word} <on|off>"),
+        "sandbox" | "verbose" | "stream" => format!("/{word} <on|off>"),
         // Takes no argument at all, so anything after it is a mistake.
         "status" => format!("/{word}"),
         _ => return None,
@@ -722,9 +801,20 @@ mod tests {
     }
 
     #[test]
-    fn classify_recognizes_verbose_toggle() {
-        assert_eq!(classify("/verbose"), Submission::ToggleVerbose);
-        assert_eq!(classify("  /verbose  "), Submission::ToggleVerbose);
+    fn classify_recognizes_verbose() {
+        // Bare reads rather than flips, matching `/sandbox` and the global
+        // `comms verbose` — a toggle can't be written down as an
+        // instruction without knowing where it started.
+        assert_eq!(classify("/verbose"), Submission::ShowVerbose);
+        assert_eq!(classify("  /verbose  "), Submission::ShowVerbose);
+        assert_eq!(classify("/verbose on"), Submission::SetVerbose(true));
+        assert_eq!(classify("/verbose off"), Submission::SetVerbose(false));
+        assert_eq!(
+            classify("/verbose maybe"),
+            Submission::UnknownCommand(
+                "Unrecognized /verbose usage. Usage: /verbose <on|off>".to_string()
+            )
+        );
         assert_eq!(
             classify("/verbosely"),
             Submission::Message("/verbosely".to_string())
@@ -865,11 +955,8 @@ mod tests {
             classify("/temperature banana"),
             Submission::UnknownCommand(temperature_usage.to_string())
         );
-        // Bare, with nothing to act on, is reported the same way.
-        assert_eq!(
-            classify("/temperature"),
-            Submission::UnknownCommand(temperature_usage.to_string())
-        );
+        // Bare reads the current value instead — see
+        // `bare_temperature_reads_it_rather_than_failing`.
     }
 
     #[test]
@@ -886,10 +973,7 @@ mod tests {
             classify("/temp banana"),
             Submission::UnknownCommand(temp_usage.to_string())
         );
-        assert_eq!(
-            classify("/temp"),
-            Submission::UnknownCommand(temp_usage.to_string())
-        );
+        // Bare reads the current value; only a malformed one is reported.
     }
 
     #[test]
@@ -952,6 +1036,68 @@ mod tests {
     }
 
     #[test]
+    fn bare_temperature_reads_it_rather_than_failing() {
+        assert_eq!(classify("/temperature"), Submission::ShowTemperature);
+        assert_eq!(classify("/temp"), Submission::ShowTemperature);
+        assert_eq!(classify("  /temp   "), Submission::ShowTemperature);
+        // Setting still works either way round.
+        assert_eq!(classify("/temp 1.5"), Submission::SetTemperature(Some(1.5)));
+        assert_eq!(
+            classify("/temperature clear"),
+            Submission::SetTemperature(None)
+        );
+    }
+
+    #[test]
+    fn temperature_notice_says_what_none_means() {
+        assert_eq!(temperature_notice(Some(0.7), false), "Temperature is 0.7");
+        assert_eq!(
+            temperature_notice(None, true),
+            "Temperature set to none sent — the provider uses its own default"
+        );
+    }
+
+    #[test]
+    fn classify_recognizes_the_stream_command() {
+        assert_eq!(classify("/stream off"), Submission::SetStream(false));
+        assert_eq!(classify("/stream on"), Submission::SetStream(true));
+        assert_eq!(classify("/stream yes"), Submission::SetStream(true));
+        // Bare reads it, like every other setting.
+        assert_eq!(classify("/stream"), Submission::ShowStream);
+        assert_eq!(classify("  /stream   "), Submission::ShowStream);
+        // A value that isn't a boolean is a failed command, not a message.
+        assert_eq!(
+            classify("/stream sometimes"),
+            Submission::UnknownCommand(
+                "Unrecognized /stream usage. Usage: /stream <on|off>".to_string()
+            )
+        );
+        assert_eq!(nearest_command("strem"), Some("stream"));
+    }
+
+    #[test]
+    fn the_on_off_notices_say_what_the_setting_does() {
+        // Not just "on"/"off": the point of a bare read is to tell someone
+        // what the setting will actually do.
+        assert_eq!(
+            verbose_notice(true, false),
+            "Verbose is on — showing tool call detail and the model's thinking"
+        );
+        assert_eq!(
+            verbose_notice(false, true),
+            "Verbose set to off — showing a one-line notice per tool call"
+        );
+        assert_eq!(
+            stream_notice(true, false),
+            "Streaming is on — replies arrive token by token"
+        );
+        assert_eq!(
+            stream_notice(false, true),
+            "Streaming set to off — replies arrive whole"
+        );
+    }
+
+    #[test]
     fn classify_recognizes_the_status_command() {
         assert_eq!(classify("/status"), Submission::ShowStatus);
         assert_eq!(classify("  /status   "), Submission::ShowStatus);
@@ -980,6 +1126,7 @@ mod tests {
             max_iterations: None,
             verbose: false,
             sandbox: true,
+            stream: true,
             approval: &approval,
         });
         let value = |label: &str| {
@@ -1015,6 +1162,7 @@ mod tests {
             max_iterations: Some(20),
             verbose: true,
             sandbox: false,
+            stream: false,
             approval: &approval,
         });
         let value = |label: &str| {

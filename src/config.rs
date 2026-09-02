@@ -104,6 +104,11 @@ pub struct Config {
     /// optional `HTTP-Referer`/`X-Title` attribution headers).
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+    /// Whether new sessions start showing full tool-call detail. Off by
+    /// default; `/verbose` toggles it for the session you're in, and that
+    /// choice is remembered per session rather than changing this.
+    #[serde(default)]
+    pub verbose: bool,
     /// Whether the agent's file writes are confined to the working
     /// directory. On by default; turning it off lets its write tools touch
     /// any path the process can. Reads are never bounded either way — they
@@ -163,6 +168,7 @@ impl Default for Config {
             max_iterations: default_max_iterations(),
             temperature: default_temperature(),
             sandbox: true,
+            verbose: false,
             effort_level: None,
             effort_style: default_effort_style(),
             extra_headers: HashMap::new(),

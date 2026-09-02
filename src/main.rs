@@ -111,6 +111,7 @@ enum Commands {
     },
 
     /// View or set the persistent default sampling temperature
+    #[command(visible_alias = "temp")]
     Temperature {
         /// Value to set as the default (omit to show the current default)
         value: Option<f32>,
@@ -129,8 +130,16 @@ enum Commands {
         value: Option<bool>,
     },
 
+    /// View or set whether new sessions start showing full tool-call detail
+    Verbose {
+        /// on/off (also accepts true/false, yes/no, 1/0). Omit to show the
+        /// current setting.
+        #[arg(value_parser = parse_bool)]
+        value: Option<bool>,
+    },
+
     /// View or set whether the agent's file writes are confined to the
-    /// working directory and your home directory
+    /// working directory
     Sandbox {
         /// on/off (also accepts true/false, yes/no, 1/0). Omit to show the
         /// current setting.
@@ -139,6 +148,7 @@ enum Commands {
     },
 
     /// View or set the persistent default reasoning effort level (low, medium, high)
+    #[command(name = "effort", visible_alias = "effort-level")]
     EffortLevel {
         /// Effort level to set as the default (omit to show the current default)
         value: Option<String>,
@@ -393,6 +403,7 @@ async fn main() -> Result<()> {
         Some(Commands::Temperature { value, clear }) => cmd_temperature(value, clear).await?,
         Some(Commands::Stream { value }) => cmd_stream(value).await?,
         Some(Commands::Sandbox { value }) => cmd_sandbox(value).await?,
+        Some(Commands::Verbose { value }) => cmd_verbose(value).await?,
         Some(Commands::EffortLevel { value, clear }) => cmd_effort_level(value, clear).await?,
         Some(Commands::Ask {
             prompt,
@@ -533,6 +544,10 @@ async fn cmd_status() -> Result<()> {
     );
     println!("  Streaming: {}", if config.stream { "on" } else { "off" });
     println!("  Sandbox: {}", if config.sandbox { "on" } else { "off" });
+    println!(
+        "  New sessions: {}",
+        if config.verbose { "verbose" } else { "quiet" }
+    );
     if !config.extra_headers.is_empty() {
         println!("  Extra headers: {}", config.extra_headers.len());
     }
@@ -763,6 +778,33 @@ async fn cmd_headers(action: Option<HeaderCommands>) -> Result<()> {
             } else {
                 println!("No header named '{}' was set.", name);
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// The persistent default for showing full tool-call detail. A session
+/// snapshots this when it's created, so changing it here affects new
+/// sessions; `/verbose` toggles the one you're in.
+async fn cmd_verbose(value: Option<bool>) -> Result<()> {
+    let mut config = load_config()?;
+
+    match value {
+        Some(enabled) => {
+            config.verbose = enabled;
+            save_config(&config)?;
+            println!(
+                "{} New sessions start {}",
+                "✓".green(),
+                if enabled { "verbose" } else { "quiet" }
+            );
+        }
+        None => {
+            println!(
+                "New sessions start: {}",
+                if config.verbose { "verbose" } else { "quiet" }
+            );
         }
     }
 
@@ -1098,14 +1140,25 @@ fn apply_submission(
                 if changed { "set to" } else { "is" }
             );
         }
-        ui::Submission::ToggleVerbose => {
-            let verbose = !session.verbose();
+        ui::Submission::SetVerbose(verbose) => {
             session.set_verbose(verbose)?;
             ui.set_verbose(verbose);
+            println!("{}", ui::verbose_notice(verbose, true).blue());
+        }
+        ui::Submission::SetStream(stream) => {
+            session.set_stream(stream)?;
+            println!("{}", ui::stream_notice(stream, true).blue());
+        }
+        ui::Submission::ShowStream => {
+            println!("{}", ui::stream_notice(session.stream(), false).blue());
+        }
+        ui::Submission::ShowVerbose => {
+            println!("{}", ui::verbose_notice(session.verbose(), false).blue());
+        }
+        ui::Submission::ShowTemperature => {
             println!(
-                "{} Verbose mode {}",
-                "✓".green(),
-                if verbose { "on" } else { "off" }
+                "{}",
+                ui::temperature_notice(session.temperature(), false).blue()
             );
         }
         ui::Submission::SetMaxIterations(max_iterations) => {
@@ -1189,6 +1242,7 @@ fn apply_submission(
                 max_iterations: session.max_iterations(),
                 verbose: session.verbose(),
                 sandbox: session.sandbox(),
+                stream: session.stream(),
                 approval: &approval,
             });
             let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
@@ -1264,6 +1318,8 @@ async fn cmd_session(
                 default_temperature,
                 config.approval.clone(),
                 config.sandbox,
+                config.verbose,
+                config.stream,
             )?
         }
     };
@@ -1281,7 +1337,9 @@ async fn cmd_session(
     // No `-v` here (unlike `agent`) — matching the TUI, a session always
     // starts quiet; `/verbose` is the only way to turn it on. No model
     // label either, again matching the TUI transcript.
-    let mut ui = TerminalAgentUi::new(false, false);
+    // Seeded from the session rather than hardcoded, so a resumed session
+    // that had `/verbose` on comes back showing detail.
+    let mut ui = TerminalAgentUi::new(session.verbose(), false);
 
     loop {
         let readline = rl.readline(&format!("{} ", "❯".green().bold()));
@@ -1319,6 +1377,7 @@ async fn cmd_session(
                 let model = session.model().to_string();
                 let effort_level = session.effort_level().map(str::to_string);
                 let temperature = session.temperature();
+                let session_stream = session.stream();
                 let turn = if session.is_agentic() {
                     let max_iterations = session.max_iterations();
                     let gates = SessionGates::new(session.approval().clone(), session.sandbox());
@@ -1331,6 +1390,7 @@ async fn cmd_session(
                         temperature,
                         &gates,
                         effort_level,
+                        session_stream,
                     )
                     .await
                 } else {
@@ -1341,6 +1401,7 @@ async fn cmd_session(
                         &model,
                         temperature,
                         effort_level,
+                        session_stream,
                     )
                     .await
                 };
@@ -1398,6 +1459,7 @@ async fn cmd_agent(
     let temperature = resolve_temperature(&config, temperature);
     let approval = config.approval.clone();
     let sandbox = config.sandbox;
+    let stream = config.stream;
     let effort_level = resolve_effort_level(&config, effort_level);
     let client = Client::new(config)?;
 
@@ -1415,6 +1477,7 @@ async fn cmd_agent(
         temperature,
         &SessionGates::new(approval, sandbox),
         effort_level,
+        stream,
     )
     .await?;
 
@@ -1431,6 +1494,8 @@ async fn cmd_tui() -> Result<()> {
         temperature: config.temperature,
         approval: config.approval.clone(),
         sandbox: config.sandbox,
+        verbose: config.verbose,
+        stream: config.stream,
         client: Arc::new(Client::new(config)?),
     };
 
@@ -1487,4 +1552,97 @@ async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with(
+        default_model: Option<&str>,
+        max_iterations: Option<usize>,
+        temperature: Option<f32>,
+        effort_level: Option<&str>,
+    ) -> config::Config {
+        config::Config {
+            default_model: default_model.map(str::to_string),
+            max_iterations,
+            temperature,
+            effort_level: effort_level.map(str::to_string),
+            ..config::Config::default()
+        }
+    }
+
+    #[test]
+    fn a_flag_beats_the_config_which_beats_the_fallback() {
+        let config = config_with(Some("config-model"), None, None, None);
+        assert_eq!(
+            resolve_model(&config, Some("flag-model".to_string())),
+            "flag-model"
+        );
+        assert_eq!(resolve_model(&config, None), "config-model");
+
+        // Cleared with `comms model --clear`, which writes null: the
+        // fallback is what a request is actually made with.
+        let cleared = config_with(None, None, None, None);
+        assert_eq!(resolve_model(&cleared, None), config::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn a_cleared_temperature_stays_cleared() {
+        // The documented contract: null means "send no temperature field",
+        // not "fall back to 0.7". Resolving it to a number would silently
+        // undo `comms temperature --clear`.
+        let cleared = config_with(None, None, None, None);
+        assert_eq!(resolve_temperature(&cleared, None), None);
+        // A flag still overrides it for that one call.
+        assert_eq!(resolve_temperature(&cleared, Some(1.5)), Some(1.5));
+
+        let set = config_with(None, None, Some(0.7), None);
+        assert_eq!(resolve_temperature(&set, None), Some(0.7));
+        assert_eq!(resolve_temperature(&set, Some(1.5)), Some(1.5));
+    }
+
+    #[test]
+    fn a_cleared_max_iterations_stays_cleared() {
+        // Same rule, and the one with teeth: agent mode refuses to run
+        // without a cap rather than inventing one — see
+        // `agent::run_agent_turn`.
+        let cleared = config_with(None, None, None, None);
+        assert_eq!(resolve_max_iterations(&cleared, None), None);
+        assert_eq!(resolve_max_iterations(&cleared, Some(5)), Some(5));
+
+        let set = config_with(None, Some(20), None, None);
+        assert_eq!(resolve_max_iterations(&set, None), Some(20));
+        assert_eq!(resolve_max_iterations(&set, Some(5)), Some(5));
+    }
+
+    #[test]
+    fn a_cleared_effort_level_stays_cleared() {
+        let cleared = config_with(None, None, None, None);
+        assert_eq!(resolve_effort_level(&cleared, None), None);
+        assert_eq!(
+            resolve_effort_level(&cleared, Some("high".to_string())),
+            Some("high".to_string())
+        );
+
+        let set = config_with(None, None, None, Some("low"));
+        assert_eq!(resolve_effort_level(&set, None), Some("low".to_string()));
+        assert_eq!(
+            resolve_effort_level(&set, Some("high".to_string())),
+            Some("high".to_string())
+        );
+    }
+
+    #[test]
+    fn an_entirely_empty_config_resolves_to_something_usable() {
+        // What a fresh install with no config.json resolves to: a model to
+        // call, and nothing else asserted — every other field being absent
+        // is itself the correct answer.
+        let empty = config_with(None, None, None, None);
+        assert_eq!(resolve_model(&empty, None), config::DEFAULT_MODEL);
+        assert_eq!(resolve_temperature(&empty, None), None);
+        assert_eq!(resolve_effort_level(&empty, None), None);
+        assert_eq!(resolve_max_iterations(&empty, None), None);
+    }
 }

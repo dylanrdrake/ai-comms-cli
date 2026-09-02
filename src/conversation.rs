@@ -47,7 +47,10 @@ pub enum Command {
     ResetEffort,
     /// Toggle verbose tool detail in the TUI view. Purely a display
     /// setting; the agent loop never sees it.
-    ToggleVerbose,
+    /// Show full tool-call detail for this session, or stop.
+    SetVerbose(bool),
+    /// Stream replies token-by-token for this session, or wait for the whole reply.
+    SetStream(bool),
     /// Confine the agent's file writes to the working directory, or let
     /// them go anywhere.
     SetSandbox(bool),
@@ -120,6 +123,9 @@ pub enum Event {
     SandboxChanged {
         sandbox: bool,
     },
+    StreamChanged {
+        stream: bool,
+    },
     /// The tool-calling iteration cap changed (or a change failed). Front
     /// ends re-label from here rather than assuming the command succeeded.
     /// `None` means nullified — turns fall back to the configured default.
@@ -164,7 +170,8 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         Submission::SetAgentic(agentic) => Some(Command::SetAgentic(*agentic)),
         Submission::SetEffort(effort_level) => Some(Command::SetEffort(effort_level.clone())),
         Submission::ResetEffort => Some(Command::ResetEffort),
-        Submission::ToggleVerbose => Some(Command::ToggleVerbose),
+        Submission::SetVerbose(verbose) => Some(Command::SetVerbose(*verbose)),
+        Submission::SetStream(stream) => Some(Command::SetStream(*stream)),
         Submission::SetSandbox(sandbox) => Some(Command::SetSandbox(*sandbox)),
         Submission::SetMaxIterations(max_iterations) => {
             Some(Command::SetMaxIterations(*max_iterations))
@@ -185,6 +192,9 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         | Submission::ShowApproval
         | Submission::ShowSandbox
         | Submission::ShowStatus
+        | Submission::ShowVerbose
+        | Submission::ShowStream
+        | Submission::ShowTemperature
         | Submission::UnknownCommand(_) => None,
     }
 }
@@ -305,7 +315,8 @@ impl Worker {
                 Command::SetAgentic(agentic) => self.set_agentic(agentic),
                 Command::SetEffort(effort_level) => self.set_effort(effort_level),
                 Command::ResetEffort => self.reset_effort(),
-                Command::ToggleVerbose => self.toggle_verbose(),
+                Command::SetVerbose(verbose) => self.set_verbose(verbose),
+                Command::SetStream(stream) => self.set_stream(stream),
                 Command::SetSandbox(sandbox) => self.set_sandbox(sandbox),
                 Command::SetMaxIterations(max_iterations) => {
                     self.set_max_iterations(max_iterations)
@@ -350,6 +361,9 @@ impl Worker {
         let max_iterations = self.session.max_iterations();
         let temperature = self.session.temperature();
         let gates = self.gates.clone();
+        // Snapshotted per turn, like model and effort: streaming shapes how
+        // the next request is made, not what a running tool may do.
+        let stream = self.session.stream();
         let agentic = self.agentic;
 
         let mut turn = tokio::spawn(async move {
@@ -364,6 +378,7 @@ impl Worker {
                     temperature,
                     &gates,
                     effort_level,
+                    stream,
                 )
                 .await
             } else {
@@ -374,6 +389,7 @@ impl Worker {
                     &model,
                     temperature,
                     effort_level,
+                    stream,
                 )
                 .await
             };
@@ -441,7 +457,8 @@ impl Worker {
                         Some(Command::SetAgentic(agentic)) => self.set_agentic(agentic),
                         Some(Command::SetEffort(effort_level)) => self.set_effort(effort_level),
                         Some(Command::ResetEffort) => self.reset_effort(),
-                        Some(Command::ToggleVerbose) => self.toggle_verbose(),
+                        Some(Command::SetVerbose(verbose)) => self.set_verbose(verbose),
+                        Some(Command::SetStream(stream)) => self.set_stream(stream),
                         // Like approval, this reaches the running turn: it
                         // decides what a tool may do, not what the next
                         // request looks like.
@@ -545,16 +562,24 @@ impl Worker {
     /// Flips verbose tool detail against the session's own confirmed
     /// state, rather than trusting whatever the front end last rendered,
     /// so repeated toggles can't drift out of sync with it.
-    fn toggle_verbose(&mut self) {
-        let verbose = !self.session.verbose();
+    fn set_verbose(&mut self, verbose: bool) {
         if let Err(e) = self.session.set_verbose(verbose) {
             let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                message: format!("Failed to toggle verbose: {e}"),
+                message: format!("Failed to switch verbose: {e}"),
             }));
         }
         let _ = self.events.send(Event::VerboseChanged {
             verbose: self.session.verbose(),
         });
+    }
+
+    fn set_stream(&mut self, stream: bool) {
+        if let Err(e) = self.session.set_stream(stream) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to switch streaming: {e}"),
+            }));
+        }
+        let _ = self.events.send(Event::StreamChanged { stream });
     }
 
     /// Switches the tool-calling iteration cap and tells the front end what
@@ -678,6 +703,91 @@ impl AgentUi for ChannelUi {
             // A dropped responder (front end gone, turn cancelled) denies,
             // rather than hanging the loop forever.
             Ok(rx.await.unwrap_or(false))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every submission that changes session state, paired with the command
+    /// it must produce. Listed rather than derived, so a mapping that
+    /// silently changes shows up as a failure here.
+    fn state_changing() -> Vec<(Submission, Command)> {
+        vec![
+            (
+                Submission::Message("hi".to_string()),
+                Command::Send("hi".to_string()),
+            ),
+            (
+                Submission::SetModel("m".to_string()),
+                Command::SetModel("m".to_string()),
+            ),
+            (Submission::SetAgentic(true), Command::SetAgentic(true)),
+            (
+                Submission::SetEffort(Some("high".to_string())),
+                Command::SetEffort(Some("high".to_string())),
+            ),
+            (Submission::ResetEffort, Command::ResetEffort),
+            (Submission::SetVerbose(true), Command::SetVerbose(true)),
+            (Submission::SetStream(false), Command::SetStream(false)),
+            (Submission::SetSandbox(false), Command::SetSandbox(false)),
+            (
+                Submission::SetMaxIterations(Some(5)),
+                Command::SetMaxIterations(Some(5)),
+            ),
+            (Submission::ResetMaxIterations, Command::ResetMaxIterations),
+            (
+                Submission::SetTemperature(Some(1.0)),
+                Command::SetTemperature(Some(1.0)),
+            ),
+            (Submission::ResetTemperature, Command::ResetTemperature),
+            (
+                Submission::SetApproval {
+                    category: "write".to_string(),
+                    enabled: false,
+                },
+                Command::SetApproval {
+                    category: "write".to_string(),
+                    enabled: false,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn state_changing_submissions_go_to_the_worker() {
+        for (submission, expected) in state_changing() {
+            let command = command_for(&submission)
+                .unwrap_or_else(|| panic!("{submission:?} should reach the worker"));
+            assert_eq!(
+                format!("{command:?}"),
+                format!("{expected:?}"),
+                "{submission:?} mapped wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_submissions_are_answered_locally() {
+        // These never reach the worker: the front end already holds what
+        // they report, and a round trip would only add latency and a second
+        // source of truth.
+        for submission in [
+            Submission::ShowModel,
+            Submission::ShowApproval,
+            Submission::ShowSandbox,
+            Submission::ShowStatus,
+            Submission::ShowVerbose,
+            Submission::ShowStream,
+            Submission::ShowTemperature,
+            Submission::UnknownCommand("nope".to_string()),
+        ] {
+            assert!(
+                command_for(&submission).is_none(),
+                "{submission:?} should be answered by the front end"
+            );
         }
     }
 }

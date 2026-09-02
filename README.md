@@ -143,6 +143,19 @@ In `tui`, the session's current value shows in the settings row as 🌡
 Persistence](#session-persistence)), color-coded cool-to-hot (cyan → yellow
 → orange → pink) as it rises from 0.
 
+#### `verbose [on|off]`
+View or set whether new sessions start showing full tool-call detail — arguments, results, and the model's own thinking.
+
+```bash
+# Show the current setting
+comms verbose
+
+# Start new sessions verbose
+comms verbose on
+```
+
+Off by default. This is the *starting* value: a session snapshots it at creation, and `/verbose` from then on toggles that session, which is remembered per session rather than changing this. `comms agent -v` is unaffected — it's a per-run flag.
+
 #### `sandbox [on|off]`
 View or set whether the agent's file-writing tools are confined to your current working directory.
 
@@ -158,18 +171,18 @@ On by default, and the bound is the working directory alone — not your home di
 
 This is the persistent default; a session snapshots it at creation, and `/sandbox` changes the session you're in. It's a separate axis from `approval`: approval decides whether you're *asked* first, the sandbox decides whether the write is allowed at all.
 
-#### `effort-level [value]`
+#### `effort [value]`
 View or set the persistent default reasoning effort sent to models that support it. Applies to `ask`, `session`, and `agent`. Usually `low`, `medium`, or `high`, but not checked against a fixed list — models vary in what they accept, and an unsupported value just gets rejected by the API.
 
 ```bash
 # Show the current effort level
-comms effort-level
+comms effort
 
 # Set the default
-comms effort-level high
+comms effort high
 
 # Clear it (falls back to the provider default)
-comms effort-level --clear
+comms effort --clear
 ```
 
 Overridden per call with `--effort-level` on `ask`, `session`, or `agent`, or
@@ -198,7 +211,7 @@ comms endpoint --clear
 Switching endpoints doesn't switch your API key or default model automatically — run `comms login` to set the new provider's key, and `comms model` to set a model it actually serves.
 
 #### `effort-style [value]`
-View or set how the reasoning effort level (`comms effort-level`) is serialized in requests, since providers disagree on the shape:
+View or set how the reasoning effort level (`comms effort`) is serialized in requests, since providers disagree on the shape:
 
 - `nested` (default) — sends `reasoning: { effort: "<level>" }`, as OpenRouter expects.
 - `flat` — sends `reasoning_effort: "<level>"` at the top level, as OrcaRouter expects.
@@ -283,13 +296,15 @@ exactly:
 | `/effort <level>` | Switch reasoning effort for the rest of the session, and remember it |
 | `/effort clear` | Nullify it — no effort field is sent at all until set again |
 | `/effort default` | Read the *currently* configured default effort and save that to the session |
-| `/verbose` | Toggle showing the model's thinking, plus full tool call arguments/results instead of a one-line notice |
+| `/verbose <on\|off>` | Show the model's thinking and full tool call arguments/results, or a one-line notice per call. Bare `/verbose` shows the current setting |
+| `/stream <on\|off>` | Stream this session's replies token-by-token, or wait for the whole reply. Bare `/stream` shows the current setting. Overrides `comms stream` for this session |
 | `/max-iterations <n>` | Switch the tool-calling iteration cap per turn (agent mode only), and remember it |
 | `/max-iterations clear` | Nullify it — agent mode then errors on any turn until a cap is set again |
 | `/max-iterations default` | Read the *currently* configured default cap and save that to the session |
 | `/temperature <n>` (or `/temp <n>`) | Switch the sampling temperature for the rest of the session, and remember it |
 | `/temperature clear` (or `/temp clear`) | Nullify it — requests are then sent with no temperature field |
 | `/temperature default` (or `/temp default`) | Read the *currently* configured default temperature and save that to the session |
+| `/temperature` (or `/temp`) | Show the temperature currently in use |
 | `/approval <read\|write\|terminal\|all> <on\|off>` | Switch a tool-approval gate for the rest of the session, and remember it. Takes effect immediately — including partway through a running turn, from its next tool call |
 | `/approval` | Show the approval gates currently in use |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
@@ -407,13 +422,15 @@ first message.
 | `/effort <level>` | Switch reasoning effort for the rest of the session, and remember it |
 | `/effort clear` | Nullify it — no effort field is sent at all until set again |
 | `/effort default` | Read the *currently* configured default effort and save that to the session |
-| `/verbose` | Toggle showing the model's thinking, plus full tool call arguments/results instead of a one-line notice |
+| `/verbose <on\|off>` | Show the model's thinking and full tool call arguments/results, or a one-line notice per call. Bare `/verbose` shows the current setting |
+| `/stream <on\|off>` | Stream this session's replies token-by-token, or wait for the whole reply. Bare `/stream` shows the current setting. Overrides `comms stream` for this session |
 | `/max-iterations <n>` | Switch the tool-calling iteration cap per turn (agent mode only), and remember it |
 | `/max-iterations clear` | Nullify it — agent mode then errors on any turn until a cap is set again |
 | `/max-iterations default` | Read the *currently* configured default cap and save that to the session |
 | `/temperature <n>` (or `/temp <n>`) | Switch the sampling temperature for the rest of the session, and remember it |
 | `/temperature clear` (or `/temp clear`) | Nullify it — requests are then sent with no temperature field |
 | `/temperature default` (or `/temp default`) | Read the *currently* configured default temperature and save that to the session |
+| `/temperature` (or `/temp`) | Show the temperature currently in use |
 | `/approval <read\|write\|terminal\|all> <on\|off>` | Switch a tool-approval gate for the rest of the session, and remember it. Takes effect immediately — including partway through a running turn, from its next tool call |
 | `/approval` | Show the approval gates currently in use |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
@@ -503,6 +520,7 @@ Configuration is stored at `~/.comms/config.json`:
   "effort_style": "nested",
   "extra_headers": {},
   "sandbox": true,
+  "verbose": false,
   "stream": true
 }
 ```
@@ -515,6 +533,7 @@ Configuration is stored at `~/.comms/config.json`:
 - `approval` settings control whether the agent prompts before performing actions. Managed via `comms approval`.
 - `max_iterations` is managed via `comms max-iterations` and is the default for `session`/`agent` when `--max-iterations` isn't passed, and for `tui`, which has no flags at all. `null` (after `comms max-iterations --clear`) means agent mode has no cap until one is set somewhere — it does not fall back to 20.
 - `temperature` is managed via `comms temperature` and is the default for `ask`, `session`, and `agent` when `--temperature` isn't passed, and for `tui`, which has no flags at all. `null` (after `comms temperature --clear`) means requests are sent with no `temperature` field at all — it does not fall back to 0.7.
+- `verbose` is managed via `comms verbose` and is the value new sessions start with; `/verbose` changes the session you're in, not this.
 - `effort_level` is managed via `comms effort-level` and is sent for `ask`, `session`, and `agent` when set, shaped according to `effort_style`.
 - `effort_style` is managed via `comms effort-style` and controls whether the effort level is sent flat, nested, or omitted (see [`effort-style`](#effort-style-value)).
 - `extra_headers` is managed via `comms headers` and is merged into every API request.

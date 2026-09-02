@@ -9,7 +9,6 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
-* need a global verbose setting
 * need a --title arg for the comms session command to name the command on creation from the terminal and a /session title <new title> in-session command
 * steering: send while a turn is running and have it join that turn, not the next
   one. Inject drained messages as user messages at the TOP of a run_agent_turn
@@ -19,6 +18,8 @@ NEXT:
   max_iterations boundary, and for anything left undrained when a turn ends —
   losing a typed message is the worst failure here. Takes effect at the next
   model call, not mid-request. TUI first: it already accepts input mid-turn.
+  Show it: a growing list of pending messages above the message input, so what
+  is waiting to join the turn is visible rather than implied by a count.
 * Websearch
 * session claimed flag on session table in case 2 comms processes open the same session. What would that do? is that ok?
 * should messages table be expanded to include tool calls, errors, etc.. OR errors logged somewhere
@@ -29,9 +30,4 @@ NEXT:
 * [model] [effort]
   AI:
 * confirmation modal for deleting session where you type in name of session
-* growing queue list above message input
 * $ for running terminal commands
-
-/approval all off
-
-* harness based around concepts of requests  and sessions
