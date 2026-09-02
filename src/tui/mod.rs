@@ -19,7 +19,7 @@ mod render;
 use crate::agent::AGENT_CHAT_SYSTEM_PROMPT;
 use crate::client::{ChatMessage, Client};
 use crate::config::ApprovalSettings;
-use crate::conversation::{Command, Conversation};
+use crate::conversation::{command_for, Command, Conversation};
 use crate::session::ChatSession;
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
 use crate::ui::{parse_yes_no, response_label};
@@ -584,79 +584,72 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
         }
         KeyCode::Enter => {
             if let Some(text) = app.take_input() {
-                match app::classify(&text) {
-                    app::Submission::Message(text) => conversation.send(Command::Send(text)),
-                    app::Submission::SetModel(model) => conversation.send(Command::SetModel(model)),
-                    // Answered by the worker so the reply reflects what the
-                    // session actually holds, not what the UI assumes.
-                    app::Submission::ShowModel => {
-                        conversation.send(Command::SetModel(app.model.clone()))
-                    }
-                    app::Submission::SetAgentic(agentic) => {
-                        conversation.send(Command::SetAgentic(agentic))
-                    }
-                    app::Submission::SetEffort(effort_level) => {
-                        conversation.send(Command::SetEffort(effort_level))
-                    }
-                    app::Submission::ResetEffort => conversation.send(Command::ResetEffort),
-                    app::Submission::ToggleVerbose => conversation.send(Command::ToggleVerbose),
-                    app::Submission::SetSandbox(sandbox) => {
-                        conversation.send(Command::SetSandbox(sandbox))
-                    }
-                    // A read of state the UI already holds — no round trip
-                    // through the worker, same as `/approval` bare.
-                    // Read from state the UI already holds, like the other
-                    // show-only commands.
-                    app::Submission::ShowStatus => {
-                        let approval = app.approval.clone();
-                        let rows = crate::ui::session_settings_rows(&crate::ui::SessionSettings {
-                            id: &app.session_id,
-                            title: &app.title,
-                            model: &app.model,
-                            agentic: app.agentic,
-                            effort_level: app.effort_level.as_deref(),
-                            temperature: app.temperature,
-                            max_iterations: app.max_iterations,
-                            verbose: app.verbose,
-                            sandbox: app.sandbox,
-                            approval: &approval,
-                        });
-                        app.transcript.push(TranscriptItem::SessionStatus(rows));
-                    }
-                    app::Submission::ShowSandbox => {
-                        app.transcript
-                            .push(TranscriptItem::Notice(crate::ui::sandbox_notice(
-                                app.sandbox,
-                                false,
-                            )));
-                    }
-                    app::Submission::SetMaxIterations(max_iterations) => {
-                        conversation.send(Command::SetMaxIterations(max_iterations))
-                    }
-                    app::Submission::ResetMaxIterations => {
-                        conversation.send(Command::ResetMaxIterations)
-                    }
-                    app::Submission::SetTemperature(temperature) => {
-                        conversation.send(Command::SetTemperature(temperature))
-                    }
-                    app::Submission::ResetTemperature => {
-                        conversation.send(Command::ResetTemperature)
-                    }
-                    app::Submission::SetApproval { category, enabled } => {
-                        conversation.send(Command::SetApproval { category, enabled })
-                    }
-                    // Purely a read of state the UI already holds — no need
-                    // to round-trip through the worker.
-                    app::Submission::ShowApproval => {
-                        app.transcript.push(TranscriptItem::ApprovalStatus {
-                            approval: app.approval.clone(),
-                            changed: false,
-                        });
-                    }
-                    // Same deal: a failed command is reported locally,
-                    // without needing the worker at all.
-                    app::Submission::UnknownCommand(message) => {
-                        app.transcript.push(TranscriptItem::Error(message));
+                let submission = app::classify(&text);
+                match command_for(&submission) {
+                    // Everything that changes session state is the worker's
+                    // to apply; it replies with the event that updates the
+                    // view, so the two can't disagree.
+                    Some(command) => conversation.send(command),
+                    // The rest are read-only, answered from state this side
+                    // already holds. `command_for` is the exhaustive match,
+                    // so a new submission variant is classified there first.
+                    None => {
+                        match submission {
+                            // Round-tripped rather than read locally, so the
+                            // answer reflects what the session actually holds.
+                            app::Submission::ShowModel => {
+                                conversation.send(Command::SetModel(app.model.clone()))
+                            }
+                            app::Submission::ShowStatus => {
+                                let approval = app.approval.clone();
+                                let rows =
+                                    crate::ui::session_settings_rows(&crate::ui::SessionSettings {
+                                        id: &app.session_id,
+                                        title: &app.title,
+                                        model: &app.model,
+                                        agentic: app.agentic,
+                                        effort_level: app.effort_level.as_deref(),
+                                        temperature: app.temperature,
+                                        max_iterations: app.max_iterations,
+                                        verbose: app.verbose,
+                                        sandbox: app.sandbox,
+                                        approval: &approval,
+                                    });
+                                app.transcript.push(TranscriptItem::SessionStatus(rows));
+                            }
+                            app::Submission::ShowSandbox => {
+                                app.transcript.push(TranscriptItem::Notice(
+                                    crate::ui::sandbox_notice(app.sandbox, false),
+                                ));
+                            }
+                            app::Submission::ShowApproval => {
+                                app.transcript.push(TranscriptItem::ApprovalStatus {
+                                    approval: app.approval.clone(),
+                                    changed: false,
+                                });
+                            }
+                            app::Submission::UnknownCommand(message) => {
+                                app.transcript.push(TranscriptItem::Error(message));
+                            }
+                            // Listed rather than caught by `_`, so adding
+                            // a submission has to be considered on this side
+                            // too — a catch-all here would silently ignore a
+                            // new read-only one.
+                            app::Submission::Message(_)
+                            | app::Submission::SetModel(_)
+                            | app::Submission::SetAgentic(_)
+                            | app::Submission::SetEffort(_)
+                            | app::Submission::ResetEffort
+                            | app::Submission::ToggleVerbose
+                            | app::Submission::SetSandbox(_)
+                            | app::Submission::SetMaxIterations(_)
+                            | app::Submission::ResetMaxIterations
+                            | app::Submission::SetTemperature(_)
+                            | app::Submission::ResetTemperature
+                            | app::Submission::SetApproval { .. } => {
+                                unreachable!("command_for routes these to the worker")
+                            }
+                        }
                     }
                 }
             }

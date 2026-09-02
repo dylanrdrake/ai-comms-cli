@@ -14,7 +14,7 @@ use crate::agent;
 use crate::client::Client;
 use crate::config::{ApprovalSettings, SessionGates};
 use crate::session::ChatSession;
-use crate::ui::{AgentEvent, AgentUi, ApprovalRequest};
+use crate::ui::{AgentEvent, AgentUi, ApprovalRequest, Submission};
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -145,6 +145,50 @@ pub enum Event {
 }
 
 /// Handle to a running conversation worker.
+/// The [`Command`] a submission turns into, or `None` when the front end
+/// answers it itself.
+///
+/// Shared so the TUI and the CLI can't drift on what a command means. The
+/// split is: anything that *changes* session state goes to the worker, which
+/// owns that state; anything that only reads it — or reports a mistyped
+/// command — is answered locally from what the front end already holds, with
+/// no round trip.
+///
+/// Deliberately exhaustive. A new [`Submission`] variant won't compile until
+/// it's classified here, which is the one place that decides the question for
+/// every front end at once.
+pub fn command_for(submission: &Submission) -> Option<Command> {
+    match submission {
+        Submission::Message(text) => Some(Command::Send(text.clone())),
+        Submission::SetModel(model) => Some(Command::SetModel(model.clone())),
+        Submission::SetAgentic(agentic) => Some(Command::SetAgentic(*agentic)),
+        Submission::SetEffort(effort_level) => Some(Command::SetEffort(effort_level.clone())),
+        Submission::ResetEffort => Some(Command::ResetEffort),
+        Submission::ToggleVerbose => Some(Command::ToggleVerbose),
+        Submission::SetSandbox(sandbox) => Some(Command::SetSandbox(*sandbox)),
+        Submission::SetMaxIterations(max_iterations) => {
+            Some(Command::SetMaxIterations(*max_iterations))
+        }
+        Submission::ResetMaxIterations => Some(Command::ResetMaxIterations),
+        Submission::SetTemperature(temperature) => Some(Command::SetTemperature(*temperature)),
+        Submission::ResetTemperature => Some(Command::ResetTemperature),
+        Submission::SetApproval { category, enabled } => Some(Command::SetApproval {
+            category: category.clone(),
+            enabled: *enabled,
+        }),
+
+        // Read-only, and front-end specific in how they're shown. `/model`
+        // bare is here too: the TUI round-trips it through the worker so the
+        // answer reflects what the session actually holds, while the CLI
+        // reads its own `ChatSession` directly.
+        Submission::ShowModel
+        | Submission::ShowApproval
+        | Submission::ShowSandbox
+        | Submission::ShowStatus
+        | Submission::UnknownCommand(_) => None,
+    }
+}
+
 pub struct Conversation {
     commands: mpsc::UnboundedSender<Command>,
     events: mpsc::UnboundedReceiver<Event>,

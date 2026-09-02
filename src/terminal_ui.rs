@@ -68,129 +68,142 @@ impl TerminalAgentUi {
     }
 }
 
-impl AgentUi for TerminalAgentUi {
-    fn event(&mut self, event: AgentEvent) -> impl Future<Output = ()> + Send {
-        async move {
-            match event {
-                AgentEvent::IterationStarted { iteration } => {
-                    if self.verbose {
-                        println!("{}", format!("\n[Iteration {}]", iteration).bright_black());
-                    }
+impl TerminalAgentUi {
+    /// Draws one agent event.
+    ///
+    /// Inherent rather than only reachable through [`AgentUi`], because the
+    /// two ways this front end is driven arrive by different routes: the
+    /// one-shot `agent` command calls the loop inline and gets events
+    /// through the trait, while a `session` running on a
+    /// [`crate::conversation::Conversation`] sees them re-emitted as
+    /// `Event::Agent(..)` and never touches the trait at all. Both render
+    /// identically because both land here.
+    pub async fn render_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::IterationStarted { iteration } => {
+                if self.verbose {
+                    println!("{}", format!("\n[Iteration {}]", iteration).bright_black());
                 }
-                AgentEvent::RequestStarted => {
-                    self.spinner = Some(Spinner::start("Thinking..."));
+            }
+            AgentEvent::RequestStarted => {
+                self.spinner = Some(Spinner::start("Thinking..."));
+            }
+            AgentEvent::RequestFinished => {
+                if let Some(spinner) = self.spinner.take() {
+                    spinner.stop().await;
                 }
-                AgentEvent::RequestFinished => {
+            }
+            // Deliberately ignored: a scrolling terminal can't re-wrap
+            // text it has already printed, so the CLI buffers and renders
+            // the complete `AssistantMessage` below instead.
+            AgentEvent::AssistantDelta { .. } => {}
+            AgentEvent::AssistantMessage {
+                model,
+                effort_level,
+                text,
+            } => {
+                if self.show_model_label {
+                    let label = format!("{}:", response_label(&model, &effort_level));
+                    println!("{} {}", label.cyan(), wrap::wrap(&text));
+                } else {
+                    // Matches the TUI transcript's dot marker, now that
+                    // neither shows a model label on every reply — and,
+                    // like the TUI's gutter, a wrapped continuation
+                    // line lines up under the first rather than
+                    // resuming at column 0.
+                    println!("{} {}", "●".cyan(), wrap::wrap_indented(&text, "  "));
+                }
+                // One blank line after every transcript unit, matching
+                // the TUI, which spaces its items the same way
+                // regardless of what kind each one is.
+                println!();
+            }
+            AgentEvent::Thinking { text } => {
+                if self.verbose {
+                    // The spinner is still animating on the current line
+                    // here: the reply has resolved, but `RequestFinished`
+                    // hasn't been emitted yet. Printing over it lands
+                    // mid-line and then gets half-overwritten by the next
+                    // redraw, so clear it first and let the thinking
+                    // start its own line. The request it was tracking is
+                    // already done, so `RequestFinished` simply finds
+                    // nothing left to stop.
                     if let Some(spinner) = self.spinner.take() {
                         spinner.stop().await;
                     }
-                }
-                // Deliberately ignored: a scrolling terminal can't re-wrap
-                // text it has already printed, so the CLI buffers and renders
-                // the complete `AssistantMessage` below instead.
-                AgentEvent::AssistantDelta { .. } => {}
-                AgentEvent::AssistantMessage {
-                    model,
-                    effort_level,
-                    text,
-                } => {
-                    if self.show_model_label {
-                        let label = format!("{}:", response_label(&model, &effort_level));
-                        println!("{} {}", label.cyan(), wrap::wrap(&text));
-                    } else {
-                        // Matches the TUI transcript's dot marker, now that
-                        // neither shows a model label on every reply — and,
-                        // like the TUI's gutter, a wrapped continuation
-                        // line lines up under the first rather than
-                        // resuming at column 0.
-                        println!("{} {}", "●".cyan(), wrap::wrap_indented(&text, "  "));
-                    }
-                    // One blank line after every transcript unit, matching
-                    // the TUI, which spaces its items the same way
-                    // regardless of what kind each one is.
+                    // Same marker-plus-hanging-indent shape the
+                    // assistant's own reply uses, one step dimmer.
+                    println!(
+                        "{} {}",
+                        "💭".bright_black(),
+                        wrap::wrap_indented(&text, "   ").bright_black().italic()
+                    );
                     println!();
                 }
-                AgentEvent::Thinking { text } => {
-                    if self.verbose {
-                        // The spinner is still animating on the current line
-                        // here: the reply has resolved, but `RequestFinished`
-                        // hasn't been emitted yet. Printing over it lands
-                        // mid-line and then gets half-overwritten by the next
-                        // redraw, so clear it first and let the thinking
-                        // start its own line. The request it was tracking is
-                        // already done, so `RequestFinished` simply finds
-                        // nothing left to stop.
-                        if let Some(spinner) = self.spinner.take() {
-                            spinner.stop().await;
-                        }
-                        // Same marker-plus-hanging-indent shape the
-                        // assistant's own reply uses, one step dimmer.
-                        println!(
-                            "{} {}",
-                            "💭".bright_black(),
-                            wrap::wrap_indented(&text, "   ").bright_black().italic()
-                        );
-                        println!();
-                    }
-                }
-                AgentEvent::ToolCallStarted { name, arguments } => {
-                    // Printed without a trailing newline — closed by
-                    // whichever of approval/denial/completion resolves it
-                    // next, with a trailing status marker, so the whole
-                    // call reads as one line: the CLI's equivalent of the
-                    // TUI transcript's gutter-marker-plus-trailing-status
-                    // row instead of repeating the tool's name on its own
-                    // line every time.
-                    print_tool_header(&name, &arguments);
-                    self.tool_header_open = true;
-                    self.approval_shown = false;
-                    if self.verbose {
-                        println!();
-                        self.tool_header_open = false;
-                        print_fields(&tool_call_fields(&name, &arguments));
-                    }
-                    self.pending_arguments = Some(arguments);
-                }
-                AgentEvent::ToolCallDenied { name: _ } => {
-                    // Consumes the pending call so the ToolCallCompleted
-                    // that always follows a denial knows not to report the
-                    // same call again as if it had succeeded. A denial only
-                    // ever happens after an approval prompt — the typed `N`
-                    // that produced it already says how this resolved, so
-                    // there's no separate marker to draw underneath it.
-                    let _ = self.pending_arguments.take();
+            }
+            AgentEvent::ToolCallStarted { name, arguments } => {
+                // Printed without a trailing newline — closed by
+                // whichever of approval/denial/completion resolves it
+                // next, with a trailing status marker, so the whole
+                // call reads as one line: the CLI's equivalent of the
+                // TUI transcript's gutter-marker-plus-trailing-status
+                // row instead of repeating the tool's name on its own
+                // line every time.
+                print_tool_header(&name, &arguments);
+                self.tool_header_open = true;
+                self.approval_shown = false;
+                if self.verbose {
                     println!();
+                    self.tool_header_open = false;
+                    print_fields(&tool_call_fields(&name, &arguments));
                 }
-                AgentEvent::ToolCallCompleted { name: _, result } => {
-                    // Only the non-denied path reaches here with a pending
-                    // entry; a denial already reported itself and cleared it.
-                    if self.pending_arguments.take().is_none() {
-                        return;
-                    }
-                    // A call that went through an approval prompt already
-                    // has its answer on screen (the typed `y`); only a call
-                    // that ran with no prompt at all still needs its own
-                    // closing marker.
-                    if !self.approval_shown {
-                        self.close_tool_header("✓".green());
-                    }
-                    if self.verbose {
-                        print_fields(&json_fields(&result));
-                    }
+                self.pending_arguments = Some(arguments);
+            }
+            AgentEvent::ToolCallDenied { name: _ } => {
+                // Consumes the pending call so the ToolCallCompleted
+                // that always follows a denial knows not to report the
+                // same call again as if it had succeeded. A denial only
+                // ever happens after an approval prompt — the typed `N`
+                // that produced it already says how this resolved, so
+                // there's no separate marker to draw underneath it.
+                let _ = self.pending_arguments.take();
+                println!();
+            }
+            AgentEvent::ToolCallCompleted { name: _, result } => {
+                // Only the non-denied path reaches here with a pending
+                // entry; a denial already reported itself and cleared it.
+                if self.pending_arguments.take().is_none() {
+                    return;
+                }
+                // A call that went through an approval prompt already
+                // has its answer on screen (the typed `y`); only a call
+                // that ran with no prompt at all still needs its own
+                // closing marker.
+                if !self.approval_shown {
+                    self.close_tool_header("✓".green());
+                }
+                if self.verbose {
+                    print_fields(&json_fields(&result));
+                }
+                println!();
+            }
+            AgentEvent::Error { message } => {
+                println!("{} {}", "✗".red(), message);
+                println!();
+            }
+            AgentEvent::TurnFinished => {
+                if self.verbose {
+                    println!("{}", "✓ Agent finished".green());
                     println!();
-                }
-                AgentEvent::Error { message } => {
-                    println!("{} {}", "✗".red(), message);
-                    println!();
-                }
-                AgentEvent::TurnFinished => {
-                    if self.verbose {
-                        println!("{}", "✓ Agent finished".green());
-                        println!();
-                    }
                 }
             }
         }
+    }
+}
+
+impl AgentUi for TerminalAgentUi {
+    fn event(&mut self, event: AgentEvent) -> impl Future<Output = ()> + Send {
+        self.render_agent_event(event)
     }
 
     fn approve(&mut self, request: ApprovalRequest) -> impl Future<Output = Result<bool>> + Send {
