@@ -663,6 +663,27 @@ Replace text in an existing file.
 ### `run_terminal_command`
 Execute a shell command and return the output. Supports custom working directory and timeout.
 
+### `web_fetch`
+Fetch an `http`/`https` URL and return the page as readable text rather than HTML.
+
+The agent can already reach the web through `run_terminal_command` — it can run
+`curl`. This exists because the raw page is mostly markup: converting first cuts
+a documentation page to between a half and a quarter of its size (measured: 4.0×
+on docs.rs, 3.8× on MDN, 2.0× on the Rust book), and whatever is fetched stays in
+the conversation for the rest of the turn.
+
+**It does not ask for approval.** It reads a page and changes nothing, and a
+prompt on every page is the friction that would send the model back to curling
+raw markup through `run_terminal_command` — which does prompt, and can then do
+anything. There is no `/approval` category for it.
+
+Refuses anything that isn't `http` or `https` (notably `file:`, which would read
+the disk through a tool the sandbox doesn't cover), refuses content types it
+can't read as text, caps a page at 1 MB, and times out after 30 seconds. What
+comes back is labelled untrusted: it is the only tool result that originates
+neither with you nor with your machine, so a page telling the agent to run
+something is an attack, and the approval prompt is what stands in the way.
+
 ## Configuration
 
 Configuration is stored at `~/.comms/config.json`:

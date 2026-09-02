@@ -27,6 +27,15 @@ fn get_tool_category(tool_name: &str) -> &'static str {
 }
 
 fn requires_approval(tool_name: &str, approval: &ApprovalSettings) -> bool {
+    // `web_fetch` never asks. It reads a page and changes nothing, and the
+    // point of having it at all is that the model reaches for it instead of
+    // curling raw markup — a prompt on every page is exactly the friction
+    // that would send it back to `run_terminal_command` — the more dangerous
+    // call, and one a session can silence with `/approval terminal off`.
+    if tool_name == "web_fetch" {
+        return false;
+    }
+
     match get_tool_category(tool_name) {
         "read" => approval.read_disk,
         "write" => approval.write_disk,
@@ -611,6 +620,18 @@ mod tests {
         assert!(!requires_approval("read_file", &write_only));
         assert!(requires_approval("write_file", &write_only));
         assert!(!requires_approval("run_terminal_command", &write_only));
+    }
+
+    #[test]
+    fn web_fetch_never_asks() {
+        // Deliberately exempt, and not via the `_ => true` fall-through that
+        // catches unmapped tools — this one is named. Prompting per page is
+        // what would push the model back to curling raw HTML.
+        assert!(!requires_approval("web_fetch", &settings(true, true, true)));
+        assert!(!requires_approval(
+            "web_fetch",
+            &settings(false, false, false)
+        ));
     }
 
     #[test]
