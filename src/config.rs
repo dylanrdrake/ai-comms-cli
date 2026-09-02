@@ -3,7 +3,7 @@ use keyring::Entry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -63,6 +63,12 @@ impl ApprovalSettings {
 pub const VALID_EFFORT_STYLES: [&str; 3] = ["flat", "nested", "none"];
 pub const DEFAULT_EFFORT_STYLE: &str = "nested";
 
+/// The model a request falls back to when neither a `--model` flag nor the
+/// config names one. Still consulted at the point of use as well as seeded
+/// into the config, because `comms model --clear` deliberately writes `null`
+/// and that has to keep meaning "use this".
+pub const DEFAULT_MODEL: &str = "openrouter/auto";
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     /// Legacy field: API keys used to be stored here in plaintext. Only
@@ -72,7 +78,7 @@ pub struct Config {
     pub api_key: Option<String>,
     #[serde(default = "default_base_url")]
     pub base_url: String,
-    #[serde(default)]
+    #[serde(default = "default_model")]
     pub default_model: Option<String>,
     #[serde(default)]
     pub approval: ApprovalSettings,
@@ -91,7 +97,7 @@ pub struct Config {
     pub effort_level: Option<String>,
     /// How to serialize `effort_level` for the current `base_url`'s provider.
     /// `None` falls back to `DEFAULT_EFFORT_STYLE` ("nested").
-    #[serde(default)]
+    #[serde(default = "default_effort_style")]
     pub effort_style: Option<String>,
     /// Extra HTTP headers sent with every API request, for providers that
     /// need something beyond `Authorization: Bearer <key>` (e.g. OpenRouter's
@@ -116,6 +122,20 @@ pub fn default_base_url() -> String {
     "https://openrouter.ai/api/v1".to_string()
 }
 
+/// The model used when nothing else names one. A seed rather than a bare
+/// `None`, so a config written from defaults says which model it will
+/// actually use instead of leaving `null` next to a literal buried in
+/// `resolve_model`.
+pub fn default_model() -> Option<String> {
+    Some(DEFAULT_MODEL.to_string())
+}
+
+/// Same deal: the shape effort is serialized in when the config doesn't say.
+/// See [`DEFAULT_EFFORT_STYLE`].
+pub fn default_effort_style() -> Option<String> {
+    Some(DEFAULT_EFFORT_STYLE.to_string())
+}
+
 /// The factory default for a fresh install (no `config.json` yet) and for
 /// migrating an old `config.json` written before this field existed. Once a
 /// user explicitly clears it with `comms max-iterations --clear`, it stays
@@ -134,13 +154,13 @@ impl Default for Config {
         Config {
             api_key: None,
             base_url: default_base_url(),
-            default_model: None,
+            default_model: default_model(),
             approval: ApprovalSettings::default(),
             max_iterations: default_max_iterations(),
             temperature: default_temperature(),
             sandbox: true,
             effort_level: None,
-            effort_style: None,
+            effort_style: default_effort_style(),
             extra_headers: HashMap::new(),
             stream: true,
         }
@@ -160,13 +180,34 @@ pub fn get_config_path() -> Result<PathBuf> {
     Ok(get_config_dir()?.join("config.json"))
 }
 
+/// Parses `config.json`, naming the file and the position when it can't be.
+///
+/// Split from [`load_config`] so it's testable without moving `HOME` around,
+/// and separate from the file-missing path, which is not an error: an absent
+/// config means "use the defaults", a malformed one means "this says
+/// something I can't read".
+fn parse_config(content: &str, path: &Path) -> Result<Config> {
+    serde_json::from_str(content).map_err(|e| {
+        anyhow!(
+            "Could not parse {}: {e}\n\n\
+             Fix the file, or delete it to start from defaults.",
+            path.display()
+        )
+    })
+}
+
 pub fn load_config() -> Result<Config> {
     let config_path = get_config_path()?;
 
     let mut config = if config_path.exists() {
         let content = fs::read_to_string(&config_path)?;
-        // If deserialization fails, fall back to defaults and let the user fix it
-        serde_json::from_str(&content).unwrap_or_default()
+        // Refused rather than defaulted. Carrying on would mean sending the
+        // API key to whatever `base_url` defaults to instead of the provider
+        // that was configured — and worse, the next setting command would
+        // save defaults-plus-one-change over the file, destroying everything
+        // else in it. Nothing is written here: the file stays exactly as it
+        // was typed so it can be fixed.
+        parse_config(&content, &config_path)?
     } else {
         Config::default()
     };
@@ -277,6 +318,54 @@ impl SessionGates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partial_config_keeps_its_values_and_seeds_the_rest() {
+        // Hand-writing one key is a supported way to configure this, so the
+        // keys that are there must survive and the rest must come from
+        // their seeds — not from `Config::default()` wholesale.
+        let config = parse_config(
+            r#"{"temperature": 1.5, "base_url": "https://example.test/v1"}"#,
+            Path::new("config.json"),
+        )
+        .expect("a partial config is valid");
+
+        assert_eq!(config.temperature, Some(1.5));
+        assert_eq!(config.base_url, "https://example.test/v1");
+        // Untouched keys take their seeds, including the two that used to
+        // sit at `null` while a literal supplied the real value.
+        assert_eq!(config.default_model.as_deref(), Some(DEFAULT_MODEL));
+        assert_eq!(config.effort_style.as_deref(), Some(DEFAULT_EFFORT_STYLE));
+        assert_eq!(config.max_iterations, Some(20));
+        assert!(config.sandbox);
+    }
+
+    #[test]
+    fn an_explicit_null_is_not_the_seed() {
+        // serde only defaults an *absent* key. `comms model --clear` writes
+        // null deliberately, and that has to keep meaning "cleared" rather
+        // than being quietly refilled.
+        let config = parse_config(r#"{"default_model": null}"#, Path::new("config.json"))
+            .expect("null is valid");
+        assert_eq!(config.default_model, None);
+    }
+
+    #[test]
+    fn a_malformed_config_is_refused_and_says_where() {
+        let error = parse_config(
+            "{\n  \"temperature\": 1.9,\n}",
+            Path::new("/tmp/config.json"),
+        )
+        .expect_err("a trailing comma is not valid json");
+        let message = error.to_string();
+
+        // Names the file, so it's obvious which one to open...
+        assert!(message.contains("/tmp/config.json"), "{message}");
+        // ...where the problem is...
+        assert!(message.contains("line"), "{message}");
+        // ...and how to get out of it.
+        assert!(message.contains("delete it"), "{message}");
+    }
 
     #[test]
     fn a_gate_flipped_on_one_handle_is_seen_through_another() {

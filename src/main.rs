@@ -295,8 +295,6 @@ enum ApprovalCommands {
     },
 }
 
-const DEFAULT_MODEL: &str = "openrouter/auto";
-
 /// Sentinel value for `--resume` passed with no id, meaning "show a picker".
 /// Never collides with a real session id since those are lowercase-hex UUIDs
 /// (no 'p', 'i', 'c', 'k' in hex).
@@ -354,7 +352,7 @@ fn resolve_resume_target(
 fn resolve_model(config: &config::Config, cli_model: Option<String>) -> String {
     cli_model
         .or_else(|| config.default_model.clone())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+        .unwrap_or_else(|| config::DEFAULT_MODEL.to_string())
 }
 
 /// `None` if neither the flag nor the config default is set — genuinely no
@@ -488,7 +486,7 @@ async fn cmd_logout() -> Result<()> {
 
 async fn cmd_status() -> Result<()> {
     let config = load_config()?;
-    println!("{}", "AI Comms CLI Configuration:".blue());
+    println!("\n{}", "AI Comms CLI Configuration:".blue());
     println!("  Base URL: {}", config.base_url);
     println!(
         "  API Key: {}",
@@ -500,7 +498,10 @@ async fn cmd_status() -> Result<()> {
     );
     println!(
         "  Default model: {}",
-        config.default_model.as_deref().unwrap_or(DEFAULT_MODEL)
+        config
+            .default_model
+            .as_deref()
+            .unwrap_or(config::DEFAULT_MODEL)
     );
     println!(
         "  Max iterations: {}",
@@ -531,12 +532,14 @@ async fn cmd_status() -> Result<()> {
             .unwrap_or(config::DEFAULT_EFFORT_STYLE)
     );
     println!("  Streaming: {}", if config.stream { "on" } else { "off" });
+    println!("  Sandbox: {}", if config.sandbox { "on" } else { "off" });
     if !config.extra_headers.is_empty() {
         println!("  Extra headers: {}", config.extra_headers.len());
     }
     println!("  Config file: {}", get_config_path()?.display());
     println!("\n{}", "Approval Settings:".blue());
     print_approval_status(&config.approval);
+    println!();
     Ok(())
 }
 
@@ -632,7 +635,7 @@ async fn cmd_model(name: Option<String>, clear: bool) -> Result<()> {
         println!(
             "{} Default model cleared, falling back to {}",
             "✓".green(),
-            DEFAULT_MODEL
+            config::DEFAULT_MODEL
         );
         return Ok(());
     }
@@ -646,7 +649,10 @@ async fn cmd_model(name: Option<String>, clear: bool) -> Result<()> {
         None => {
             println!(
                 "Current default model: {}",
-                config.default_model.as_deref().unwrap_or(DEFAULT_MODEL)
+                config
+                    .default_model
+                    .as_deref()
+                    .unwrap_or(config::DEFAULT_MODEL)
             );
         }
     }

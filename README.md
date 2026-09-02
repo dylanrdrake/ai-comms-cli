@@ -499,10 +499,14 @@ Configuration is stored at `~/.comms/config.json`:
   "temperature": 0.7,
   "effort_level": "high",
   "effort_style": "nested",
-  "extra_headers": {}
+  "extra_headers": {},
+  "sandbox": true,
+  "stream": true
 }
 ```
 
+- The file is created the first time you change a setting, not on first run — until then every value comes from the defaults above, which `comms status` will show you. You can also write it by hand: any keys you leave out fall back to their defaults, so a file containing only `{"temperature": 1.5}` is valid, and the next `comms` setting command fills in the rest around what you wrote.
+- If the file can't be parsed, commands stop with the parse position rather than silently reverting to defaults, and nothing is written over it — a malformed config would otherwise send your API key to the default endpoint instead of the one you configured, and the next setting command would overwrite everything else you'd set. Fix it, or delete it to start over.
 - Your API key is **not** in this file — `comms login`/`logout` store and remove it from the OS keychain instead (see [Security](#security)). If you have an old config with a plaintext `api_key` field, the next command that loads config transparently migrates it into the OS keychain and rewrites the file without it.
 - `base_url` is managed via `comms endpoint` and is the API endpoint used by every command. Defaults to OpenRouter; point it at any OpenAI-compatible service.
 - `default_model` is managed via `comms model` and is used by `ask`, `session`, and `agent` when `-m`/`--model` isn't passed, and always by `tui`, which has no flags at all.
