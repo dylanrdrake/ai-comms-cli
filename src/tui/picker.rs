@@ -459,17 +459,78 @@ fn state_badge(state: LastState, tick: usize) -> (String, Style) {
 const HERE_SECTION: &str = "In this directory";
 
 // Fixed columns, so the preview can be given whatever the line has left.
-const MARKER_WIDTH: usize = 2 + BADGE_WIDTH + 1; // marker, badge, gap
+const MARKER_WIDTH: usize = 2 + ICON_WIDTH + 1 + BADGE_WIDTH + 1; // marker, mark, badge, gaps
 const KIND_WIDTH: usize = 7;
 const TITLE_WIDTH: usize = 24;
 const DIR_WIDTH: usize = 24;
-/// Below this a preview says too little to be worth the clutter.
 const WHEN_WIDTH: usize = 8;
 
+/// Below this a preview says too little to be worth the clutter.
 const MIN_PREVIEW: usize = 12;
 /// Every badge is a single cell — see `state_badge` — and padded to this so
 /// the column stays straight.
 const BADGE_WIDTH: usize = 1;
+
+/// The mark is two braille cells: 4 dots across by 4 down. One cell is 2
+/// dots wide by 4 tall in a character box about half as wide as it is tall,
+/// so the dots already sit on a square lattice — it's the glyph that's a
+/// 1:2 rectangle. Two of them side by side makes the block square as well.
+const ICON_WIDTH: usize = 2;
+
+/// Braille patterns of three to seven dots. Nothing emptier (a mark with a
+/// blank half reads as a rendering fault) and nothing solid (every solid
+/// half looks like every other one).
+const MARK_PATTERNS: [u8; 218] = {
+    let mut patterns = [0u8; 218];
+    let (mut bits, mut found) = (0usize, 0usize);
+    while bits < 256 {
+        let dots = (bits as u8).count_ones();
+        if dots >= 3 && dots <= 7 {
+            patterns[found] = bits as u8;
+            found += 1;
+        }
+        bits += 1;
+    }
+    patterns
+};
+
+/// Mid-tone 256-colour indices: saturated enough to tell apart, dark enough
+/// to read on a light terminal and light enough to read on a dark one. The
+/// mark draws on whatever background the row has, so the palette can't lean
+/// on one being behind it. Deliberately clear of the colours that carry
+/// meaning here — the cyan and yellow of the mode column, and the badge
+/// colours for state.
+const IDENTICON_FG: [u8; 12] = [33, 30, 70, 61, 96, 100, 130, 133, 136, 166, 172, 25];
+
+/// A session's mark: a square of braille dots, derived from its id and
+/// stable for the life of the session.
+///
+/// It identifies nothing you can type — the id column was removed because
+/// nothing in the picker needs it. This is for recognition: a list that
+/// refreshes under you, with rows moving as sessions are touched, is easier
+/// to keep your place in when the row you were watching carries the same
+/// mark it had a moment ago.
+fn identicon(id: &str) -> (String, Style) {
+    // FNV-1a, 64-bit: the mark has to be identical in every process that
+    // draws this session, so it can come from nothing but the id, and the
+    // wider hash leaves room to slice a half, a half and a colour out of
+    // independent bits.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in id.bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    let half = |bits: u64| {
+        let pattern = MARK_PATTERNS[bits as usize % MARK_PATTERNS.len()];
+        char::from_u32(0x2800 + u32::from(pattern)).unwrap_or('?')
+    };
+    let fg = IDENTICON_FG[(hash >> 24) as usize % IDENTICON_FG.len()];
+
+    (
+        format!("{}{}", half(hash), half(hash >> 12)),
+        Style::new().fg(Color::Indexed(fg)),
+    )
+}
 
 /// A path with the home directory shown as `~`, so the column stays
 /// readable on the long paths most projects have.
@@ -537,6 +598,12 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str, tick: u
                 ));
             }
             LaunchItem::Resume(row) => {
+                // Identity first, then state: what the session is, then what
+                // it's doing.
+                let (mark, mark_style) = identicon(&row.id);
+                spans.push(Span::styled(mark, mark_style));
+                spans.push(Span::raw(" "));
+
                 let (glyph, style) = state_badge(row.last_state(), tick);
                 spans.push(Span::styled(format!("{glyph} "), style));
                 spans.push(Span::styled(
@@ -735,6 +802,35 @@ fn relative_time(timestamp: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_mark_is_two_cells_of_braille_and_the_same_every_time() {
+        let (mark, style) = identicon("4f2a91b2-0000-0000-0000-000000000000");
+        assert_eq!(mark, identicon("4f2a91b2-0000-0000-0000-000000000000").0);
+        assert_eq!(mark.chars().count(), ICON_WIDTH);
+        for dot in mark.chars() {
+            let pattern = dot as u32 - 0x2800;
+            assert!(pattern < 256, "{dot:?} is not a braille pattern");
+            // Never blank, never solid: a half of either kind reads as a
+            // fault rather than as a mark.
+            assert!((3..=7).contains(&pattern.count_ones()), "{dot:?}");
+        }
+        assert!(style.fg.is_some());
+        assert!(style.bg.is_none(), "the row's own background shows through");
+    }
+
+    #[test]
+    fn marks_use_the_whole_palette_and_rarely_repeat() {
+        let ids: Vec<String> = (0..500).map(|n| format!("{n:08x}-session")).collect();
+        let marks: std::collections::HashSet<_> = ids.iter().map(|id| identicon(id).0).collect();
+        // Two of 500 sharing a glyph pair is fine; a hash collapsing onto a
+        // handful of patterns is not.
+        assert!(marks.len() > 450, "only {} distinct marks", marks.len());
+
+        let fgs: std::collections::HashSet<_> =
+            ids.iter().filter_map(|id| identicon(id).1.fg).collect();
+        assert_eq!(fgs.len(), IDENTICON_FG.len());
+    }
 
     #[test]
     fn the_kind_column_says_ask_not_chat() {

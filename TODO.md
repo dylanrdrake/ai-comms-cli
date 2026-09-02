@@ -9,6 +9,7 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
+* drain the queue as soon as the message is sent. Look at the queue system and make sure it is getting drained propertly. especially when getting completely drained to 0 in-queue
 * steering: send while a turn is running and have it join that turn, not the next
   one. Inject drained messages as user messages at the TOP of a run_agent_turn
   iteration only — never between an assistant's tool_calls and its tool results,
@@ -19,6 +20,7 @@ NEXT:
   model call, not mid-request. TUI first: it already accepts input mid-turn.
   Show it: a growing list of pending messages above the message input, so what
   is waiting to join the turn is visible rather than implied by a count.
+* think about being able to access the same session from 2 different terminals/processes
 * picker refresh decrypts every session title and every session's last message
   every 2s, regardless of how many rows are on screen. Fine now — it scales with
   how many sessions you've accumulated, not with the screen — but that's the
@@ -30,6 +32,12 @@ NEXT:
   and there's no indication they exist. The two blank lines between sections
   cost two more rows. Wants a scroll offset that follows the selection, and
   probably some hint that the list continues past the edge.
+* the transcript's reply avatar `●` (U+25CF) is East Asian Width Ambiguous,
+  so some terminals draw it two cells wide and the whole reply gutter shifts
+  against the wrapped continuation lines under it. Same bug the picker badges
+  had. `—` for notices and `·` in the settings bar are Ambiguous too. The fix
+  is a Neutral-width character: ✦ ⏺ ◉ ✻ ❖ ⟡ ✧ ❉ ✱ ⌾ ⬤ are all safe, as is
+  anything in the braille block.
 * the client's timeouts are hardcoded in client.rs and can't be configured:
   CONNECT_TIMEOUT 20s, REQUEST_TIMEOUT 300s, STREAM_IDLE_TIMEOUT 90s, plus
   tools.rs's 30s default for a terminal command when the model doesn't give one.
