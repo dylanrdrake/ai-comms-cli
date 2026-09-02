@@ -118,10 +118,9 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
 }
 
 /// Runs one tool call. `sandbox` is the session's current setting: with it
-/// on, the tools that write are confined to the working directory and the
-/// user's home. Reads are not bounded either way — they mutate nothing, and
-/// confining them would break ordinary work like reading a file under
-/// `/etc`.
+/// on, the tools that write are confined to the working directory. Reads are
+/// not bounded either way — they mutate nothing, and confining them would
+/// break ordinary work like reading a file under `/etc`.
 pub async fn execute_tool(name: &str, arguments: &str, sandbox: bool) -> Result<serde_json::Value> {
     let args: serde_json::Value = serde_json::from_str(arguments)?;
 
@@ -185,24 +184,28 @@ pub async fn execute_tool(name: &str, arguments: &str, sandbox: bool) -> Result<
     }
 }
 
-/// The directories a write may land in: the working directory and the user's
-/// home.
+/// The one directory a write may land in: the working directory.
 ///
-/// Both are canonicalized, because `path` is — and on Windows the two forms
-/// don't compare. `canonicalize` there returns an extended-length path
+/// Home used to count as a bound too, which made the setting close to
+/// meaningless — the parent of any project kept under `~` is inside home, so
+/// an agent could write across every personal file on the machine and only
+/// `/etc`-style paths were refused. The working directory is the boundary
+/// people mean by "sandbox", and it costs nothing the app needs: its own
+/// state (`config.json`, `chats.db`, `errors.log`) is written directly, not
+/// through the tools this gates.
+///
+/// Canonicalized, because the path being checked is — and on Windows the two
+/// forms don't compare. `canonicalize` there returns an extended-length path
 /// (`\\?\D:\a\project`) while `current_dir` returns a plain one
 /// (`D:\a\project`), so a prefix test between them never matches and the
-/// sandbox refused *every* write, including the ones inside the working
-/// directory it was meant to allow.
+/// sandbox refused *every* write, including the ones it was meant to allow.
 ///
 /// A bound that won't canonicalize falls back to its raw form rather than
-/// being dropped: losing one would silently shrink what's allowed.
-fn sandbox_bounds() -> Vec<std::path::PathBuf> {
-    [std::env::current_dir().ok(), home::home_dir()]
-        .into_iter()
-        .flatten()
+/// being dropped: losing it would refuse everything.
+fn sandbox_bound() -> Option<std::path::PathBuf> {
+    std::env::current_dir()
+        .ok()
         .map(|dir| dir.canonicalize().unwrap_or(dir))
-        .collect()
 }
 
 /// Resolves `filepath` to the absolute path a write would land on, without
@@ -256,13 +259,13 @@ fn sandbox_refusal(path: &Path, sandbox: bool) -> Option<serde_json::Value> {
     if !sandbox {
         return None;
     }
-    if sandbox_bounds().iter().any(|bound| path.starts_with(bound)) {
+    if sandbox_bound().is_some_and(|bound| path.starts_with(bound)) {
         return None;
     }
     Some(json!({
         "success": false,
         "error": format!(
-            "Sandbox: {} is outside the working directory and home directory. \
+            "Sandbox: {} is outside the working directory. \
              Allow writes anywhere with /sandbox off (or comms sandbox off).",
             path.display()
         )
@@ -526,8 +529,8 @@ async fn run_terminal_command(
 mod tests {
     use super::*;
 
-    /// A path that resolves outside both the working directory and home on
-    /// every platform, and exists nowhere.
+    /// A path that resolves outside the working directory on every platform,
+    /// and exists nowhere.
     ///
     /// Deliberately not `std::env::temp_dir()`: on Windows that sits under
     /// the user profile (`C:\\Users\\...\\AppData\\Local\\Temp`) — *inside*
@@ -593,6 +596,28 @@ mod tests {
         let allowed = write_file(&inside, "x", "write", true).unwrap();
         assert_eq!(allowed["success"], true, "{allowed}");
         fs::remove_file(&inside).ok();
+    }
+
+    #[test]
+    fn a_sibling_of_the_working_directory_is_outside_the_sandbox() {
+        // The regression this exists for: home used to count as a bound too,
+        // so the parent of any project kept under `~` passed — an agent
+        // could write across every personal file on the machine and only
+        // `/etc`-style paths were refused.
+        let home = home::home_dir().expect("a home directory");
+        let cwd = std::env::current_dir().unwrap();
+        if cwd == home {
+            // Running from `~` makes home the working directory, so there's
+            // no "inside home but outside cwd" to test. Never the case in
+            // CI or normal development.
+            return;
+        }
+
+        let under_home = home.join(format!("comms-sandbox-test-{}-sibling", std::process::id()));
+        let result = write_file(under_home.to_str().unwrap(), "x", "write", true).unwrap();
+
+        assert_eq!(result["success"], false, "{result}");
+        assert!(!under_home.exists(), "nothing may be created on a refusal");
     }
 
     #[test]

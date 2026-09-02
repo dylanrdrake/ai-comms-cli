@@ -144,7 +144,7 @@ Persistence](#session-persistence)), color-coded cool-to-hot (cyan → yellow
 → orange → pink) as it rises from 0.
 
 #### `sandbox [on|off]`
-View or set whether the agent's file-writing tools are confined to your current working directory and your home directory.
+View or set whether the agent's file-writing tools are confined to your current working directory.
 
 ```bash
 # Show the current setting
@@ -154,7 +154,7 @@ comms sandbox
 comms sandbox off
 ```
 
-On by default. It bounds `write_file` and `replace_in_file` only — reads are never restricted, since they change nothing and confining them would break ordinary work like reading a file under `/etc`. The bound is checked against the path a write *resolves to*, so `..` and symlinks can't be used to step outside it.
+On by default, and the bound is the working directory alone — not your home directory, which would let an agent write across every project you keep under `~`. It bounds `write_file` and `replace_in_file` only: reads are never restricted, since they change nothing and confining them would break ordinary work like reading a file under `/etc`. The bound is checked against the path a write *resolves to*, so `..` and symlinks can't be used to step outside it, and `comms` writes its own `~/.comms` state directly so that keeps working at any setting.
 
 This is the persistent default; a session snapshots it at creation, and `/sandbox` changes the session you're in. It's a separate axis from `approval`: approval decides whether you're *asked* first, the sandbox decides whether the write is allowed at all.
 
@@ -292,7 +292,7 @@ exactly:
 | `/temperature default` (or `/temp default`) | Read the *currently* configured default temperature and save that to the session |
 | `/approval <read\|write\|terminal\|all> <on\|off>` | Switch a tool-approval gate for the rest of the session, and remember it. Takes effect immediately — including partway through a running turn, from its next tool call |
 | `/approval` | Show the approval gates currently in use |
-| `/sandbox <on\|off>` | Confine the agent's file writes to the working directory and home, or allow them anywhere. Takes effect immediately, including partway through a running turn |
+| `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
 | `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, approval gates. The session-scoped counterpart to `comms status` |
 
@@ -416,7 +416,7 @@ first message.
 | `/temperature default` (or `/temp default`) | Read the *currently* configured default temperature and save that to the session |
 | `/approval <read\|write\|terminal\|all> <on\|off>` | Switch a tool-approval gate for the rest of the session, and remember it. Takes effect immediately — including partway through a running turn, from its next tool call |
 | `/approval` | Show the approval gates currently in use |
-| `/sandbox <on\|off>` | Confine the agent's file writes to the working directory and home, or allow them anywhere. Takes effect immediately, including partway through a running turn |
+| `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
 | `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, approval gates. The session-scoped counterpart to `comms status` |
 
@@ -634,7 +634,7 @@ sudo dnf groupinstall "Development Tools"
 
 ## Security
 
-- The agent's file-writing tools (`write_file`, `replace_in_file`) are confined to your current working directory and home directory by default, checked against the path a write resolves to so `..` and symlinks can't step outside it. Turn it off per session with `/sandbox off` or globally with `comms sandbox off`. Reads and terminal commands are not bounded this way — a terminal command runs whatever you approve
+- The agent's file-writing tools (`write_file`, `replace_in_file`) are confined to your current working directory by default, checked against the path a write resolves to so `..` and symlinks can't step outside it. Turn it off per session with `/sandbox off` or globally with `comms sandbox off`. Reads and terminal commands are not bounded this way — a terminal command runs whatever you approve. This gates the agent's tools only; `comms` writes its own `~/.comms` state directly and is unaffected
 - API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.comms/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `comms` command, and the field is stripped from the file afterward
 - `session`/`tui` history is stored in `~/.comms/chats.db` with message content, tool calls, reasoning, and titles encrypted at rest (AES-256-GCM, key held in your OS keychain under a separate `db_encryption_key` entry) — but the surrounding session metadata (roles, model names, effort levels, timestamps) is stored in the clear, and rows written before encryption existed stay plaintext until they're next written. The key lives in the same keychain `comms` already uses, so this protects the file at rest (backups, drive theft) rather than against someone who can run `comms` as you; avoid pasting secrets into a session if you plan to share the database file
 - The last 100 LLM API errors (a non-2xx response, a stalled/dropped connection, a malformed stream) are kept at `~/.comms/errors.log`, so a confusing one can be looked back at without having to catch and copy it in the moment — plain text, one line per entry, oldest dropped as new ones come in

@@ -145,8 +145,8 @@ pub enum Submission {
     /// Prints/shows this session's current tool-approval gates without
     /// changing them.
     ShowApproval,
-    /// Confines the agent's file writes to the working directory and home,
-    /// or lets them go anywhere. The read tools are unaffected either way.
+    /// Confines the agent's file writes to the working directory, or lets
+    /// them go anywhere. The read tools are unaffected either way.
     SetSandbox(bool),
     /// Prints/shows whether writes are currently confined, without changing
     /// it.
@@ -246,7 +246,7 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
 pub fn sandbox_notice(sandbox: bool, changed: bool) -> String {
     let verb = if changed { "set to" } else { "is" };
     let state = if sandbox {
-        "on — writes confined to the working directory and home"
+        "on — writes confined to the working directory"
     } else {
         "off — writes allowed anywhere"
     };
@@ -1057,7 +1057,7 @@ mod tests {
     fn sandbox_notice_says_what_changed_and_what_it_means() {
         assert_eq!(
             sandbox_notice(true, true),
-            "Sandbox set to on — writes confined to the working directory and home"
+            "Sandbox set to on — writes confined to the working directory"
         );
         assert_eq!(
             sandbox_notice(false, false),

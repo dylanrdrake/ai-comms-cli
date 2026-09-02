@@ -48,8 +48,8 @@ pub enum Command {
     /// Toggle verbose tool detail in the TUI view. Purely a display
     /// setting; the agent loop never sees it.
     ToggleVerbose,
-    /// Confine the agent's file writes to the working directory and home,
-    /// or let them go anywhere.
+    /// Confine the agent's file writes to the working directory, or let
+    /// them go anywhere.
     SetSandbox(bool),
     /// Switch the tool-calling iteration cap per turn (agent mode only).
     /// `None` nullifies it — a turn falls back to whatever the configured

@@ -112,6 +112,17 @@ impl AgentUi for TerminalAgentUi {
                 }
                 AgentEvent::Thinking { text } => {
                     if self.verbose {
+                        // The spinner is still animating on the current line
+                        // here: the reply has resolved, but `RequestFinished`
+                        // hasn't been emitted yet. Printing over it lands
+                        // mid-line and then gets half-overwritten by the next
+                        // redraw, so clear it first and let the thinking
+                        // start its own line. The request it was tracking is
+                        // already done, so `RequestFinished` simply finds
+                        // nothing left to stop.
+                        if let Some(spinner) = self.spinner.take() {
+                            spinner.stop().await;
+                        }
                         // Same marker-plus-hanging-indent shape the
                         // assistant's own reply uses, one step dimmer.
                         println!(

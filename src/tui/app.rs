@@ -107,8 +107,8 @@ pub struct App {
     /// Mirrors the plain CLI's `-v`: gates whether tool call arguments and
     /// results are shown, not just that a tool ran. Toggled with `/verbose`.
     pub verbose: bool,
-    /// Whether the agent's file writes are confined to the working directory
-    /// and home. Changed with `/sandbox`.
+    /// Whether the agent's file writes are confined to the working
+    /// directory. Changed with `/sandbox`.
     pub sandbox: bool,
     /// This session's `/max-iterations` override, changed with
     /// `/max-iterations`/`/max-iterations default`. `None` means nullified —

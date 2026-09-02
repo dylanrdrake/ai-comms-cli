@@ -104,11 +104,15 @@ pub struct Config {
     /// optional `HTTP-Referer`/`X-Title` attribution headers).
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
-    /// Whether file writes are confined to the working directory and the
-    /// user's home. On by default; turning it off lets the agent's write
-    /// tools touch any path the process can. Reads are never bounded either
-    /// way — they mutate nothing, and confining them would break ordinary
-    /// work like reading a file under `/etc`.
+    /// Whether the agent's file writes are confined to the working
+    /// directory. On by default; turning it off lets its write tools touch
+    /// any path the process can. Reads are never bounded either way — they
+    /// mutate nothing, and confining them would break ordinary work like
+    /// reading a file under `/etc`.
+    ///
+    /// This gates the agent's tools only. The app's own state —
+    /// `config.json`, `chats.db`, `errors.log` — is written directly and is
+    /// unaffected at any setting.
     #[serde(default = "default_true")]
     pub sandbox: bool,
     /// Whether to stream responses token-by-token. On by default; turn it off
@@ -298,7 +302,7 @@ impl SessionGates {
         *self.lock() = approval;
     }
 
-    /// Whether file writes are confined to the working directory and home.
+    /// Whether the agent's file writes are confined to the working directory.
     pub fn sandbox(&self) -> bool {
         self.sandbox.load(Ordering::Relaxed)
     }

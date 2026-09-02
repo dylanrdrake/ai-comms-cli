@@ -46,8 +46,8 @@ pub struct ChatSession {
     /// defer to config" state once a turn actually needs to check them).
     approval: ApprovalSettings,
     /// Whether this session confines the agent's file writes to the working
-    /// directory and the user's home. Always concrete, like `approval` — a
-    /// tool about to write needs a yes or no, not "defer to config".
+    /// directory. Always concrete, like `approval` — a tool about to write
+    /// needs a yes or no, not "defer to config".
     sandbox: bool,
     messages: Vec<ChatMessage>,
     /// Whether the session has been given a title derived from a user
@@ -267,8 +267,8 @@ impl ChatSession {
         &self.approval
     }
 
-    /// Switches whether file writes are confined to the working directory
-    /// and home, and records it.
+    /// Switches whether the agent's file writes are confined to the working
+    /// directory, and records it.
     pub fn set_sandbox(&mut self, sandbox: bool) -> Result<()> {
         if self.sandbox == sandbox {
             return Ok(());
@@ -278,8 +278,8 @@ impl ChatSession {
         Ok(())
     }
 
-    /// Whether this session confines file writes to the working directory
-    /// and home.
+    /// Whether this session confines the agent's file writes to the working
+    /// directory.
     pub fn sandbox(&self) -> bool {
         self.sandbox
     }

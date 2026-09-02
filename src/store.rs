@@ -46,8 +46,8 @@ pub struct SessionSummary {
     /// configured default taken when it was created, mutable from inside
     /// it with `/approval`.
     pub approval: ApprovalSettings,
-    /// Whether this session confines file writes to the working directory
-    /// and home — a snapshot of the configured default taken when it was
+    /// Whether this session confines the agent's file writes to the working
+    /// directory — a snapshot of the configured default taken when it was
     /// created, mutable from inside it with `/sandbox`.
     pub sandbox: bool,
     /// Not surfaced by the CLI, but kept for sorting and display.
@@ -335,8 +335,8 @@ pub fn set_session_approval(
     Ok(())
 }
 
-/// Records whether this session confines file writes to the working
-/// directory and home.
+/// Records whether this session confines the agent's file writes to the
+/// working directory.
 pub fn set_session_sandbox(conn: &Connection, session_id: &str, sandbox: bool) -> Result<()> {
     conn.execute(
         "UPDATE sessions SET sandbox = ?1 WHERE id = ?2",
