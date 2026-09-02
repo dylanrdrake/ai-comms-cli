@@ -309,16 +309,21 @@ exactly:
 | `/approval` | Show the approval gates currently in use |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
-| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, approval gates. The session-scoped counterpart to `comms status` |
+| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
 
 A mistyped invocation of one of these (`/effort` with no value, `/approval
 bogus off`), or a misspelled command name (`/mode` for `/model`), is
 reported as an error rather than sent to the model — see the note under
 `tui`'s command table for the exact boundary.
 
+A new session needs a name. Pass one with `--title`, or you'll be asked for it before the session starts — starting one is meant to be deliberate, so there's no untitled path and a blank answer is refused. A resumed session keeps the name it has, and `--title` is ignored with a note.
+
 ```bash
-comms session
+comms session --title "Fix the parser"
 # Type exit to quit
+
+# Omit --title and you'll be prompted for one
+comms session
 
 # Override the default model for a new session (ignored when resuming —
 # a resumed session always keeps its own saved model)
@@ -369,8 +374,10 @@ saved sessions, interchangeably resumable from either.
 
 It's not a subcommand — there are no flags. Run `comms` with nothing else on
 the command line, and it opens on a **launch screen**: start a new session,
-jump straight back into a recent one, or go to a sessions browser covering
-all of them.
+or pick up any saved one. Sessions are grouped by where they live — the ones
+started in your current directory first, then everything else — and each row
+shows its directory, since that's where it will resume and what its sandbox
+will be bounded to.
 
 ```bash
 comms
@@ -381,20 +388,24 @@ turn tools on (see **Commands** below) — there's no separate "agent" launch
 option. A resumed session picks back up in whichever mode, model, and effort
 level it was last left in.
 
-Choosing "New session" from the launch screen first asks for a title; leave
-it blank to fall back to the usual behavior of naming the session from your
-first message.
+Choosing "New session" from the launch screen asks for a title, and requires
+one — starting a session is meant to be deliberate, so there's no untitled
+path. The session is kept from the moment you confirm it, whether or not you
+ever say anything in it.
 
-**Launch screen / sessions browser**
+**Launch screen**
 
 | Key | Does |
 |---|---|
-| `↑` / `↓` (or `k` / `j`) | Move the selection |
+| `↑` / `↓` (or `k` / `j`) | Move the selection (section labels are skipped) |
 | `Enter` | Open the selected row |
-| `r` | Rename a session (sessions browser only) |
-| `d` | Delete a session (sessions browser only, asks to confirm) |
-| `Esc` | Back to the launch screen |
+| `r` | Rename the selected session |
+| `d` | Delete the selected session (asks to confirm) |
 | `q` | Quit |
+
+Opening a session whose directory no longer exists asks whether to resume in
+the current one instead, repointing the session there — the same thing
+`comms session --resume <id> --here` does from the shell.
 
 **In a conversation**
 
@@ -435,7 +446,7 @@ first message.
 | `/approval` | Show the approval gates currently in use |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
-| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, approval gates. The session-scoped counterpart to `comms status` |
+| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
 
 Only recognized commands are intercepted — including a *mistyped* one.
 `/approval bogus off`, or a bare `/effort` with no value, is reported as an
@@ -451,11 +462,16 @@ merely extend a command name (`/verbosely`), both go through untouched.
 All of the above persist to the session, so they stick across
 `Ctrl-B`/`--resume` too.
 
+A session records the directory it was started in. Resuming moves the process back into it, because that directory is the sandbox's boundary and what the session's relative paths resolve against — resuming somewhere else would silently rebind both to wherever your shell happened to be. If the directory no longer exists, resuming stops and says so — the CLI with an error, the TUI by asking whether to resume here instead and repoint the session. `comms session --resume <id> --here` resumes in the current directory and repoints the session, for a project that moved. Sessions saved before this was tracked have no recorded directory and resume wherever they're run, as they always did.
+
 Sessions are saved exactly as the other commands save them, so a `tui`
 session can be resumed with `comms session --resume` and vice versa — mode,
-model, and effort level all carry over either way. Opening a conversation
-and leaving without saying anything discards it rather than leaving an empty
-"Untitled" in your session list.
+model, and effort level all carry over either way. A session is kept from the
+moment you name it, whether or not anything is ever said in it — naming one
+is the deliberate act of starting it. (Sessions created before names were
+required can still be untitled; one of those is discarded if you open it and
+leave without saying anything, rather than leaving an empty "Untitled" in
+your list.)
 
 #### `stream [on|off]`
 Whether replies stream in as they're generated. On by default. Turn it off for

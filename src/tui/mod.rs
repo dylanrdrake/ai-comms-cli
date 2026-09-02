@@ -20,7 +20,7 @@ use crate::agent::AGENT_CHAT_SYSTEM_PROMPT;
 use crate::client::{ChatMessage, Client};
 use crate::config::ApprovalSettings;
 use crate::conversation::{command_for, Command, Conversation};
-use crate::session::ChatSession;
+use crate::session::{self, ChatSession};
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
 use crate::ui::{parse_yes_no, response_label};
 use anyhow::Result;
@@ -65,8 +65,9 @@ pub struct Context {
 }
 
 enum Screen {
-    Launch(Picker),
-    Sessions(Picker),
+    /// Boxed for the same reason `Chat` is: it dwarfs the other variants,
+    /// and every `Screen` would otherwise carry its footprint.
+    Launch(Box<Picker>),
     /// Naming a new session before it's created — reached by choosing "New
     /// session" on the launch screen.
     NameSession {
@@ -84,7 +85,7 @@ struct Chat {
 /// there's no flag to skip straight into a new or resumed session, so this
 /// is the one and only way in.
 pub async fn run(context: Context) -> Result<()> {
-    let mut screen = Screen::Launch(Picker::launch(load_sessions()?));
+    let mut screen = Screen::Launch(Box::new(launch_picker()?));
 
     let mut terminal = enter()?;
     // Restore the terminal even on the way out of an error, so a failure
@@ -108,7 +109,16 @@ fn load_sessions() -> Result<Vec<SessionRow>> {
 /// Each conversation gets its own database handle, so sessions can be
 /// opened and closed over the life of the TUI without threading one
 /// connection through every screen.
-fn open_new(context: &Context, agentic: bool, title: Option<String>) -> Result<Chat> {
+/// The launch screen, grouped by whether each session belongs to the
+/// directory the process is in right now.
+fn launch_picker() -> Result<Picker> {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.display().to_string());
+    Ok(Picker::launch(load_sessions()?, cwd.as_deref()))
+}
+
+fn open_new(context: &Context, agentic: bool, title: String) -> Result<Chat> {
     let kind = if agentic { KIND_AGENT_CHAT } else { KIND_CHAT };
 
     let mut session = ChatSession::create(
@@ -122,10 +132,11 @@ fn open_new(context: &Context, agentic: bool, title: Option<String>) -> Result<C
         context.sandbox,
         context.verbose,
         context.stream,
+        std::env::current_dir()
+            .ok()
+            .map(|dir| dir.display().to_string()),
     )?;
-    if let Some(title) = title {
-        session.set_title(title)?;
-    }
+    session.set_title(title)?;
     if agentic {
         session.push_and_persist(ChatMessage {
             role: "system".to_string(),
@@ -143,14 +154,69 @@ fn open_resumed(context: &Context, summary: &SessionSummary) -> Result<Chat> {
     let (session, history) =
         ChatSession::resume(store::open_db()?, summary, summary.model.clone())?;
     let agentic = summary.kind == KIND_AGENT_CHAT;
-    Ok(start_chat(context, session, history, agentic))
+
+    // The session's directory is its sandbox boundary, so opening one moves
+    // the process into it. Unlike the CLI there's nowhere to refuse to: the
+    // TUI can open any session from its picker, so a directory that's gone
+    // is reported in the transcript and the session opens where it is —
+    // loudly, because its bound is now the wrong one.
+    let entered = session::enter_working_dir(&session)?;
+    let mut chat = start_chat(context, session, history, agentic);
+    match entered {
+        session::EnteredDir::Moved(dir) => chat
+            .app
+            .transcript
+            .push(TranscriptItem::Notice(format!("Working directory: {dir}"))),
+        session::EnteredDir::Unchanged => {}
+        session::EnteredDir::Missing(dir) => {
+            chat.app.transcript.push(TranscriptItem::Error(format!(
+                "This session was started in {dir}, which no longer exists — \
+                 it is running in the current directory instead, so its sandbox \
+                 and relative paths point somewhere else than when it was saved."
+            )))
+        }
+    }
+    Ok(chat)
 }
 
-fn open_row(context: &Context, row: &SessionRow) -> Result<Chat> {
+/// Why a row couldn't be opened, when the caller can do something about it.
+enum OpenFailure {
+    /// The session's directory is gone. Offerable: resuming here and
+    /// repointing is a real answer, so the picker asks rather than refusing.
+    MissingDir(String),
+    Other(anyhow::Error),
+}
+
+fn open_row(context: &Context, row: &SessionRow) -> std::result::Result<Chat, OpenFailure> {
+    let summary = (|| {
+        let conn = store::open_db()?;
+        store::find_session(&conn, &row.id)?
+            .ok_or_else(|| anyhow::anyhow!("Session {} no longer exists", row.short_id()))
+    })()
+    .map_err(OpenFailure::Other)?;
+
+    if let Some(dir) = summary.working_dir.as_deref() {
+        if !std::path::Path::new(dir).is_dir() {
+            return Err(OpenFailure::MissingDir(dir.to_string()));
+        }
+    }
+    open_resumed(context, &summary).map_err(OpenFailure::Other)
+}
+
+/// Resumes `row` in the current directory, recording it as the session's own.
+fn open_row_here(context: &Context, row: &SessionRow) -> Result<Chat> {
     let conn = store::open_db()?;
     let summary = store::find_session(&conn, &row.id)?
         .ok_or_else(|| anyhow::anyhow!("Session {} no longer exists", row.short_id()))?;
-    open_resumed(context, &summary)
+    let (mut session, history) = ChatSession::resume(conn, &summary, summary.model.clone())?;
+    if let Some(cwd) = std::env::current_dir()
+        .ok()
+        .map(|d| d.display().to_string())
+    {
+        session.set_working_dir(cwd)?;
+    }
+    let agentic = summary.kind == KIND_AGENT_CHAT;
+    Ok(start_chat(context, session, history, agentic))
 }
 
 fn start_chat(
@@ -171,6 +237,7 @@ fn start_chat(
     app.approval = session.approval().clone();
     app.sandbox = session.sandbox();
     app.stream = session.stream();
+    app.working_dir = session.working_dir().map(str::to_string);
     app.title = session.title().to_string();
     seed_transcript(&mut app, &history);
 
@@ -325,12 +392,11 @@ async fn next_conversation_event(screen: &mut Screen) -> Option<crate::conversat
 
 fn draw(terminal: &mut Tui, screen: &Screen, tick: usize) -> Result<()> {
     terminal.draw(|frame| match screen {
-        Screen::Launch(p) => picker::draw(frame, p, "comms", "↑/↓ move · Enter open · q quit"),
-        Screen::Sessions(p) => picker::draw(
+        Screen::Launch(p) => picker::draw(
             frame,
             p,
-            "sessions",
-            "↑/↓ move · Enter resume · r rename · d delete · Esc back · q quit",
+            "comms",
+            "↑/↓ move · Enter open · r rename · d delete · q quit",
         ),
         Screen::NameSession { input } => picker::draw_naming(frame, input),
         Screen::Chat(chat) => render::draw(frame, &chat.app, tick),
@@ -405,21 +471,21 @@ async fn handle_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> Re
     }
 
     match screen {
-        Screen::Launch(_) | Screen::Sessions(_) => handle_picker_key(context, screen, key).await,
+        Screen::Launch(_) => handle_picker_key(context, screen, key).await,
         Screen::NameSession { .. } => handle_naming_key(context, screen, key),
         Screen::Chat(chat) => {
             if handle_chat_key(&mut chat.app, &chat.conversation, key) {
                 // Leaving the conversation: stop its worker before the
                 // screen is replaced, so its final writes land.
                 let Screen::Chat(chat) =
-                    std::mem::replace(screen, Screen::Launch(Picker::launch(load_sessions()?)))
+                    std::mem::replace(screen, Screen::Launch(Box::new(launch_picker()?)))
                 else {
                     unreachable!("just matched Chat")
                 };
                 chat.conversation.shutdown().await;
                 // The list was loaded before the shutdown flushed this
                 // session, so refresh it to show the up-to-date title.
-                *screen = Screen::Launch(Picker::launch(load_sessions()?));
+                *screen = Screen::Launch(Box::new(launch_picker()?));
             }
             Ok(false)
         }
@@ -427,9 +493,8 @@ async fn handle_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> Re
 }
 
 async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> Result<bool> {
-    let is_sessions = matches!(screen, Screen::Sessions(_));
-    let (Screen::Launch(p) | Screen::Sessions(p)) = screen else {
-        unreachable!("picker screens only")
+    let Screen::Launch(p) = screen else {
+        unreachable!("picker screen only")
     };
 
     // A pending rename swallows everything until it's answered.
@@ -446,6 +511,25 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
             KeyCode::Backspace => p.rename_backspace(),
             KeyCode::Char(c) if is_typed_char(&key) => p.rename_insert_char(c),
             _ => {}
+        }
+        return Ok(false);
+    }
+
+    // A pending repoint swallows everything until it's answered.
+    if p.confirming_repoint.is_some() {
+        let action = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => p.resolve_repoint(true),
+            _ => p.resolve_repoint(false),
+        };
+        if let Some(Activation::Repoint(row)) = action {
+            match open_row_here(context, &row) {
+                Ok(chat) => *screen = Screen::Chat(Box::new(chat)),
+                Err(e) => {
+                    if let Screen::Launch(p) = screen {
+                        p.notice = Some(e.to_string());
+                    }
+                }
+            }
         }
         return Ok(false);
     }
@@ -468,11 +552,10 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
         KeyCode::Char('q') => return Ok(true),
         KeyCode::Up | KeyCode::Char('k') => p.move_up(),
         KeyCode::Down | KeyCode::Char('j') => p.move_down(),
-        KeyCode::Char('r') if is_sessions => p.begin_rename(),
-        KeyCode::Char('d') if is_sessions => p.begin_delete(),
-        KeyCode::Esc if is_sessions => {
-            *screen = Screen::Launch(Picker::launch(load_sessions()?));
-        }
+        // Rename and delete used to live on the separate browser; with one
+        // list they belong here.
+        KeyCode::Char('r') => p.begin_rename(),
+        KeyCode::Char('d') => p.begin_delete(),
         KeyCode::Enter => {
             let Some(activation) = p.activate() else {
                 return Ok(false);
@@ -483,14 +566,25 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
                         input: String::new(),
                     }
                 }
-                Activation::Resume(row) => {
-                    *screen = Screen::Chat(Box::new(open_row(context, &row)?))
-                }
-                Activation::BrowseAll => {
-                    *screen = Screen::Sessions(Picker::sessions(load_sessions()?))
-                }
-                // Delete is resolved by the confirmation flow, not here.
-                Activation::Delete(_) => {}
+                Activation::Resume(row) => match open_row(context, &row) {
+                    Ok(chat) => *screen = Screen::Chat(Box::new(chat)),
+                    // Neither failure is fatal: a session that won't open is
+                    // one row in a list of them, and taking the whole TUI
+                    // down would lose access to every other session too.
+                    Err(OpenFailure::MissingDir(dir)) => {
+                        if let Screen::Launch(p) = screen {
+                            p.begin_repoint(row, dir);
+                        }
+                    }
+                    Err(OpenFailure::Other(e)) => {
+                        if let Screen::Launch(p) = screen {
+                            p.notice = Some(e.to_string());
+                        }
+                    }
+                },
+                // Delete and repoint are resolved by their confirmation
+                // flows, not here.
+                Activation::Delete(_) | Activation::Repoint(_) => {}
             }
         }
         _ => {}
@@ -507,11 +601,17 @@ fn handle_naming_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> R
     };
 
     match key.code {
-        KeyCode::Esc => *screen = Screen::Launch(Picker::launch(load_sessions()?)),
+        KeyCode::Esc => *screen = Screen::Launch(Box::new(launch_picker()?)),
         KeyCode::Enter => {
+            // A blank title does nothing rather than starting an untitled
+            // session: naming it is the deliberate act that creating one
+            // should take, and it's what makes the session worth keeping
+            // whether or not anything is ever said in it.
             let title = input.trim();
-            let title = (!title.is_empty()).then(|| title.to_string());
-            *screen = Screen::Chat(Box::new(open_new(context, false, title)?));
+            if !title.is_empty() {
+                let title = title.to_string();
+                *screen = Screen::Chat(Box::new(open_new(context, false, title)?));
+            }
         }
         KeyCode::Backspace => {
             input.pop();
@@ -622,6 +722,7 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                                         verbose: app.verbose,
                                         sandbox: app.sandbox,
                                         stream: app.stream,
+                                        working_dir: app.working_dir.as_deref(),
                                         approval: &approval,
                                     });
                                 app.transcript.push(TranscriptItem::SessionStatus(rows));
@@ -713,6 +814,42 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    fn test_context() -> Context {
+        Context {
+            client: Arc::new(Client::for_test(crate::config::Config::default())),
+            default_model: "m".to_string(),
+            effort_level: None,
+            max_iterations: Some(20),
+            temperature: None,
+            approval: ApprovalSettings::default(),
+            sandbox: true,
+            verbose: false,
+            stream: true,
+        }
+    }
+
+    #[test]
+    fn a_blank_title_does_not_start_a_session() {
+        // Naming it is the deliberate act of creating one, so Enter on an
+        // empty name has nothing to do — it must not fall through to
+        // starting an untitled session.
+        //
+        // Only the blank path is tested here: every other key on this screen
+        // reaches the database (Esc rebuilds the picker, a real title opens a
+        // session), and a unit test has no business reading the user's own.
+        let context = test_context();
+        let mut screen = Screen::NameSession {
+            input: "   ".to_string(),
+        };
+
+        handle_naming_key(&context, &mut screen, KeyEvent::from(KeyCode::Enter)).unwrap();
+
+        assert!(
+            matches!(screen, Screen::NameSession { .. }),
+            "a blank title should leave you on the naming screen"
+        );
     }
 
     #[test]

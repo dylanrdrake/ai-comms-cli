@@ -54,6 +54,11 @@ pub struct SessionSummary {
     /// the configured default taken when it was created, mutable from inside
     /// it with `/stream`.
     pub stream: bool,
+    /// The directory this session was started in, which is the sandbox's
+    /// boundary and what its relative paths resolve against. `None` for a
+    /// session recorded before this was tracked — those resume wherever
+    /// they're run, as they always did.
+    pub working_dir: Option<String>,
     /// Not surfaced by the CLI, but kept for sorting and display.
     #[allow(dead_code)]
     pub created_at: i64,
@@ -92,6 +97,7 @@ pub fn open_db() -> Result<Connection> {
             approval_terminal  INTEGER NOT NULL DEFAULT 1,
             sandbox            INTEGER NOT NULL DEFAULT 1,
             stream             INTEGER NOT NULL DEFAULT 1,
+            working_dir        TEXT,
             created_at      INTEGER NOT NULL,
             updated_at      INTEGER NOT NULL
         );
@@ -157,6 +163,10 @@ pub fn open_db() -> Result<Connection> {
     // Whether replies stream token-by-token, per session — see
     // `Config::stream` for the configured default this snapshots.
     ensure_column(&conn, "sessions", "stream", "INTEGER NOT NULL DEFAULT 1")?;
+    // The directory a session was started in. Nullable on purpose: rows
+    // written before this existed have no answer, and a migration shouldn't
+    // start refusing to resume sessions that already worked.
+    ensure_column(&conn, "sessions", "working_dir", "TEXT")?;
 
     Ok(conn)
 }
@@ -214,13 +224,14 @@ pub fn create_session(
     sandbox: bool,
     verbose: bool,
     stream: bool,
+    working_dir: Option<&str>,
 ) -> Result<String> {
     let id = uuid::Uuid::new_v4().to_string();
     let ts = now();
     let title = crypto::encrypt("Untitled")?;
 
     conn.execute(
-        "INSERT INTO sessions (id, title, model, kind, effort_level, max_iterations, temperature, approval_read, approval_write, approval_terminal, sandbox, verbose, stream, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+        "INSERT INTO sessions (id, title, model, kind, effort_level, max_iterations, temperature, approval_read, approval_write, approval_terminal, sandbox, verbose, stream, working_dir, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
         params![
             id,
             title,
@@ -235,6 +246,7 @@ pub fn create_session(
             sandbox,
             verbose,
             stream,
+            working_dir,
             ts
         ],
     )?;
@@ -366,6 +378,19 @@ pub fn set_session_stream(conn: &Connection, session_id: &str, stream: bool) -> 
     Ok(())
 }
 
+/// Repoints a session at a different directory, for a project that moved.
+pub fn set_session_working_dir(
+    conn: &Connection,
+    session_id: &str,
+    working_dir: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET working_dir = ?1 WHERE id = ?2",
+        params![working_dir, session_id],
+    )?;
+    Ok(())
+}
+
 /// Appends a single message to a session and bumps its updated_at timestamp.
 /// `seq` should be the message's 0-based position within the session.
 /// `model`/`effort_level` record what was active when the message was
@@ -422,7 +447,7 @@ pub fn append_message(
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, created_at, updated_at \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, created_at, updated_at \
          FROM sessions ORDER BY updated_at DESC",
     )?;
 
@@ -443,8 +468,9 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
             },
             sandbox: row.get(11)?,
             stream: row.get(12)?,
-            created_at: row.get(13)?,
-            updated_at: row.get(14)?,
+            working_dir: row.get(13)?,
+            created_at: row.get(14)?,
+            updated_at: row.get(15)?,
         })
     })?;
 
@@ -461,7 +487,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
 pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, created_at, updated_at \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, created_at, updated_at \
          FROM sessions WHERE id = ?1 OR id LIKE ?2",
     )?;
 
@@ -486,8 +512,9 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
             },
             sandbox: row.get(11)?,
             stream: row.get(12)?,
-            created_at: row.get(13)?,
-            updated_at: row.get(14)?,
+            working_dir: row.get(13)?,
+            created_at: row.get(14)?,
+            updated_at: row.get(15)?,
         }))
     } else {
         Ok(None)
@@ -606,6 +633,7 @@ mod tests {
                 approval_terminal  INTEGER NOT NULL DEFAULT 1,
                 sandbox            INTEGER NOT NULL DEFAULT 1,
                 stream             INTEGER NOT NULL DEFAULT 1,
+                working_dir        TEXT,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -683,6 +711,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
 
@@ -729,6 +758,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
 
@@ -792,6 +822,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -806,6 +837,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
 
@@ -829,6 +861,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
         let prefix = &id[..8];
@@ -851,6 +884,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
 
@@ -878,6 +912,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
         let summary = find_session(&conn, &id).unwrap().unwrap();
@@ -906,6 +941,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
 
@@ -936,6 +972,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
 
@@ -960,6 +997,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
 
@@ -990,6 +1028,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
 
@@ -1017,6 +1056,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
 
@@ -1044,6 +1084,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap();
         append_message(

@@ -12,6 +12,7 @@ use crate::config::ApprovalSettings;
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
 use anyhow::Result;
 use rusqlite::Connection;
+use std::path::Path;
 
 pub struct ChatSession {
     conn: Connection,
@@ -52,6 +53,10 @@ pub struct ChatSession {
     /// Whether this session streams replies token-by-token. Snapshotted from
     /// the configured default at creation, like `sandbox`.
     stream: bool,
+    /// The directory this session was started in — the sandbox's boundary
+    /// and what its relative paths resolve against. `None` for a session
+    /// recorded before this was tracked.
+    working_dir: Option<String>,
     messages: Vec<ChatMessage>,
     /// Whether the session has been given a title derived from a user
     /// message yet. Sessions start as "Untitled".
@@ -59,6 +64,42 @@ pub struct ChatSession {
     /// How many of `messages` have been written to the database. Everything
     /// from here on is pending; see [`ChatSession::persist_pending`].
     saved_len: usize,
+}
+
+/// What moving into a session's recorded directory did.
+pub enum EnteredDir {
+    /// The process moved into the session's directory.
+    Moved(String),
+    /// Already there, or the session recorded no directory — sessions
+    /// written before that was tracked resume wherever they're run, as they
+    /// always did.
+    Unchanged,
+    /// The recorded directory is gone. The caller decides what to do: the
+    /// session's sandbox boundary can't be honoured, so continuing means
+    /// running against whatever directory happens to be current.
+    Missing(String),
+}
+
+/// Moves the process into `session`'s recorded working directory.
+///
+/// The directory is the sandbox's boundary and what the session's relative
+/// paths resolve against, so a session resumed somewhere else is bounded by
+/// wherever the shell happened to be — which is not what anyone means by
+/// resuming it. Moving the process is what keeps the boundary a property of
+/// the session rather than of the terminal.
+pub fn enter_working_dir(session: &ChatSession) -> Result<EnteredDir> {
+    let Some(recorded) = session.working_dir() else {
+        return Ok(EnteredDir::Unchanged);
+    };
+    let recorded = recorded.to_string();
+    if !Path::new(&recorded).is_dir() {
+        return Ok(EnteredDir::Missing(recorded));
+    }
+    if std::env::current_dir().is_ok_and(|cwd| cwd == Path::new(&recorded)) {
+        return Ok(EnteredDir::Unchanged);
+    }
+    std::env::set_current_dir(&recorded)?;
+    Ok(EnteredDir::Moved(recorded))
 }
 
 impl ChatSession {
@@ -81,6 +122,7 @@ impl ChatSession {
         sandbox: bool,
         verbose: bool,
         stream: bool,
+        working_dir: Option<String>,
     ) -> Result<Self> {
         let id = store::create_session(
             &conn,
@@ -93,6 +135,7 @@ impl ChatSession {
             sandbox,
             verbose,
             stream,
+            working_dir.as_deref(),
         )?;
         Ok(ChatSession {
             conn,
@@ -107,6 +150,7 @@ impl ChatSession {
             approval,
             sandbox,
             stream,
+            working_dir,
             messages: Vec::new(),
             title_set: false,
             saved_len: 0,
@@ -153,6 +197,7 @@ impl ChatSession {
                 max_iterations: summary.max_iterations.map(|n| n as usize),
                 sandbox: summary.sandbox,
                 stream: summary.stream,
+                working_dir: summary.working_dir.clone(),
                 temperature: summary.temperature.map(|n| n as f32),
                 approval: summary.approval.clone(),
                 messages,
@@ -308,6 +353,18 @@ impl ChatSession {
         self.stream
     }
 
+    /// The directory this session was started in, if it recorded one.
+    pub fn working_dir(&self) -> Option<&str> {
+        self.working_dir.as_deref()
+    }
+
+    /// Repoints this session at `working_dir`, for a project that moved.
+    pub fn set_working_dir(&mut self, working_dir: String) -> Result<()> {
+        store::set_session_working_dir(&self.conn, &self.id, &working_dir)?;
+        self.working_dir = Some(working_dir);
+        Ok(())
+    }
+
     /// The session's current title — "Untitled" until the first user
     /// message names it.
     pub fn title(&self) -> &str {
@@ -440,17 +497,21 @@ impl ChatSession {
         self.persist_pending()
     }
 
-    /// Deletes the session if nothing was ever said in it, reporting whether
-    /// it did.
+    /// Deletes the session if it was never named and nothing was ever said
+    /// in it, reporting whether it did.
     ///
     /// A session row is created up front so messages have somewhere to go,
     /// which means opening a conversation and backing out without typing
-    /// leaves an empty "Untitled" behind. Harmless when sessions are only
-    /// listed on demand, but clutter once a launch screen shows recent ones.
-    /// A resumed session is never empty, so this only ever discards a
-    /// genuinely unused one.
+    /// would leave an empty "Untitled" behind — clutter, now that the launch
+    /// screen lists every session.
+    ///
+    /// Naming one is enough to keep it, though. Typing a title and
+    /// confirming is a deliberate act: the session is something the user
+    /// decided to start, whether or not they got as far as saying anything
+    /// in it. Only backing out of the naming screen with a blank title, and
+    /// then saying nothing, reads as "never mind".
     pub fn discard_if_unused(&self) -> Result<bool> {
-        if self.messages.iter().any(|m| m.role == "user") {
+        if self.title_set || self.messages.iter().any(|m| m.role == "user") {
             return Ok(false);
         }
         store::delete_session(&self.conn, &self.id)
@@ -483,6 +544,7 @@ mod tests {
                 approval_terminal  INTEGER NOT NULL DEFAULT 1,
                 sandbox            INTEGER NOT NULL DEFAULT 1,
                 stream             INTEGER NOT NULL DEFAULT 1,
+                working_dir        TEXT,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -517,6 +579,7 @@ mod tests {
             true,
             false,
             true,
+            None,
         )
         .unwrap()
     }
@@ -721,6 +784,76 @@ mod tests {
         assert_eq!(summary.temperature, None);
     }
 
+    fn session_in(dir: Option<&str>) -> ChatSession {
+        ChatSession::create(
+            memory_conn(),
+            "test-model".to_string(),
+            KIND_CHAT,
+            None,
+            Some(20),
+            Some(0.7),
+            ApprovalSettings::default(),
+            true,
+            false,
+            true,
+            dir.map(str::to_string),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_session_records_the_directory_it_started_in() {
+        let dir = std::env::temp_dir().display().to_string();
+        let session = session_in(Some(&dir));
+        assert_eq!(session.working_dir(), Some(dir.as_str()));
+
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.working_dir.as_deref(), Some(dir.as_str()));
+    }
+
+    #[test]
+    fn a_session_without_a_recorded_directory_resumes_where_it_is() {
+        // Rows written before this was tracked. Refusing to resume them, or
+        // moving the process somewhere arbitrary, would break sessions that
+        // worked yesterday.
+        let session = session_in(None);
+        assert!(matches!(
+            enter_working_dir(&session).unwrap(),
+            EnteredDir::Unchanged
+        ));
+    }
+
+    #[test]
+    fn a_missing_directory_is_reported_rather_than_ignored() {
+        // The session's sandbox is anchored to a directory that isn't there,
+        // so neither front end can honour it — and quietly rebinding the
+        // bound to whatever is current is the one outcome worth refusing.
+        let session = session_in(Some("/comms-no-such-directory-exists"));
+        assert!(matches!(
+            enter_working_dir(&session).unwrap(),
+            EnteredDir::Missing(_)
+        ));
+        // Nothing moved.
+        assert_ne!(
+            std::env::current_dir().unwrap().display().to_string(),
+            "/comms-no-such-directory-exists"
+        );
+    }
+
+    #[test]
+    fn repointing_a_session_records_the_new_directory() {
+        let mut session = session_in(Some("/comms-no-such-directory-exists"));
+        session.set_working_dir("/tmp".to_string()).unwrap();
+
+        assert_eq!(session.working_dir(), Some("/tmp"));
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.working_dir.as_deref(), Some("/tmp"));
+    }
+
     #[test]
     fn a_new_session_snapshots_the_configured_verbose_default() {
         // The configured default is a starting value, not a live one: it is
@@ -738,6 +871,7 @@ mod tests {
             true,
             true,
             true,
+            None,
         )
         .unwrap();
 
@@ -845,6 +979,20 @@ mod tests {
         assert!(store::find_session(&session.conn, session.id())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn a_named_session_is_kept_even_with_nothing_said_in_it() {
+        // Typing a title and confirming is a deliberate act — the session is
+        // one the user decided to start, whether or not they got as far as
+        // saying anything in it.
+        let mut session = memory_session();
+        session.set_title("Plan the migration".to_string()).unwrap();
+
+        assert!(!session.discard_if_unused().unwrap());
+        assert!(store::find_session(&session.conn, session.id())
+            .unwrap()
+            .is_some());
     }
 
     #[test]

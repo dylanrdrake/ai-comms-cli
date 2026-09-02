@@ -198,6 +198,7 @@ pub struct SessionSettings<'a> {
     pub verbose: bool,
     pub sandbox: bool,
     pub stream: bool,
+    pub working_dir: Option<&'a str>,
     pub approval: &'a ApprovalSettings,
 }
 
@@ -246,6 +247,15 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
         ("Sandbox".to_string(), on_off(settings.sandbox)),
         ("Verbose".to_string(), on_off(settings.verbose)),
         ("Streaming".to_string(), on_off(settings.stream)),
+        (
+            "Directory".to_string(),
+            settings
+                .working_dir
+                .map(str::to_string)
+                // Sessions predating this resume wherever they're run, and
+                // saying so beats an empty cell that looks like a bug.
+                .unwrap_or_else(|| "not recorded".to_string()),
+        ),
         (
             "Approval".to_string(),
             format!(
@@ -1127,6 +1137,7 @@ mod tests {
             verbose: false,
             sandbox: true,
             stream: true,
+            working_dir: None,
             approval: &approval,
         });
         let value = |label: &str| {
@@ -1143,6 +1154,7 @@ mod tests {
         assert_eq!(value("Max iterations"), "not set");
         assert_eq!(value("Sandbox"), "on");
         assert_eq!(value("Approval"), "read Ask · write Ask · terminal Ask");
+        assert_eq!(value("Directory"), "not recorded");
     }
 
     #[test]
@@ -1163,6 +1175,7 @@ mod tests {
             verbose: true,
             sandbox: false,
             stream: false,
+            working_dir: Some("/home/dev/project"),
             approval: &approval,
         });
         let value = |label: &str| {
@@ -1178,6 +1191,7 @@ mod tests {
         assert_eq!(value("Verbose"), "on");
         // An auto-approved category reads differently from a gated one.
         assert_eq!(value("Approval"), "read Auto · write Ask · terminal Ask");
+        assert_eq!(value("Directory"), "/home/dev/project");
     }
 
     #[test]

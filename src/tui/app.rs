@@ -113,6 +113,8 @@ pub struct App {
     /// Whether this session streams replies token-by-token. Changed with
     /// `/stream`.
     pub stream: bool,
+    /// The directory this session was started in, shown by `/status`.
+    pub working_dir: Option<String>,
     /// This session's `/max-iterations` override, changed with
     /// `/max-iterations`/`/max-iterations default`. `None` means nullified —
     /// turns fall back to the configured default. Only takes effect in
@@ -156,6 +158,7 @@ impl App {
             verbose: false,
             sandbox: true,
             stream: true,
+            working_dir: None,
             max_iterations: None,
             temperature: None,
             approval: ApprovalSettings::default(),

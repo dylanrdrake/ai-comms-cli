@@ -208,6 +208,16 @@ enum Commands {
         /// value to pick from a list of all your saved sessions
         #[arg(long, num_args = 0..=1, default_missing_value = PICK_SESSION_SENTINEL)]
         resume: Option<String>,
+
+        /// Resume in the current directory instead of the one the session
+        /// was started in, and remember it — for a project that has moved
+        #[arg(long)]
+        here: bool,
+
+        /// Name the session. Prompted for if omitted; ignored when resuming,
+        /// since a resumed session keeps the name it has
+        #[arg(long)]
+        title: Option<String>,
     },
 
     /// Run an agentic task (can write/read files)
@@ -417,7 +427,20 @@ async fn main() -> Result<()> {
             temperature,
             effort_level,
             resume,
-        }) => cmd_session(model, max_iterations, temperature, effort_level, resume).await?,
+            here,
+            title,
+        }) => {
+            cmd_session(
+                model,
+                max_iterations,
+                temperature,
+                effort_level,
+                resume,
+                here,
+                title,
+            )
+            .await?
+        }
         Some(Commands::Agent {
             task,
             model,
@@ -1243,6 +1266,7 @@ fn apply_submission(
                 verbose: session.verbose(),
                 sandbox: session.sandbox(),
                 stream: session.stream(),
+                working_dir: session.working_dir(),
                 approval: &approval,
             });
             let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
@@ -1264,12 +1288,34 @@ fn apply_submission(
     Ok(())
 }
 
+/// Asks for a session title, for `comms session` without `--title`.
+///
+/// Refuses a blank one rather than falling back to naming the session from
+/// its first message: creating a session should be deliberate, and a name is
+/// what makes it worth keeping whether or not anything is said in it.
+fn prompt_for_title() -> Result<String> {
+    let mut rl = DefaultEditor::new()?;
+    loop {
+        match rl.readline(&format!("{} ", "Session title:".blue())) {
+            Ok(line) if !line.trim().is_empty() => return Ok(line.trim().to_string()),
+            Ok(_) => println!("{} A title is required.", "✗".red()),
+            Err(rustyline::error::ReadlineError::Interrupted)
+            | Err(rustyline::error::ReadlineError::Eof) => {
+                anyhow::bail!("Cancelled")
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 async fn cmd_session(
     model: Option<String>,
     max_iterations: Option<usize>,
     temperature: Option<f32>,
     effort_level: Option<String>,
     resume: Option<String>,
+    here: bool,
+    title: Option<String>,
 ) -> Result<()> {
     let config = load_config()?;
     let conn = store::open_db()?;
@@ -1294,13 +1340,49 @@ async fn cmd_session(
                     "note:".bright_black()
                 );
             }
+            if title.is_some() {
+                println!(
+                    "{} Ignoring --title: resumed sessions keep their saved name",
+                    "note:".bright_black()
+                );
+            }
             println!(
                 "{} Resuming session {} ({})\n",
                 "✓".green(),
                 summary.id,
                 summary.title
             );
-            let (session, history) = ChatSession::resume(conn, &summary, summary.model.clone())?;
+            let (mut session, history) =
+                ChatSession::resume(conn, &summary, summary.model.clone())?;
+
+            // The session's directory is its sandbox boundary and what its
+            // relative paths mean, so resuming somewhere else would silently
+            // rebind both to wherever the shell happens to be.
+            if here {
+                if let Some(cwd) = std::env::current_dir()
+                    .ok()
+                    .map(|d| d.display().to_string())
+                {
+                    session.set_working_dir(cwd.clone())?;
+                    println!("{} Session repointed at {}", "✓".green(), cwd);
+                }
+            } else {
+                match session::enter_working_dir(&session)? {
+                    session::EnteredDir::Moved(dir) => {
+                        println!("{} Working directory: {}", "↳".blue(), dir);
+                    }
+                    session::EnteredDir::Unchanged => {}
+                    session::EnteredDir::Missing(dir) => {
+                        anyhow::bail!(
+                            "This session was started in {dir}, which no longer exists.\n\n\
+                             Its sandbox and relative paths are anchored there, so resuming \
+                             elsewhere would quietly rebind them to the current directory. \
+                             Re-run with --here to resume where you are and repoint the session."
+                        );
+                    }
+                }
+            }
+
             print_transcript(&history);
             prior_prompts = user_prompts(&history);
             session
@@ -1309,7 +1391,14 @@ async fn cmd_session(
         // "New session" — `/agent` turns tools on from inside it.
         None => {
             let model = resolve_model(&config, model);
-            ChatSession::create(
+            // Naming it is the deliberate act of starting one, so there's no
+            // untitled path — an omitted `--title` is asked for rather than
+            // defaulted.
+            let title = match title {
+                Some(title) => title,
+                None => prompt_for_title()?,
+            };
+            let mut session = ChatSession::create(
                 conn,
                 model,
                 KIND_CHAT,
@@ -1320,7 +1409,12 @@ async fn cmd_session(
                 config.sandbox,
                 config.verbose,
                 config.stream,
-            )?
+                std::env::current_dir()
+                    .ok()
+                    .map(|dir| dir.display().to_string()),
+            )?;
+            session.set_title(title)?;
+            session
         }
     };
 
