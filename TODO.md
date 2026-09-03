@@ -10,9 +10,10 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
+* should --headless agents not be allowed to spawn more headless sessions?
 * token counters (definitely one in-session, part of verbose?)
-* rebrand to Clanker Command Center (CCC)
 * how to handle $'s that need an answer to std in
+* is it possible to create a session and not enter the terminal but keep the process open, or create/open a session and back out of the terminal but the process stays open so the agent can keep wokring?
 * what happens if you --resume an 'elsewhere' session then ctrl-c? Where does your terminal land to?
 * add a clank ask with no "" text and it immediately asks for input from the user and asks with that input
 * if `$` gets reverted, keep the stdin fix in tools.rs. `run_terminal_command`

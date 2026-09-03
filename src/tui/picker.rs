@@ -31,6 +31,9 @@ pub struct SessionRow {
     pub activity: Option<Activity>,
     /// The line that goes with that — for an approval, what is being asked.
     pub activity_detail: Option<String>,
+    /// When the process running it last checked in, so a state it claimed and
+    /// then died holding can be told apart from one that's still true.
+    pub heartbeat: Option<i64>,
 }
 
 impl From<SessionSummary> for SessionRow {
@@ -44,6 +47,7 @@ impl From<SessionSummary> for SessionRow {
             last: None,
             activity: summary.activity,
             activity_detail: summary.activity_detail,
+            heartbeat: summary.heartbeat,
         }
     }
 }
@@ -86,7 +90,7 @@ impl SessionRow {
     /// somebody is being asked a question. Otherwise the last message
     /// speaks, which is all a session nobody is running can offer.
     pub fn last_state(&self) -> LastState {
-        crate::store::last_state(self.activity, self.last.as_ref())
+        crate::store::last_state(self.activity, self.heartbeat, self.last.as_ref())
     }
 }
 
@@ -789,7 +793,21 @@ mod tests {
             last: None,
             activity: None,
             activity_detail: None,
+            heartbeat: None,
         }
+    }
+
+    /// Marks a row as being run right now: an activity is only believed
+    /// while a process is checking in to back it up.
+    fn running(mut row: SessionRow, activity: Activity) -> SessionRow {
+        row.activity = Some(activity);
+        row.heartbeat = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        );
+        row
     }
 
     fn with_last(mut row: SessionRow, role: &str, tool_calls: bool, preview: &str) -> SessionRow {
@@ -937,17 +955,36 @@ mod tests {
         );
         assert_eq!(sent.last_state(), LastState::NoReply);
 
-        let mut running = sent.clone();
-        running.activity = Some(Activity::Working);
-        assert_eq!(running.last_state(), LastState::Working);
+        let in_flight = running(sent.clone(), Activity::Working);
+        assert_eq!(in_flight.last_state(), LastState::Working);
 
-        let mut asking = sent.clone();
-        asking.activity = Some(Activity::AwaitingApproval);
+        let asking = running(sent.clone(), Activity::AwaitingApproval);
         assert_eq!(asking.last_state(), LastState::AwaitingApproval);
 
         let mut broken = sent.clone();
         broken.activity = Some(Activity::Failed);
         assert_eq!(broken.last_state(), LastState::Failed);
+    }
+
+    #[test]
+    fn a_row_left_working_by_a_dead_process_stops_saying_so() {
+        // A detached run killed mid-turn never clears its activity. Without
+        // a heartbeat to back it, the claim is ignored and the row reports
+        // what its messages actually show.
+        let sent = with_last(
+            row_in("00000001", "chat", "t", Some(HERE)),
+            "user",
+            false,
+            "do the thing",
+        );
+
+        let mut abandoned = sent.clone();
+        abandoned.activity = Some(Activity::Working);
+        abandoned.heartbeat = None;
+        assert_eq!(abandoned.last_state(), LastState::NoReply);
+
+        abandoned.heartbeat = Some(0); // the epoch: as stale as it gets
+        assert_eq!(abandoned.last_state(), LastState::NoReply);
     }
 
     #[test]
@@ -993,8 +1030,10 @@ mod tests {
         let idle = picker_of(vec![row_in("00000001", "chat", "one", Some(HERE))]);
         assert!(!idle.has_working_session());
 
-        let mut busy_row = row_in("00000002", "chat", "two", Some(HERE));
-        busy_row.activity = Some(Activity::Working);
+        let busy_row = running(
+            row_in("00000002", "chat", "two", Some(HERE)),
+            Activity::Working,
+        );
         assert!(picker_of(vec![busy_row]).has_working_session());
     }
 
@@ -1010,7 +1049,7 @@ mod tests {
         );
         assert_eq!(row.preview().as_deref(), Some("please tidy the build"));
 
-        row.activity = Some(Activity::AwaitingApproval);
+        let mut row = running(row, Activity::AwaitingApproval);
         row.activity_detail = Some("run_terminal_command: rm -rf build".to_string());
         assert_eq!(
             row.preview().as_deref(),

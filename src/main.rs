@@ -13,7 +13,7 @@ mod tui;
 mod ui;
 mod wrap;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
 use rustyline::DefaultEditor;
@@ -193,6 +193,11 @@ enum Commands {
         /// model accepts.
         #[arg(long)]
         effort_level: Option<String>,
+
+        /// Print just the reply on stdout — no spinner, no model label —
+        /// for piping into another command or a file.
+        #[arg(long, alias = "h")]
+        headless: bool,
     },
 
     /// Interactive session — starts in plain ask mode; /agent turns on
@@ -263,6 +268,21 @@ enum Commands {
         /// model accepts.
         #[arg(long)]
         effort_level: Option<String>,
+
+        /// Run with no terminal attached: no spinner, and — for `agent` —
+        /// no approval prompts, since there is nobody to answer them.
+        #[arg(long, alias = "h")]
+        headless: bool,
+
+        /// Save this run as a session, so it shows up in the picker and can
+        /// be resumed later. Without it a task leaves nothing behind.
+        #[arg(long)]
+        session: bool,
+
+        /// Run the task inside an existing session, appending to it. Takes a
+        /// session id or any unique prefix of one.
+        #[arg(long, value_name = "ID", conflicts_with = "session")]
+        resume: Option<String>,
     },
 
     /// Manage saved chat sessions
@@ -435,7 +455,8 @@ async fn main() -> Result<()> {
             model,
             temperature,
             effort_level,
-        }) => cmd_ask(&prompt, model, temperature, effort_level).await?,
+            headless,
+        }) => cmd_ask(&prompt, model, temperature, effort_level, headless).await?,
         Some(Commands::Session {
             model,
             max_iterations,
@@ -463,6 +484,9 @@ async fn main() -> Result<()> {
             max_iterations,
             temperature,
             effort_level,
+            headless,
+            session,
+            resume,
         }) => {
             cmd_agent(
                 &task,
@@ -471,6 +495,9 @@ async fn main() -> Result<()> {
                 max_iterations,
                 temperature,
                 effort_level,
+                headless,
+                session,
+                resume,
             )
             .await?
         }
@@ -1116,6 +1143,7 @@ async fn cmd_ask(
     model: Option<String>,
     temperature: Option<f32>,
     effort_level: Option<String>,
+    headless: bool,
 ) -> Result<()> {
     let config = load_config()?;
     let model = resolve_model(&config, model);
@@ -1131,7 +1159,10 @@ async fn cmd_ask(
         ..Default::default()
     }];
 
-    let spinner = Spinner::start("Thinking...");
+    // Nothing that only means something on a live terminal: the spinner
+    // animates in place with `\r`, which in a file is a line of overwritten
+    // frames rather than progress.
+    let spinner = (!headless).then(|| Spinner::start("Thinking..."));
     let response = client
         .chat(
             model.clone(),
@@ -1141,12 +1172,25 @@ async fn cmd_ask(
             effort_level.clone(),
         )
         .await;
-    spinner.stop().await;
+    if let Some(spinner) = spinner {
+        spinner.stop().await;
+    }
     let response = response?;
+    let choice = &response.choices[0];
+
+    // Just the reply, so `clank ask --headless ... | wc -w` measures the
+    // answer and not a ✓ and a model label. Unwrapped too — whatever reads
+    // this decides its own width; inheriting this terminal's would bake
+    // hard newlines into text being piped somewhere else entirely.
+    if headless {
+        if choice.message.has_visible_content() {
+            println!("{}", choice.message.content.as_deref().unwrap());
+        }
+        return Ok(());
+    }
 
     println!("{} ", "✓".green());
     println!("\n{}:", response_label(&model, &effort_level).cyan());
-    let choice = &response.choices[0];
     if choice.message.has_visible_content() {
         println!("{}", wrap::wrap(choice.message.content.as_deref().unwrap()));
     }
@@ -1696,6 +1740,190 @@ async fn cmd_session(
     Ok(())
 }
 
+/// Marks a process as being a headless run, so one can't launch another.
+///
+/// An environment variable rather than anything cleverer precisely because
+/// it is inherited: `run_terminal_command` spawns children from this process,
+/// so every descendant carries it without being told to.
+const HEADLESS_MARKER: &str = "CLANK_HEADLESS";
+
+/// Refuses a headless run that would stop at the first gated tool call.
+///
+/// A gate is a yes/no question, and `--headless` has nobody to ask. Denying
+/// every call instead would "work" — the run finishes, having been refused
+/// every tool it reached — which is worse than not starting, because it
+/// costs a full task's tokens to discover. Checked before the first request
+/// so the failure is free, and it names the exact way out rather than
+/// leaving you to find it.
+fn ensure_headless_can_run(approval: &ApprovalSettings) -> Result<()> {
+    headless_verdict(approval, std::env::var(HEADLESS_MARKER).is_ok())
+}
+
+/// The body of [`ensure_headless_can_run`], against an explicit answer to
+/// "are we already inside a headless run?".
+///
+/// Split out so it's testable without setting the variable for real: the
+/// environment is process-wide, and tests run in parallel, so one test
+/// setting it would decide the outcome of every other.
+fn headless_verdict(approval: &ApprovalSettings, inside_headless: bool) -> Result<()> {
+    // A headless run has `terminal` ungated by definition — that's the
+    // condition for starting one — so nothing stops the model from launching
+    // more of itself. Each is detached, so each is invisible, and the fan-out
+    // is unbounded and spending money. The marker is inherited by every child
+    // process, so this catches the third level as readily as the second.
+    if inside_headless {
+        return Err(anyhow!(
+            "Refusing to start a headless run from inside one.\n\n\
+             This process was launched by `--headless`, which leaves `terminal` \
+             ungated — so an agent spawning more headless agents would fan out \
+             with nobody watching and nothing to stop it. Do the work in this \
+             run, or queue the tasks from outside."
+        ));
+    }
+
+    let gated: Vec<&str> = [
+        ("read", approval.read_disk),
+        ("write", approval.write_disk),
+        ("terminal", approval.terminal),
+    ]
+    .into_iter()
+    .filter(|(_, on)| *on)
+    .map(|(name, _)| name)
+    .collect();
+
+    if gated.is_empty() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "--headless has nobody to answer an approval prompt, but these gates \
+         are still on: {}.\n\nTurn them off first:\n    clank approval all off\n\n\
+         Or one at a time, e.g. `clank approval {} off`. `clank approval show` \
+         lists where they stand.",
+        gated.join(", "),
+        gated[0],
+    ))
+}
+
+/// Opens the session a `--session`/`--resume` agent run writes to, or
+/// `None` for the default one-shot that leaves nothing behind.
+///
+/// Split from [`cmd_agent`] because the two branches share almost nothing:
+/// a new session snapshots the config-plus-flags defaults the same way
+/// `clank session` does, while a resumed one takes every setting off the
+/// stored row and ignores the flags entirely — the same rule the interactive
+/// resume follows, so a session behaves the same however it's reopened.
+fn open_agent_session(
+    config: &config::Config,
+    model: Option<String>,
+    max_iterations: Option<usize>,
+    temperature: Option<f32>,
+    effort_level: Option<String>,
+    session: bool,
+    resume: Option<String>,
+) -> Result<Option<ChatSession>> {
+    if !session && resume.is_none() {
+        return Ok(None);
+    }
+
+    let conn = store::open_db()?;
+
+    if let Some(id_or_prefix) = resume {
+        let summary = resolve_resume_target(&conn, &id_or_prefix)?;
+
+        // Two processes appending to one session interleave their turns into
+        // a history neither of them wrote, and the loser of the race is
+        // usually the detached one nobody is watching. A heartbeat is the
+        // only evidence available, and it expires on its own — so a session
+        // whose runner died is claimable again without anything to clean up.
+        if store::heartbeat_is_live(summary.heartbeat) {
+            anyhow::bail!(
+                "Session {} is already being run by another process.\n\n\
+                 Wait for it to finish, or start a separate run with \
+                 `--session` instead of appending to this one.",
+                summary.id
+            );
+        }
+        for (flag, given) in [
+            ("--model", model.is_some()),
+            ("--max-iterations", max_iterations.is_some()),
+            ("--temperature", temperature.is_some()),
+            ("--effort-level", effort_level.is_some()),
+        ] {
+            if given {
+                println!(
+                    "{} Ignoring {flag}: resumed sessions keep their saved settings",
+                    "note:".bright_black()
+                );
+            }
+        }
+
+        let (mut session, _history) = ChatSession::resume(conn, &summary, summary.model.clone())?;
+
+        // The session's directory is its sandbox boundary and what its
+        // relative paths mean. `clank session` offers `--here` to repoint it;
+        // there's no such escape hatch here, because the run that would use
+        // it is the one nobody is watching — so a moved directory is an
+        // error rather than a silent rebind to wherever this was launched.
+        match session::enter_working_dir(&session)? {
+            session::EnteredDir::Moved(dir) => {
+                println!("{} Working directory: {}", "↳".blue(), dir);
+            }
+            session::EnteredDir::Unchanged => {}
+            session::EnteredDir::Missing(dir) => {
+                anyhow::bail!(
+                    "Session {} was started in {dir}, which no longer exists.\n\n\
+                     Its sandbox and relative paths are anchored there, so running \
+                     here would quietly rebind both to the current directory. Resume \
+                     it with `clank session --resume {} --here` to repoint it first.",
+                    summary.id,
+                    summary.id,
+                );
+            }
+        }
+
+        // Running a task in it makes it an agent session, so reopening it in
+        // the TUI or `clank session` comes back with tools already on rather
+        // than needing `/agent` again.
+        session.set_agentic(true)?;
+        println!(
+            "{} Resuming session {} ({})\n",
+            "✓".green(),
+            session.short_id(),
+            session.title()
+        );
+        return Ok(Some(session));
+    }
+
+    let session = ChatSession::create(
+        conn,
+        resolve_model(config, model),
+        store::KIND_AGENT_CHAT,
+        resolve_effort_level(config, effort_level),
+        resolve_max_iterations(config, max_iterations),
+        resolve_temperature(config, temperature),
+        config.approval.clone(),
+        config.sandbox,
+        config.verbose,
+        config.highlight,
+        config.stream,
+        std::env::current_dir()
+            .ok()
+            .map(|dir| dir.display().to_string()),
+    )?;
+    // No title is set, which leaves it eligible for the usual
+    // derive-from-first-message step — and the first message is the task, so
+    // the picker names the session after the work rather than "Untitled".
+    println!(
+        "{} Session {} — resume it with `clank session --resume {}`\n",
+        "✓".green(),
+        session.short_id(),
+        session.short_id()
+    );
+    Ok(Some(session))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn cmd_agent(
     task: &str,
     model: Option<String>,
@@ -1703,15 +1931,56 @@ async fn cmd_agent(
     max_iterations: Option<usize>,
     temperature: Option<f32>,
     effort_level: Option<String>,
+    headless: bool,
+    session: bool,
+    resume: Option<String>,
 ) -> Result<()> {
     let config = load_config()?;
-    let model = resolve_model(&config, model);
-    let max_iterations = resolve_max_iterations(&config, max_iterations);
-    let temperature = resolve_temperature(&config, temperature);
-    let approval = config.approval.clone();
-    let sandbox = config.sandbox;
-    let stream = config.stream;
-    let effort_level = resolve_effort_level(&config, effort_level);
+
+    // Read before the session is opened: a refusal should cost nothing, and
+    // creating a session first would leave an empty row behind for a run that
+    // never starts.
+    if headless {
+        ensure_headless_can_run(&config.approval)?;
+        // Set after the check, so this run doesn't refuse itself, and before
+        // any tool can run, so every child it spawns inherits it.
+        std::env::set_var(HEADLESS_MARKER, "1");
+    }
+
+    let mut stored = open_agent_session(
+        &config,
+        model.clone(),
+        max_iterations,
+        temperature,
+        effort_level.clone(),
+        session,
+        resume,
+    )?;
+
+    // A session's own settings are the ones it runs with; the flag-plus-config
+    // merge only applies to a run that has no session to remember anything.
+    let (model, max_iterations, temperature, effort_level, approval, sandbox, stream) =
+        match &stored {
+            Some(session) => (
+                session.model().to_string(),
+                session.max_iterations(),
+                session.temperature(),
+                session.effort_level().map(str::to_string),
+                session.approval().clone(),
+                session.sandbox(),
+                session.stream(),
+            ),
+            None => (
+                resolve_model(&config, model),
+                resolve_max_iterations(&config, max_iterations),
+                resolve_temperature(&config, temperature),
+                resolve_effort_level(&config, effort_level),
+                config.approval.clone(),
+                config.sandbox,
+                config.stream,
+            ),
+        };
+
     let client = Client::new(config)?;
 
     println!("{}\n", "Starting agent task...".blue());
@@ -1719,19 +1988,72 @@ async fn cmd_agent(
     // Unlike `session`, a one-shot task has no other way to show which
     // model answered, so it keeps the label `session`/`tui` dropped.
     let mut ui = TerminalAgentUi::new(verbose, true);
-    agent::run_agent(
+    if headless {
+        ui.go_headless();
+    }
+
+    let gates = SessionGates::new(approval, sandbox);
+
+    let Some(session) = &mut stored else {
+        agent::run_agent(
+            &client,
+            &mut ui,
+            task,
+            &model,
+            max_iterations,
+            temperature,
+            &gates,
+            effort_level,
+            stream,
+        )
+        .await?;
+        return Ok(());
+    };
+
+    // Reports Working/Failed to the picker, which is the whole point of
+    // running with a session: a detached task is otherwise invisible until
+    // it finishes.
+    match terminal_ui::ActivityWriter::new(session.id().to_string()) {
+        Ok(activity) => ui.watch(activity),
+        // Not being watchable is no reason to refuse to run.
+        Err(e) => eprintln!(
+            "{} Session activity won't be reported: {e}",
+            "note:".bright_black()
+        ),
+    }
+
+    session.push_user(task.to_string());
+    if let Err(e) = session.persist_pending() {
+        eprintln!("{} Failed to save message: {}", "✗".red(), e);
+    }
+
+    session.set_activity(Some(store::Activity::Working), None);
+    let turn = agent::run_agent_turn(
         &client,
         &mut ui,
-        task,
+        session.messages_mut(),
         &model,
         max_iterations,
         temperature,
-        &SessionGates::new(approval, sandbox),
+        &gates,
         effort_level,
         stream,
+        // Nothing can join a turn that has no input to type into.
+        &agent::Steering::default(),
     )
-    .await?;
+    .await;
 
+    let failed = turn.is_err();
+    session.set_activity(failed.then_some(store::Activity::Failed), None);
+
+    // Persisted before the error is returned: the turn's messages are worth
+    // keeping either way, and a failed run that saved nothing would be
+    // indistinguishable in the picker from one that never started.
+    if let Err(e) = session.persist_pending() {
+        eprintln!("{} Failed to save message: {}", "✗".red(), e);
+    }
+
+    turn?;
     Ok(())
 }
 
@@ -1773,7 +2095,7 @@ async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
 
             println!("{}\n", "Saved sessions:".blue());
             for s in &sessions {
-                let state = store::last_state(s.activity, last.get(&s.id));
+                let state = store::last_state(s.activity, s.heartbeat, last.get(&s.id));
                 println!(
                     "  {}  {}  {}  {}  {}",
                     (&s.id[..8]).bright_black(),
@@ -1841,6 +2163,63 @@ mod tests {
             effort_level: effort_level.map(str::to_string),
             ..config::Config::default()
         }
+    }
+
+    fn gates(read_disk: bool, write_disk: bool, terminal: bool) -> ApprovalSettings {
+        ApprovalSettings {
+            read_disk,
+            write_disk,
+            terminal,
+        }
+    }
+
+    #[test]
+    fn a_headless_run_will_not_launch_another_headless_run() {
+        // Unbounded fan-out of detached processes, each spending money with
+        // nobody watching. Refused even with every gate off — which is the
+        // only state a headless run is ever in, so the check has to sit
+        // ahead of the gate check rather than beside it.
+        let error = headless_verdict(&gates(false, false, false), true)
+            .expect_err("a headless run may not start another")
+            .to_string();
+        assert!(error.contains("inside one"), "{error}");
+
+        // The same settings are fine from a process that isn't one.
+        assert!(headless_verdict(&gates(false, false, false), false).is_ok());
+    }
+
+    #[test]
+    fn headless_runs_only_when_nothing_would_stop_to_ask() {
+        // The whole point of the flag: fired off and left alone. A gate is a
+        // question, and there is nobody to answer it.
+        assert!(headless_verdict(&gates(false, false, false), false).is_ok());
+
+        for (read, write, terminal) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            assert!(
+                headless_verdict(&gates(read, write, terminal), false).is_err(),
+                "{read} {write} {terminal} should refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_every_gate_that_is_on_and_the_way_out() {
+        // Refusing is only useful if it says which gates and how to change
+        // them — the failure happens before any request, so this message is
+        // the entire output of the run.
+        let error = headless_verdict(&gates(true, false, true), false)
+            .expect_err("two gates on is a refusal")
+            .to_string();
+
+        assert!(error.contains("read"), "{error}");
+        assert!(error.contains("terminal"), "{error}");
+        assert!(!error.contains("write"), "an off gate is not a blocker: {error}");
+        assert!(error.contains("clank approval all off"), "{error}");
     }
 
     #[test]

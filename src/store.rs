@@ -4,7 +4,7 @@ use crate::crypto;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Kind of session, used to distinguish plain chat from agentic chat when listing.
 pub const KIND_CHAT: &str = "chat";
@@ -79,6 +79,9 @@ pub struct SessionSummary {
     /// The line that goes with it — for an approval, the tool being asked
     /// about. Decrypted, like `title`.
     pub activity_detail: Option<String>,
+    /// When the process running this session last checked in. `None` means
+    /// nothing is running it. See [`heartbeat_is_live`].
+    pub heartbeat: Option<i64>,
     /// Not surfaced by the CLI, but kept for sorting and display.
     #[allow(dead_code)]
     pub created_at: i64,
@@ -98,6 +101,14 @@ fn now() -> i64 {
 pub fn open_db() -> Result<Connection> {
     let path = get_config_dir()?.join("chats.db");
     let conn = Connection::open(path)?;
+
+    // A detached `agent --session` run writes to the same database the TUI
+    // and the picker are reading, which the default rollback journal turns
+    // into an immediate `SQLITE_BUSY` for whoever loses the race. WAL lets
+    // readers and one writer proceed together; the timeout covers two
+    // writers, which is rare but no longer impossible.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
     conn.execute_batch(
         "
@@ -121,6 +132,7 @@ pub fn open_db() -> Result<Connection> {
             working_dir        TEXT,
             activity           TEXT,
             activity_detail    TEXT,
+            heartbeat          INTEGER,
             created_at      INTEGER NOT NULL,
             updated_at      INTEGER NOT NULL
         );
@@ -198,6 +210,12 @@ pub fn open_db() -> Result<Connection> {
     // the list. Null means "nothing to say" — see `Activity`.
     ensure_column(&conn, "sessions", "activity", "TEXT")?;
     ensure_column(&conn, "sessions", "activity_detail", "TEXT")?;
+    // When the process running this session was last known to be alive. An
+    // `activity` says what a process is doing; this says whether that process
+    // still exists. Null for a session nobody is running, and for every row
+    // written before this existed — which reads as "not running", the safe
+    // answer for a session that has been sitting in the database untouched.
+    ensure_column(&conn, "sessions", "heartbeat", "INTEGER")?;
 
     Ok(conn)
 }
@@ -543,9 +561,11 @@ pub enum LastState {
     New,
     /// The model answered. A turn that ran to completion.
     Replied,
-    /// A message was sent and nothing came back — the turn is either running
-    /// somewhere right now or it ended badly. Nothing on disk tells the two
-    /// apart, because a turn's messages are only written when it finishes.
+    /// A message was sent and nothing came back, and nothing is running the
+    /// session now — so the turn ended badly rather than being still in
+    /// flight. The heartbeat is what separates the two: a turn's messages are
+    /// only written when it finishes, so storage alone can't tell a request
+    /// in flight from a process that died holding one.
     NoReply,
     /// It stopped part-way through working: after a tool result with no
     /// answer after it, or on a tool call that never ran.
@@ -560,12 +580,30 @@ pub enum LastState {
 /// failed. The rest are read from the messages, and are what a session
 /// nobody is running can still tell you.
 ///
+/// What a process claimed is only believed while it is still there to claim
+/// it — see `heartbeat`. Otherwise a detached run killed mid-turn would leave
+/// a row insisting it was `working` for ever, with nobody watching to notice.
+///
 /// Shared so the launch screen and `clank sessions list` cannot come to
 /// disagree about what a session is doing.
-pub fn last_state(activity: Option<Activity>, last: Option<&LastMessage>) -> LastState {
+pub fn last_state(
+    activity: Option<Activity>,
+    heartbeat: Option<i64>,
+    last: Option<&LastMessage>,
+) -> LastState {
     match activity {
-        Some(Activity::Working) => return LastState::Working,
-        Some(Activity::AwaitingApproval) => return LastState::AwaitingApproval,
+        // Gated on the heartbeat, because these two are the only states that
+        // are a claim about a *live process*. A run killed by an OOM, a
+        // reboot, or a `kill -9` never gets to clear them, and left to itself
+        // the row would say `working` forever. When no process is checking
+        // in, what the messages say is the truth.
+        Some(Activity::Working) if heartbeat_is_live(heartbeat) => return LastState::Working,
+        Some(Activity::AwaitingApproval) if heartbeat_is_live(heartbeat) => {
+            return LastState::AwaitingApproval
+        }
+        Some(Activity::Working) | Some(Activity::AwaitingApproval) => {}
+        // Not gated: this is written by a process that then exits on purpose.
+        // It's a record of how the last turn ended, not a claim to be running.
         Some(Activity::Failed) => return LastState::Failed,
         None => {}
     }
@@ -579,6 +617,55 @@ pub fn last_state(activity: Option<Activity>, last: Option<&LastMessage>) -> Las
         // A user message with nothing after it.
         _ => LastState::NoReply,
     }
+}
+
+/// How often a running process re-stamps its session's heartbeat.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a heartbeat stays believable without being re-stamped.
+///
+/// Several intervals, not one: a process can be briefly starved without being
+/// dead, and calling a live run dead is the worse mistake — it invites a
+/// second process to start work the first is still doing.
+const HEARTBEAT_STALE_AFTER: i64 = 30;
+
+/// Whether a heartbeat means someone is still running this session.
+///
+/// `None` is not running: either nothing ever claimed it, or the row predates
+/// heartbeats entirely. A timestamp from the future is treated as live — a
+/// clock that jumped is not evidence a process died.
+pub fn heartbeat_is_live(heartbeat: Option<i64>) -> bool {
+    heartbeat.is_some_and(|beat| now() - beat < HEARTBEAT_STALE_AFTER)
+}
+
+/// Stamps the session as still being run, right now.
+///
+/// Deliberately separate from [`set_session_activity`]: activity changes at
+/// the edges of a turn, while this has to keep ticking through the long
+/// middle of one — and through an approval prompt, where the process is alive
+/// and waiting rather than working.
+///
+/// Does not touch `updated_at`, for the same reason activity doesn't: it
+/// would reorder the list under the cursor of anyone watching.
+pub fn touch_session_heartbeat(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET heartbeat = ?1 WHERE id = ?2",
+        params![now(), session_id],
+    )?;
+    Ok(())
+}
+
+/// Gives up the claim on a session, on the way out of a clean exit.
+///
+/// Only makes the common case immediate — the stale check is what actually
+/// makes this correct, since the exits that matter here are the ones that
+/// never run any cleanup.
+pub fn clear_session_heartbeat(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET heartbeat = NULL WHERE id = ?1",
+        params![session_id],
+    )?;
+    Ok(())
 }
 
 /// Records what a session's process is doing, or clears it with `None`.
@@ -692,7 +779,7 @@ fn message_preview(content: Option<&str>, tool_calls: Option<&str>) -> String {
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat \
          FROM sessions ORDER BY updated_at DESC",
     )?;
 
@@ -716,6 +803,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
             working_dir: row.get(13)?,
             activity: Activity::from_stored(row.get::<_, Option<String>>(14)?.as_deref()),
             activity_detail: row.get(15)?,
+            heartbeat: row.get(19)?,
             created_at: row.get(16)?,
             updated_at: row.get(17)?,
             highlight: row.get(18)?,
@@ -736,7 +824,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
 pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat \
          FROM sessions WHERE id = ?1 OR id LIKE ?2",
     )?;
 
@@ -764,6 +852,7 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
             working_dir: row.get(13)?,
             activity: Activity::from_stored(row.get::<_, Option<String>>(14)?.as_deref()),
             activity_detail: row.get(15)?,
+            heartbeat: row.get(19)?,
             created_at: row.get(16)?,
             updated_at: row.get(17)?,
             highlight: row.get(18)?,
@@ -864,6 +953,16 @@ pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
 
+    /// A heartbeat stamped just now, i.e. a process that is still checking in.
+    fn beating() -> Option<i64> {
+        Some(now())
+    }
+
+    /// A heartbeat old enough that whoever wrote it is presumed gone.
+    fn stale() -> Option<i64> {
+        Some(now() - HEARTBEAT_STALE_AFTER - 1)
+    }
+
     #[test]
     fn last_state_prefers_what_the_running_process_says() {
         let replied = LastMessage {
@@ -874,14 +973,61 @@ mod tests {
         // The process knows things the messages can't say — a turn's
         // messages are only written when it finishes.
         assert_eq!(
-            last_state(Some(Activity::Working), Some(&replied)),
+            last_state(Some(Activity::Working), beating(), Some(&replied)),
             LastState::Working
         );
         assert_eq!(
-            last_state(Some(Activity::AwaitingApproval), None),
+            last_state(Some(Activity::AwaitingApproval), beating(), None),
             LastState::AwaitingApproval
         );
-        assert_eq!(last_state(Some(Activity::Failed), None), LastState::Failed);
+        assert_eq!(
+            last_state(Some(Activity::Failed), None, None),
+            LastState::Failed
+        );
+    }
+
+    #[test]
+    fn a_state_nobody_is_alive_to_hold_stops_being_believed() {
+        // The bug this exists for: a detached run killed by an OOM or a
+        // reboot never clears its activity, and the row claimed `working`
+        // for ever. Nothing is running, so the messages are the truth —
+        // a user message with no reply after it.
+        let asked = LastMessage {
+            role: "user".to_string(),
+            has_tool_calls: false,
+            preview: "do the thing".to_string(),
+        };
+
+        for heartbeat in [None, stale()] {
+            assert_eq!(
+                last_state(Some(Activity::Working), heartbeat, Some(&asked)),
+                LastState::NoReply,
+                "{heartbeat:?}"
+            );
+            assert_eq!(
+                last_state(Some(Activity::AwaitingApproval), heartbeat, Some(&asked)),
+                LastState::NoReply,
+                "{heartbeat:?}"
+            );
+        }
+
+        // Failed is not a claim to be running — it's written by a process on
+        // its way out, so it outlives the heartbeat on purpose.
+        assert_eq!(
+            last_state(Some(Activity::Failed), stale(), Some(&asked)),
+            LastState::Failed
+        );
+    }
+
+    #[test]
+    fn a_heartbeat_from_the_future_still_counts_as_alive() {
+        // A clock that jumped backwards is not evidence a process died, and
+        // calling a live run dead is the mistake that lets a second process
+        // start work the first one is still doing.
+        assert!(heartbeat_is_live(Some(now() + 3600)));
+        assert!(heartbeat_is_live(Some(now())));
+        assert!(!heartbeat_is_live(None));
+        assert!(!heartbeat_is_live(stale()));
     }
 
     #[test]
@@ -891,22 +1037,22 @@ mod tests {
             has_tool_calls: tools,
             preview: String::new(),
         };
-        assert_eq!(last_state(None, None), LastState::New);
+        assert_eq!(last_state(None, None, None), LastState::New);
         assert_eq!(
-            last_state(None, Some(&of("assistant", false))),
+            last_state(None, None, Some(&of("assistant", false))),
             LastState::Replied
         );
         // Asked for a tool and nothing came back after it.
         assert_eq!(
-            last_state(None, Some(&of("assistant", true))),
+            last_state(None, None, Some(&of("assistant", true))),
             LastState::Interrupted
         );
         assert_eq!(
-            last_state(None, Some(&of("tool", false))),
+            last_state(None, None, Some(&of("tool", false))),
             LastState::Interrupted
         );
         assert_eq!(
-            last_state(None, Some(&of("user", false))),
+            last_state(None, None, Some(&of("user", false))),
             LastState::NoReply
         );
     }
@@ -936,6 +1082,7 @@ mod tests {
                 working_dir        TEXT,
                 activity           TEXT,
                 activity_detail    TEXT,
+                heartbeat          INTEGER,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );

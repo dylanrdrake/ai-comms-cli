@@ -295,6 +295,12 @@ impl Conversation {
 
         let worker = Worker {
             client,
+            // Started before the session moves in, since it needs the id.
+            // A failure here costs the row its liveness, not the session:
+            // there is no reason to refuse to run over it.
+            _heartbeat: crate::session::Heartbeat::start(session.id().to_string())
+                .ok()
+                .flatten(),
             // Built before the session moves in, and shared with every turn
             // this worker spawns so a mid-turn `/approval` reaches it.
             gates: SessionGates::new(session.approval().clone(), session.sandbox()),
@@ -364,6 +370,11 @@ struct Worker {
     /// request has no seam to inject at, so ask mode queues instead.
     steering: Steering,
     events: mpsc::UnboundedSender<Event>,
+    /// Held, not used: it ticks while this worker is alive and gives up the
+    /// claim when the worker ends. Every `set_activity` below is a statement
+    /// about a live process, and this is what backs that up — without it the
+    /// TUI's own sessions would go stale in the picker mid-turn.
+    _heartbeat: Option<crate::session::Heartbeat>,
 }
 
 impl Worker {

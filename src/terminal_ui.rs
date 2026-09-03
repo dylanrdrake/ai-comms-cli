@@ -23,12 +23,17 @@ use std::io::{self, Write};
 pub struct ActivityWriter {
     conn: rusqlite::Connection,
     session_id: String,
+    /// Held, not used: it ticks on its own and gives up the claim when this
+    /// writer is dropped. Without it every activity written below would go
+    /// stale after its window and stop being believed.
+    _heartbeat: Option<crate::session::Heartbeat>,
 }
 
 impl ActivityWriter {
     pub fn new(session_id: String) -> Result<Self> {
         Ok(ActivityWriter {
             conn: crate::store::open_db()?,
+            _heartbeat: crate::session::Heartbeat::start(session_id.clone())?,
             session_id,
         })
     }
@@ -74,6 +79,12 @@ pub struct TerminalAgentUi {
     /// resolved, so — unlike a call that ran with no prompt at all —
     /// `ToolCallCompleted`/`ToolCallDenied` draw no further marker for it.
     approval_shown: bool,
+    /// Whether this run has a terminal behind it. Set by `--headless`, which
+    /// exists so a run can be fired off and left: no spinner (an animation
+    /// redrawn with `\r` is noise in a log) and no approval prompt (there is
+    /// no stdin to read an answer from, and blocking on one would hang the
+    /// run forever with nobody watching).
+    headless: bool,
 }
 
 impl TerminalAgentUi {
@@ -92,7 +103,16 @@ impl TerminalAgentUi {
             tool_header_open: false,
             approval_shown: false,
             activity: None,
+            headless: false,
         }
+    }
+
+    /// Drops everything that needs a live terminal, for `--headless`.
+    ///
+    /// Deliberately one-way: a run either has someone watching it or it
+    /// doesn't, and there is no point in the session where that changes.
+    pub fn go_headless(&mut self) {
+        self.headless = true;
     }
 
     /// Flips the `-v`-equivalent detail level live, for `/verbose` in a
@@ -126,7 +146,9 @@ impl TerminalAgentUi {
                 }
             }
             AgentEvent::RequestStarted => {
-                self.spinner = Some(Spinner::start("Thinking..."));
+                if !self.headless {
+                    self.spinner = Some(Spinner::start("Thinking..."));
+                }
             }
             AgentEvent::RequestFinished => {
                 if let Some(spinner) = self.spinner.take() {
@@ -255,6 +277,23 @@ impl TerminalAgentUi {
     /// The blocking stdin prompt behind [`AgentUi::approve`], kept separate
     /// so the async wrapper stays trivial.
     fn prompt_approval(&mut self, request: ApprovalRequest) -> Result<bool> {
+        // Denied without asking, and without ever touching stdin. `clank
+        // agent --headless` refuses to start while any gate is on, so this
+        // is the second line of defence rather than the expected path — but
+        // it is the one that matters, because the alternative is a run that
+        // blocks forever on an answer nobody is there to give. Never records
+        // `AwaitingApproval` either: nothing is awaited.
+        if self.headless {
+            self.close_tool_header("✗".red());
+            self.approval_shown = true;
+            println!(
+                "  {} {} needs approval, and --headless cannot ask",
+                "denied:".red(),
+                request.tool_name.cyan()
+            );
+            return Ok(false);
+        }
+
         // Announced before the prompt blocks on stdin: this is exactly the
         // state worth seeing from another terminal, and it's the one a
         // blocking loop would otherwise never report.
