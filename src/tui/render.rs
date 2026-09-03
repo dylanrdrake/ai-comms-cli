@@ -971,8 +971,8 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
 /// the launch screen. Deliberately slight — a step off the background rather
 /// than a colour, so it separates without competing with the text.
 ///
-/// Which step depends on the terminal: one shade *darker* than a dark
-/// background, one *lighter* than a light one. A fixed dark band reads as a
+/// Which step depends on the terminal: one shade *lighter* than a dark
+/// background, one *darker* than a light one. A fixed dark band reads as a
 /// heavy bar on a light theme, which is the opposite of subtle.
 static BAND: std::sync::OnceLock<Style> = std::sync::OnceLock::new();
 
@@ -1010,8 +1010,17 @@ fn scale(channel: u16) -> u8 {
 /// showing a near-black band. An RGB value is the colour we asked for.
 fn band_for(lightness: f32, (r, g, b): (u8, u8, u8)) -> Style {
     // Small enough to read as a tint of the background rather than a bar
-    // drawn over it.
-    const STEP: i16 = 14;
+    // drawn over it: 2-4 points of L* across the backgrounds terminals
+    // actually use, which is near the floor of what separates two areas at
+    // all. The band only has to make your own messages findable when
+    // scrolling back, not announce them.
+    //
+    // A flat step in sRGB rather than a computed one in a perceptual space.
+    // sRGB's gamma curve already spends most of its range on the dark end,
+    // so one number stays in that narrow band whether the terminal is
+    // #1e1e1e, mid-grey or white — the ends drift low (a pure black
+    // terminal gets ~2.2) but drift *subtler*, which is the safe direction.
+    const STEP: i16 = 8;
     let step = if lightness < 0.5 { STEP } else { -STEP };
     let shift = |channel: u8| (channel as i16 + step).clamp(0, 255) as u8;
     Style::new().bg(Color::Rgb(shift(r), shift(g), shift(b)))

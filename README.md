@@ -171,10 +171,11 @@ clank highlight off
 On by default, and the *starting* value like `verbose`: a session snapshots it
 at creation, and `/highlight` changes that one session from then on.
 
-The band is derived from your terminal's own background — a step lighter on a
-dark theme, darker on a light one — rather than a fixed colour, so it stays a
-tint of whatever you're using. If your terminal doesn't answer the query that
-asks, no band is drawn at all rather than one guessed at.
+The band is derived from your terminal's own background — one faint step
+lighter on a dark theme, darker on a light one (NOT working too well atm) — rather than a fixed colour, so
+it stays a tint of whatever you're using rather than a bar drawn over it. If
+your terminal doesn't answer the query that asks, no band is drawn at all
+rather than one guessed at.
 
 #### `selection [on|off]`
 View or set whether the launch screen bands its selected row.
