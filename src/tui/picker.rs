@@ -1041,7 +1041,7 @@ mod tests {
     fn a_pending_approval_displaces_the_conversation_preview() {
         // What the session last said matters far less than what it is stuck
         // asking — that's the row someone watching this list has to act on.
-        let mut row = with_last(
+        let row = with_last(
             row_in("00000001", "agent_chat", "t", Some(HERE)),
             "user",
             false,
