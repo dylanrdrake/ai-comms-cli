@@ -65,35 +65,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-comms-cli"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "async-stream",
- "base64 0.22.1",
- "clap",
- "colored",
- "crossterm",
- "futures-util",
- "home",
- "html2text",
- "keyring",
- "ratatui",
- "reqwest",
- "rusqlite",
- "rustyline",
- "serde",
- "serde_json",
- "terminal-colorsaurus",
- "textwrap",
- "thiserror 1.0.69",
- "tokio",
- "tui-markdown",
- "uuid",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -494,6 +465,35 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+]
+
+[[package]]
+name = "clanker-command-center"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-stream",
+ "base64 0.22.1",
+ "clap",
+ "colored",
+ "crossterm",
+ "futures-util",
+ "home",
+ "html2text",
+ "keyring",
+ "ratatui",
+ "reqwest",
+ "rusqlite",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "terminal-colorsaurus",
+ "textwrap",
+ "thiserror 1.0.69",
+ "tokio",
+ "tui-markdown",
+ "uuid",
 ]
 
 [[package]]

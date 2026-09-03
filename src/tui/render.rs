@@ -340,7 +340,7 @@ fn clip(text: &str, width: usize) -> String {
     }
 }
 
-/// The session's title, plain — no border, no "comms -" prefix.
+/// The session's title, plain — no border, no "clank -" prefix.
 fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![Span::styled(app.title.clone(), Style::new().bold())];
     // Where this session runs, beside its name: it is the directory the

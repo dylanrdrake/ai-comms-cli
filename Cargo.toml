@@ -1,11 +1,11 @@
 [package]
-name = "ai-comms-cli"
+name = "clanker-command-center"
 version = "0.1.0"
 edition = "2021"
 description = "An OpenAI-compatible CLI frontend for any LLM provider"
 
 [[bin]]
-name = "comms"
+name = "clank"
 path = "src/main.rs"
 
 [dependencies]

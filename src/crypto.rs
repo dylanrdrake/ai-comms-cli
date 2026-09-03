@@ -7,7 +7,7 @@ use base64::Engine as _;
 use keyring::Entry;
 use std::sync::Mutex;
 
-const KEYRING_SERVICE: &str = "ai-comms-cli";
+const KEYRING_SERVICE: &str = "clanker-command-center";
 const KEYRING_USERNAME: &str = "db_encryption_key";
 
 /// Prefix marking a stored value as AES-256-GCM ciphertext. Values without

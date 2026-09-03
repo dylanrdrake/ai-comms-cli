@@ -189,7 +189,7 @@ pub enum Submission {
     /// it.
     ShowSandbox,
     /// Prints/shows every setting this session is running with, without
-    /// changing any of them. Named for `comms status`, which does the same
+    /// changing any of them. Named for `clank status`, which does the same
     /// job one scope out: global configuration there, this session here.
     ShowStatus,
     /// Renames this session. `/session` is the namespace for acting on the
@@ -739,7 +739,7 @@ fn command_usage(word: &str) -> Option<String> {
 
 /// "clear" (case-insensitive) resets an override; anything else is the new
 /// value to set.
-/// Accepts the same words the CLI's own `comms approval`/`comms stream`
+/// Accepts the same words the CLI's own `clank approval`/`clank stream`
 /// flags do, so `/approval` in a session reads the same way.
 pub fn parse_bool(s: &str) -> Result<bool, String> {
     match s.to_lowercase().as_str() {
@@ -994,7 +994,7 @@ mod tests {
     #[test]
     fn classify_recognizes_verbose() {
         // Bare reads rather than flips, matching `/sandbox` and the global
-        // `comms verbose` — a toggle can't be written down as an
+        // `clank verbose` — a toggle can't be written down as an
         // instruction without knowing where it started.
         assert_eq!(classify("/verbose"), Submission::ShowVerbose);
         assert_eq!(classify("  /verbose  "), Submission::ShowVerbose);

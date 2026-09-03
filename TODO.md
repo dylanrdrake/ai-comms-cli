@@ -10,9 +10,11 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
+* token counters (definitely one in-session, part of verbose?)
+* rebrand to Clanker Command Center (CCC)
 * how to handle $'s that need an answer to std in
 * what happens if you --resume an 'elsewhere' session then ctrl-c? Where does your terminal land to?
-* add a comms ask with no "" text and it immediately asks for input from the user and asks with that input
+* add a clank ask with no "" text and it immediately asks for input from the user and asks with that input
 * if `$` gets reverted, keep the stdin fix in tools.rs. `run_terminal_command`
   never set stdin, so the child inherited this process's — for the TUI, a
   terminal in raw mode the event loop is already reading. Any command wanting
@@ -63,19 +65,19 @@ NEXT:
   CONNECT_TIMEOUT 20s, REQUEST_TIMEOUT 300s, STREAM_IDLE_TIMEOUT 90s, plus
   tools.rs's 30s default for a terminal command when the model doesn't give one.
   The 90s stream idle one has stalled real turns twice. Would follow the same
-  shape as sandbox/verbose: seeded config fields, `comms <name> <value>`.
-* project-scoped sessions via a .comms/ folder, like .git: walk up from cwd to
+  shape as sandbox/verbose: seeded config fields, `clank <name> <value>`.
+* project-scoped sessions via a .clank/ folder, like .git: walk up from cwd to
   find it, sessions live there. Bigger than storing working_dir (which is done):
   it changes WHERE state lives. Costs to weigh first — storage splits from one
   global chats.db into many plus a global fallback for sessions started outside
   any project, so you carry both mechanisms; existing sessions need migrating;
-  `comms sessions` from outside a project can no longer list everything, which
+  `clank sessions` from outside a project can no longer list everything, which
   matters when you resume by id; conversation history moves inside repos, so it
   gets committed by anyone who doesn't gitignore it (encrypted, but present and
-  shareable); and auto-creating .comms/ wherever you happen to run litters
-  directories, while requiring `comms init` adds a new concept. The stored
+  shareable); and auto-creating .clank/ wherever you happen to run litters
+  directories, while requiring `clank init` adds a new concept. The stored
   working_dir is the data you'd migrate from.
-* session claimed flag on session table in case 2 comms processes open the same session. What would that do? is that ok?
+* session claimed flag on session table in case 2 clank processes open the same session. What would that do? is that ok?
 * should messages table be expanded to include tool calls, errors, etc.. OR errors logged somewhere
 * need a model browser/search/picker
 * [agent/ask] [verbose]

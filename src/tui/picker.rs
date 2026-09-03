@@ -645,7 +645,7 @@ pub fn draw_naming(frame: &mut Frame, input: &str) {
     .split(frame.area());
 
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled("comms", Style::new().bold()))),
+        Paragraph::new(Line::from(Span::styled("clank", Style::new().bold()))),
         areas[0],
     );
     draw_rule(frame, areas[1], None);

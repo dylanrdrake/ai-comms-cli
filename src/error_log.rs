@@ -1,4 +1,4 @@
-//! A small rolling debug log at `~/.comms/errors.log`, so a confusing API or
+//! A small rolling debug log at `~/.clank/errors.log`, so a confusing API or
 //! provider error can be looked back at (or pasted somewhere for help)
 //! without having to catch and copy it in the moment it happened.
 //!
@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_ENTRIES: usize = 100;
 const LOG_FILE: &str = "errors.log";
 const REQUEST_DUMP_FILE: &str = "failed-request.json";
-const REQUEST_DUMP_VAR: &str = "COMMS_DEBUG_REQUESTS";
+const REQUEST_DUMP_VAR: &str = "CLANK_DEBUG_REQUESTS";
 
 /// Appends one entry and trims the file back down to the most recent
 /// [`MAX_ENTRIES`]. Best-effort: a failure here (a full disk, a permissions
@@ -119,7 +119,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-/// Whether raw request capture is switched on, via `COMMS_DEBUG_REQUESTS=1`.
+/// Whether raw request capture is switched on, via `CLANK_DEBUG_REQUESTS=1`.
 /// Checked before serializing anything, since the body is the whole
 /// conversation and building it isn't free.
 pub fn request_dumps_enabled() -> bool {
@@ -130,7 +130,7 @@ pub fn request_dumps_enabled() -> bool {
 }
 
 /// Writes the exact JSON body of a failed request to
-/// `~/.comms/failed-request.json`, overwriting any previous one, and returns
+/// `~/.clank/failed-request.json`, overwriting any previous one, and returns
 /// where it went.
 ///
 /// This is the deliberate opposite of [`log_error`]'s content-free
@@ -198,7 +198,7 @@ mod tests {
 
     fn tempfile_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "comms-error-log-test-{}-{}",
+            "clank-error-log-test-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

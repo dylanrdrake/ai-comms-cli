@@ -571,7 +571,7 @@ impl Client {
 
     pub fn new(config: Config) -> Result<Self> {
         let api_key = crate::config::get_api_key()?
-            .ok_or_else(|| anyhow!("API key not configured. Run: comms login"))?;
+            .ok_or_else(|| anyhow!("API key not configured. Run: clank login"))?;
 
         let http_client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
@@ -1195,7 +1195,7 @@ mod deser_tests {
 
     #[test]
     fn a_null_temperature_sends_no_temperature_field() {
-        // The contract `comms temperature --clear` promises: not a zero, not
+        // The contract `clank temperature --clear` promises: not a zero, not
         // a default — no field at all, so the provider uses its own.
         let json = request_json(Config::default(), None, None);
         assert!(

@@ -1,6 +1,6 @@
-# AI Comms CLI - Examples
+# Clanker Command Center - Examples
 
-Real-world usage examples for AI Comms CLI.
+Real-world usage examples for Clanker Command Center.
 
 ## Quick Start
 
@@ -9,11 +9,11 @@ Real-world usage examples for AI Comms CLI.
 cargo install --path .
 
 # 2. Login
-comms login
+clank login
 
 # 3. Try it
-comms ask "What can you do?"
-comms agent "Create a hello.rs file that prints 'Hello, Rust!'"
+clank ask "What can you do?"
+clank agent "Create a hello.rs file that prints 'Hello, Rust!'"
 ```
 
 ## Code Generation
@@ -21,7 +21,7 @@ comms agent "Create a hello.rs file that prints 'Hello, Rust!'"
 ### Generate a Rust utility function
 
 ```bash
-comms agent "Create a file utils.rs with functions to:
+clank agent "Create a file utils.rs with functions to:
 - Format dates
 - Calculate age from birthdate
 - Validate email addresses"
@@ -30,7 +30,7 @@ comms agent "Create a file utils.rs with functions to:
 ### Generate with tests
 
 ```bash
-comms agent "Create calculator.rs with add, subtract, multiply, divide functions, then create calculator_tests.rs with comprehensive tests"
+clank agent "Create calculator.rs with add, subtract, multiply, divide functions, then create calculator_tests.rs with comprehensive tests"
 ```
 
 ## Code Modification
@@ -38,19 +38,19 @@ comms agent "Create calculator.rs with add, subtract, multiply, divide functions
 ### Read and improve existing code
 
 ```bash
-comms agent "Read src/main.rs and create an improved version with better error handling and documentation, save as src/main_improved.rs"
+clank agent "Read src/main.rs and create an improved version with better error handling and documentation, save as src/main_improved.rs"
 ```
 
 ### Fix bugs in code
 
 ```bash
-comms agent "Read src/buggy.rs, identify any bugs or inefficiencies, and write a fixed version to src/buggy_fixed.rs"
+clank agent "Read src/buggy.rs, identify any bugs or inefficiencies, and write a fixed version to src/buggy_fixed.rs"
 ```
 
 ### Refactor for performance
 
 ```bash
-comms agent "Read src/index.rs, analyze for performance improvements, and write an optimized version to src/index_optimized.rs"
+clank agent "Read src/index.rs, analyze for performance improvements, and write an optimized version to src/index_optimized.rs"
 ```
 
 ## Project Structure
@@ -58,7 +58,7 @@ comms agent "Read src/index.rs, analyze for performance improvements, and write 
 ### Generate a basic Rust project
 
 ```bash
-comms agent "Create a Rust project structure:
+clank agent "Create a Rust project structure:
 - Cargo.toml (with name and version)
 - src/main.rs (entry point with main function)
 - src/lib.rs (library module)
@@ -69,7 +69,7 @@ comms agent "Create a Rust project structure:
 ### Create a CLI tool skeleton
 
 ```bash
-comms agent "Create a Rust CLI tool with:
+clank agent "Create a Rust CLI tool with:
 - Cargo.toml (with clap dependency)
 - src/main.rs (argument parsing using clap)
 - src/commands.rs (command handlers)
@@ -80,7 +80,7 @@ comms agent "Create a Rust CLI tool with:
 ### Generate an async HTTP client
 
 ```bash
-comms agent "Create a Rust HTTP client library:
+clank agent "Create a Rust HTTP client library:
 - Cargo.toml (with reqwest and tokio dependencies)
 - src/lib.rs (module setup)
 - src/client.rs (HTTP client struct)
@@ -93,19 +93,19 @@ comms agent "Create a Rust HTTP client library:
 ### Generate and verify
 
 ```bash
-comms agent "Generate a random number generator in random.rs using rand crate, then read it back and verify the file exists and has valid Rust syntax" -v
+clank agent "Generate a random number generator in random.rs using rand crate, then read it back and verify the file exists and has valid Rust syntax" -v
 ```
 
 ### Create and document
 
 ```bash
-comms agent "Create a sorting.rs file with merge sort and quick sort implementations, then read it and create a SORTING.md file documenting the algorithms and complexity"
+clank agent "Create a sorting.rs file with merge sort and quick sort implementations, then read it and create a SORTING.md file documenting the algorithms and complexity"
 ```
 
 ### Build and chain modifications
 
 ```bash
-comms agent "Create math.rs with basic math functions, then read it and create stats.rs that uses math.rs functions for statistical calculations"
+clank agent "Create math.rs with basic math functions, then read it and create stats.rs that uses math.rs functions for statistical calculations"
 ```
 
 ## Using Different Models
@@ -113,19 +113,19 @@ comms agent "Create math.rs with basic math functions, then read it and create s
 ### Claude for code review
 
 ```bash
-comms agent "Read src/main.rs and provide detailed Rust-specific code review feedback" -m anthropic/claude-opus-4.5
+clank agent "Read src/main.rs and provide detailed Rust-specific code review feedback" -m anthropic/claude-opus-4.5
 ```
 
 ### GPT-4 for complex algorithms
 
 ```bash
-comms agent "Create an implementation of the A* pathfinding algorithm in Rust" -m openai/gpt-4o
+clank agent "Create an implementation of the A* pathfinding algorithm in Rust" -m openai/gpt-4o
 ```
 
 ### Adaptive routing (default)
 
 ```bash
-comms agent "Generate Rust boilerplate code for a web API" -m openrouter/auto
+clank agent "Generate Rust boilerplate code for a web API" -m openrouter/auto
 ```
 
 ## Interactive Chat
@@ -133,7 +133,7 @@ comms agent "Generate Rust boilerplate code for a web API" -m openrouter/auto
 ### Have a Rust programming conversation
 
 ```bash
-comms session
+clank session
 # ❯ What's the best way to handle errors in Rust?
 # [response about Result and ?]
 # ❯ Can you show me an example?
@@ -144,7 +144,7 @@ comms session
 ### Get design advice
 
 ```bash
-comms session
+clank session
 # ❯ Should I use a trait or a struct for this?
 # [design discussion]
 # ❯ What about performance?
@@ -157,7 +157,7 @@ comms session
 ### Create a web server
 
 ```bash
-comms agent "Create a basic Axum web server:
+clank agent "Create a basic Axum web server:
 - Cargo.toml (with axum and tokio dependencies)
 - src/main.rs (server setup with routes)
 - src/handlers.rs (request handlers)
@@ -167,7 +167,7 @@ comms agent "Create a basic Axum web server:
 ### Database integration
 
 ```bash
-comms agent "Create a database abstraction layer:
+clank agent "Create a database abstraction layer:
 - Cargo.toml (with sqlx dependency)
 - src/db.rs (database connection and queries)
 - src/models.rs (data models)
@@ -177,7 +177,7 @@ comms agent "Create a database abstraction layer:
 ### Generate testing utilities
 
 ```bash
-comms agent "Create test_utils.rs with helper functions for:
+clank agent "Create test_utils.rs with helper functions for:
 - Creating test fixtures
 - Temporary file management
 - Mock object creation
@@ -187,7 +187,7 @@ comms agent "Create test_utils.rs with helper functions for:
 ### Create GitHub Actions workflow
 
 ```bash
-comms agent "Create .github/workflows/ci.yml for a Rust project with:
+clank agent "Create .github/workflows/ci.yml for a Rust project with:
 - cargo test
 - cargo clippy
 - cargo fmt --check
@@ -199,19 +199,19 @@ comms agent "Create .github/workflows/ci.yml for a Rust project with:
 ### Optimize hot loop
 
 ```bash
-comms agent "Read hot_loop.rs, identify performance bottlenecks, and rewrite using SIMD or other optimization techniques" -m openai/gpt-4o
+clank agent "Read hot_loop.rs, identify performance bottlenecks, and rewrite using SIMD or other optimization techniques" -m openai/gpt-4o
 ```
 
 ### Memory-efficient data structure
 
 ```bash
-comms agent "Create an efficient-memory.rs with a data structure that minimizes allocations while processing large datasets"
+clank agent "Create an efficient-memory.rs with a data structure that minimizes allocations while processing large datasets"
 ```
 
 ### Concurrent processing
 
 ```bash
-comms agent "Create parallel.rs with a multi-threaded or async implementation for processing batches of items"
+clank agent "Create parallel.rs with a multi-threaded or async implementation for processing batches of items"
 ```
 
 ## Continuous Agentic Chat
@@ -219,7 +219,7 @@ comms agent "Create parallel.rs with a multi-threaded or async implementation fo
 ### Iterate on a project across multiple prompts
 
 ```bash
-comms session
+clank session
 ❯ /agent
 ❯ Create a Cargo project for a CLI todo app with add/list/done commands
 ❯ Now add a --priority flag to the add subcommand
@@ -232,22 +232,22 @@ Every new session starts in plain ask mode; `/agent` turns on tool-calling
 back off. Each prompt in agent mode is answered with the full agent tool
 loop, and the whole conversation — including tool results — stays in context
 for the next prompt, so you can build on prior turns instead of restating
-everything in one `comms agent` call.
+everything in one `clank agent` call.
 
 ### Resume a saved session later
 
 ```bash
-comms sessions list
+clank sessions list
 #   a1b2c3d4  [agent]  replied   openrouter/auto  Create a Cargo project for a CLI todo app...
 
-comms session --resume a1b2c3d4
+clank session --resume a1b2c3d4
 # prints the prior transcript, then drops you back into the prompt
 ```
 
 Don't remember the id? Leave `--resume` bare and pick from a list instead:
 
 ```bash
-comms session --resume
+clank session --resume
 # Select a session to resume:
 #   1. a1b2c3d4  Create a Cargo project for a CLI todo app...
 #   2. f9e8d7c6  Refactor the auth middleware
@@ -266,20 +266,20 @@ details.
 ### Use verbose mode to debug agent iterations
 
 ```bash
-comms agent "Your Rust task" -v
+clank agent "Your Rust task" -v
 ```
 
 ### Increase iterations for complex tasks
 
 ```bash
 # Override for a single call
-comms agent "Complex multi-file project setup" --max-iterations 30
+clank agent "Complex multi-file project setup" --max-iterations 30
 
 # Or raise the persistent default so every agent call gets more room
-comms max-iterations 30
+clank max-iterations 30
 
 # Or, inside a session, just for that one session
-comms session
+clank session
 ❯ /max-iterations 30
 ```
 
@@ -287,12 +287,12 @@ comms session
 
 ```bash
 # Auto-approve everything for a one-off agent call (use with caution)
-comms approval all off
-comms agent "Refactor the whole src/ directory"
-comms approval all on
+clank approval all off
+clank agent "Refactor the whole src/ directory"
+clank approval all on
 
 # Or, inside a session, just for that one session
-comms session
+clank session
 ❯ /agent
 ❯ /approval all off
 
@@ -304,18 +304,18 @@ comms session
 
 ```bash
 # Push harder on reasoning for tough tasks
-comms effort-level high
-comms agent "Design a lock-free concurrent queue in Rust"
+clank effort-level high
+clank agent "Design a lock-free concurrent queue in Rust"
 
 # Back off for quick, cheap responses
-comms effort-level low
+clank effort-level low
 
 # Or start a single session at a different level, without changing the
 # persistent default
-comms session --effort-level high
+clank session --effort-level high
 
 # Or, inside a session, just for that one session
-comms session
+clank session
 ❯ /effort high
 ```
 
@@ -325,20 +325,20 @@ Once set, response labels show the effort level alongside the model, e.g. `anthr
 
 ```bash
 # Override for a single call
-comms agent "Complex multi-file project setup" --temperature 0.3
+clank agent "Complex multi-file project setup" --temperature 0.3
 
 # Or raise the persistent default so every call is more consistent
-comms temperature 0.3
+clank temperature 0.3
 
 # Or, inside a session, just for that one session (/temp also works)
-comms session
+clank session
 ❯ /temp 1.2
 ```
 
 ### Chain operations
 
 ```bash
-comms agent "List files in src/, then read src/main.rs, then create a refactored version"
+clank agent "List files in src/, then read src/main.rs, then create a refactored version"
 ```
 
 ## Workflow Examples
@@ -346,7 +346,7 @@ comms agent "List files in src/, then read src/main.rs, then create a refactored
 ### Building a microservice
 
 ```bash
-comms agent "Create a Rust microservice with:
+clank agent "Create a Rust microservice with:
 1. Cargo.toml (with axum, tokio, sqlx)
 2. src/main.rs (server entry point)
 3. src/handlers.rs (API endpoints)
@@ -359,7 +359,7 @@ comms agent "Create a Rust microservice with:
 ### Setting up testing
 
 ```bash
-comms agent "Create a comprehensive test setup:
+clank agent "Create a comprehensive test setup:
 1. Cargo.toml (with test dependencies)
 2. src/lib.rs (library with public API)
 3. src/main.rs (binary that uses lib)
@@ -370,7 +370,7 @@ comms agent "Create a comprehensive test setup:
 ### Create a library
 
 ```bash
-comms agent "Scaffold a reusable Rust library:
+clank agent "Scaffold a reusable Rust library:
 1. Cargo.toml (publishable on crates.io)
 2. src/lib.rs (module exports)
 3. src/core.rs (core functionality)
@@ -383,7 +383,7 @@ comms agent "Scaffold a reusable Rust library:
 ### Generate CLI tool with subcommands
 
 ```bash
-comms agent "Create a feature-rich CLI tool using clap:
+clank agent "Create a feature-rich CLI tool using clap:
 1. Cargo.toml (with clap v4)
 2. src/main.rs (argument parsing)
 3. src/commands/ (subcommand modules)

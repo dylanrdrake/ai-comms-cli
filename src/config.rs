@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-const KEYRING_SERVICE: &str = "ai-comms-cli";
+const KEYRING_SERVICE: &str = "clanker-command-center";
 const KEYRING_USERNAME: &str = "api_key";
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -36,7 +36,7 @@ impl Default for ApprovalSettings {
 
 impl ApprovalSettings {
     /// Returns a copy with `category` (`"read"`/`"write"`/`"terminal"`/`"all"`)
-    /// switched to `enabled`. Shared by `comms approval`'s global-default
+    /// switched to `enabled`. Shared by `clank approval`'s global-default
     /// commands and a session's `/approval` override, so both parse the
     /// same category words the same way.
     pub fn with_category(&self, category: &str, enabled: bool) -> Self {
@@ -65,7 +65,7 @@ pub const DEFAULT_EFFORT_STYLE: &str = "nested";
 
 /// The model a request falls back to when neither a `--model` flag nor the
 /// config names one. Still consulted at the point of use as well as seeded
-/// into the config, because `comms model --clear` deliberately writes `null`
+/// into the config, because `clank model --clear` deliberately writes `null`
 /// and that has to keep meaning "use this".
 pub const DEFAULT_MODEL: &str = "openrouter/auto";
 
@@ -158,7 +158,7 @@ pub fn default_effort_style() -> Option<String> {
 
 /// The factory default for a fresh install (no `config.json` yet) and for
 /// migrating an old `config.json` written before this field existed. Once a
-/// user explicitly clears it with `comms max-iterations --clear`, it stays
+/// user explicitly clears it with `clank max-iterations --clear`, it stays
 /// `None` — this is never consulted again after that.
 pub fn default_max_iterations() -> Option<usize> {
     Some(20)
@@ -193,7 +193,7 @@ impl Default for Config {
 pub fn get_config_dir() -> Result<PathBuf> {
     let config_dir = home::home_dir()
         .ok_or(anyhow!("Could not determine home directory"))?
-        .join(".comms");
+        .join(".clank");
 
     fs::create_dir_all(&config_dir)?;
     Ok(config_dir)
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn an_explicit_null_is_not_the_seed() {
-        // serde only defaults an *absent* key. `comms model --clear` writes
+        // serde only defaults an *absent* key. `clank model --clear` writes
         // null deliberately, and that has to keep meaning "cleared" rather
         // than being quietly refilled.
         let config = parse_config(r#"{"default_model": null}"#, Path::new("config.json"))

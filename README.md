@@ -1,6 +1,6 @@
-# AI Comms CLI
+# Clanker Command Center
 
-An OpenAI-compatible CLI frontend for any LLM provider, with agentic tool capabilities, written in Rust. Defaults to OpenRouter, but works with any OpenAI-compatible service (OrcaRouter, Together, Groq, self-hosted gateways, etc) via `comms endpoint` — see [Using other providers](#using-other-providers).
+An OpenAI-compatible CLI frontend for any LLM provider, with agentic tool capabilities, written in Rust. Defaults to OpenRouter, but works with any OpenAI-compatible service (OrcaRouter, Together, Groq, self-hosted gateways, etc) via `clank endpoint` — see [Using other providers](#using-other-providers).
 
 ## Features
 
@@ -25,7 +25,7 @@ An OpenAI-compatible CLI frontend for any LLM provider, with agentic tool capabi
 cargo build --release
 ```
 
-The binary will be at `target/release/comms` (or `comms.exe` on Windows).
+The binary will be at `target/release/clank` (or `clank.exe` on Windows).
 
 ### Install Globally
 
@@ -33,11 +33,11 @@ The binary will be at `target/release/comms` (or `comms.exe` on Windows).
 cargo install --path .
 ```
 
-Then use `comms` from anywhere:
+Then use `clank` from anywhere:
 
 ```bash
-comms login
-comms ask "Hello"
+clank login
+clank ask "Hello"
 ```
 
 ## Usage
@@ -48,28 +48,28 @@ comms ask "Hello"
 Set up or update your API key. The key is stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service) rather than in a plaintext config file.
 
 ```bash
-comms login
+clank login
 ```
 
 #### `logout`
 Remove your stored API key from the OS keychain.
 
 ```bash
-comms logout
+clank logout
 ```
 
 #### `status`
 Check your configuration.
 
 ```bash
-comms status
+clank status
 ```
 
 #### `models`
 List available models from your configured provider (shows first 20).
 
 ```bash
-comms models
+clank models
 ```
 
 #### `model [name]`
@@ -77,13 +77,13 @@ View or set the persistent default model, so you don't need to pass `-m` on ever
 
 ```bash
 # Show the current default
-comms model
+clank model
 
 # Set the default model
-comms model anthropic/claude-opus-4.5
+clank model anthropic/claude-opus-4.5
 
 # Clear the default (falls back to openrouter/auto)
-comms model --clear
+clank model --clear
 ```
 
 Once set, `ask`, `session`, and `agent` all use this default unless overridden with `-m`/`--model` for that specific call.
@@ -101,14 +101,14 @@ View or set the persistent default for how many tool-calling iterations `agent` 
 
 ```bash
 # Show the current default
-comms max-iterations
+clank max-iterations
 
 # Set the default
-comms max-iterations 20
+clank max-iterations 20
 
 # Clear it — agent mode then needs a cap set per call (--max-iterations) or
 # per session (/max-iterations) to run at all; it does not fall back to 20
-comms max-iterations --clear
+clank max-iterations --clear
 ```
 
 Ships at 20 on a fresh install (no `config.json` yet), but once cleared it
@@ -122,14 +122,14 @@ View or set the persistent default sampling temperature (0-2) sent to models tha
 
 ```bash
 # Show the current default
-comms temperature
+clank temperature
 
 # Set the default
-comms temperature 1.2
+clank temperature 1.2
 
 # Clear it — requests are then sent with no temperature field at all, and
 # the provider uses its own default, rather than this falling back to 0.7
-comms temperature --clear
+clank temperature --clear
 ```
 
 Ships at 0.7 on a fresh install, same caveat as `max-iterations` once
@@ -148,13 +148,13 @@ View or set whether new sessions start showing full tool-call detail — argumen
 
 ```bash
 # Show the current setting
-comms verbose
+clank verbose
 
 # Start new sessions verbose
-comms verbose on
+clank verbose on
 ```
 
-Off by default. This is the *starting* value: a session snapshots it at creation, and `/verbose` from then on toggles that session, which is remembered per session rather than changing this. `comms agent -v` is unaffected — it's a per-run flag.
+Off by default. This is the *starting* value: a session snapshots it at creation, and `/verbose` from then on toggles that session, which is remembered per session rather than changing this. `clank agent -v` is unaffected — it's a per-run flag.
 
 #### `highlight [on|off]`
 View or set whether new sessions band your own messages in the transcript, so
@@ -162,10 +162,10 @@ they stand out when scrolling back through a long turn.
 
 ```bash
 # Show the current setting
-comms highlight
+clank highlight
 
 # Start new sessions without the band
-comms highlight off
+clank highlight off
 ```
 
 On by default, and the *starting* value like `verbose`: a session snapshots it
@@ -180,7 +180,7 @@ asks, no band is drawn at all rather than one guessed at.
 View or set whether the launch screen bands its selected row.
 
 ```bash
-comms selection off
+clank selection off
 ```
 
 On by default. Global only, with no per-session counterpart and no slash
@@ -192,13 +192,13 @@ View or set whether the agent's file-writing tools are confined to your current 
 
 ```bash
 # Show the current setting
-comms sandbox
+clank sandbox
 
 # Let the agent write anywhere it has permission to
-comms sandbox off
+clank sandbox off
 ```
 
-On by default, and the bound is the working directory alone — not your home directory, which would let an agent write across every project you keep under `~`. It bounds `write_file` and `replace_in_file` only: reads are never restricted, since they change nothing and confining them would break ordinary work like reading a file under `/etc`. The bound is checked against the path a write *resolves to*, so `..` and symlinks can't be used to step outside it, and `comms` writes its own `~/.comms` state directly so that keeps working at any setting.
+On by default, and the bound is the working directory alone — not your home directory, which would let an agent write across every project you keep under `~`. It bounds `write_file` and `replace_in_file` only: reads are never restricted, since they change nothing and confining them would break ordinary work like reading a file under `/etc`. The bound is checked against the path a write *resolves to*, so `..` and symlinks can't be used to step outside it, and `clank` writes its own `~/.clank` state directly so that keeps working at any setting.
 
 This is the persistent default; a session snapshots it at creation, and `/sandbox` changes the session you're in. It's a separate axis from `approval`: approval decides whether you're *asked* first, the sandbox decides whether the write is allowed at all.
 
@@ -207,13 +207,13 @@ View or set the persistent default reasoning effort sent to models that support 
 
 ```bash
 # Show the current effort level
-comms effort
+clank effort
 
 # Set the default
-comms effort high
+clank effort high
 
 # Clear it (falls back to the provider default)
-comms effort --clear
+clank effort --clear
 ```
 
 Overridden per call with `--effort-level` on `ask`, `session`, or `agent`, or
@@ -226,32 +226,32 @@ In `tui`, the session's current value shows in the settings row as 🧠
 from `low`.
 
 #### `endpoint [url]`
-View or set the API base URL, so you can point `comms` at any OpenAI-compatible service instead of OpenRouter (OrcaRouter, Together, Groq, a self-hosted gateway, etc).
+View or set the API base URL, so you can point `clank` at any OpenAI-compatible service instead of OpenRouter (OrcaRouter, Together, Groq, a self-hosted gateway, etc).
 
 ```bash
 # Show the current endpoint
-comms endpoint
+clank endpoint
 
 # Point at OrcaRouter
-comms endpoint https://api.orcarouter.ai/v1
+clank endpoint https://api.orcarouter.ai/v1
 
 # Clear it (falls back to the OpenRouter default)
-comms endpoint --clear
+clank endpoint --clear
 ```
 
-Switching endpoints doesn't switch your API key or default model automatically — run `comms login` to set the new provider's key, and `comms model` to set a model it actually serves.
+Switching endpoints doesn't switch your API key or default model automatically — run `clank login` to set the new provider's key, and `clank model` to set a model it actually serves.
 
 #### `effort-style [value]`
-View or set how the reasoning effort level (`comms effort`) is serialized in requests, since providers disagree on the shape:
+View or set how the reasoning effort level (`clank effort`) is serialized in requests, since providers disagree on the shape:
 
 - `nested` (default) — sends `reasoning: { effort: "<level>" }`, as OpenRouter expects.
 - `flat` — sends `reasoning_effort: "<level>"` at the top level, as OrcaRouter expects.
 - `none` — omits effort entirely, for providers that reject unrecognized fields.
 
 ```bash
-comms effort-style
-comms effort-style flat
-comms effort-style --clear
+clank effort-style
+clank effort-style flat
+clank effort-style --clear
 ```
 
 #### `headers`
@@ -259,14 +259,14 @@ View or manage extra HTTP headers sent with every API request, useful for provid
 
 ```bash
 # Show current extra headers
-comms headers
+clank headers
 
 # Set a header
-comms headers set HTTP-Referer https://myapp.example.com
-comms headers set X-Title "My App"
+clank headers set HTTP-Referer https://myapp.example.com
+clank headers set X-Title "My App"
 
 # Remove one
-comms headers unset HTTP-Referer
+clank headers unset HTTP-Referer
 ```
 
 #### `approval`
@@ -274,16 +274,16 @@ Configure approval settings for agentic actions. By default, the agent prompts f
 
 ```bash
 # Show current approval settings
-comms approval
+clank approval
 
 # Configure individual approvals (use on/off, true/false, yes/no, or 1/0)
-comms approval read off      # Auto-approve file reads
-comms approval write on      # Prompt before file writes
-comms approval terminal on   # Prompt before terminal commands
+clank approval read off      # Auto-approve file reads
+clank approval write on      # Prompt before file writes
+clank approval terminal on   # Prompt before terminal commands
 
 # Set all approvals at once
-comms approval all off       # Auto-approve everything (use with caution)
-comms approval all on        # Prompt for all actions
+clank approval all off       # Auto-approve everything (use with caution)
+clank approval all on        # Prompt for all actions
 ```
 
 **Per-session approval.** These commands set the default new sessions start
@@ -297,14 +297,14 @@ reverting to the configured default.
 Send a single prompt to the LLM.
 
 ```bash
-comms ask "What's the capital of France?"
+clank ask "What's the capital of France?"
 
 # Specify a model
-comms ask "Explain quantum computing" -m anthropic/claude-opus-4.5
+clank ask "Explain quantum computing" -m anthropic/claude-opus-4.5
 
 # Override temperature or effort level for this call only
-comms ask "Write a haiku" --temperature 1.2
-comms ask "Design a lock-free queue" --effort-level high
+clank ask "Write a haiku" --temperature 1.2
+clank ask "Design a lock-free queue" --effort-level high
 ```
 
 #### `session`
@@ -328,7 +328,7 @@ exactly:
 | `/effort clear` | Nullify it — no effort field is sent at all until set again |
 | `/effort default` | Read the *currently* configured default effort and save that to the session |
 | `/verbose <on\|off>` | Show the model's thinking and full tool call arguments/results, or a one-line notice per call. Bare `/verbose` shows the current setting |
-| `/stream <on\|off>` | Stream this session's replies token-by-token, or wait for the whole reply. Bare `/stream` shows the current setting. Overrides `comms stream` for this session |
+| `/stream <on\|off>` | Stream this session's replies token-by-token, or wait for the whole reply. Bare `/stream` shows the current setting. Overrides `clank stream` for this session |
 | `/max-iterations <n>` | Switch the tool-calling iteration cap per turn (agent mode only), and remember it |
 | `/max-iterations clear` | Nullify it — agent mode then errors on any turn until a cap is set again |
 | `/max-iterations default` | Read the *currently* configured default cap and save that to the session |
@@ -340,7 +340,7 @@ exactly:
 | `/approval` | Show the approval gates currently in use |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
-| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
+| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `clank status` |
 | `/highlight <on\|off>` | Band your own messages in the transcript, or don't. Bare `/highlight` shows the current setting |
 | `/session title <new title>` | Rename this session. Bare `/session` (or `/session title`) shows its current name |
 | `/send`, `/discard` | Answer the `$` command box — the same as `Ctrl-S` and `Ctrl-D`. Typed forms exist because terminals claim chords: Zed's takes `Ctrl-S` |
@@ -355,29 +355,29 @@ reported as an error rather than sent to the model — see the note under
 A new session needs a name. Pass one with `--title`, or you'll be asked for it before the session starts — starting one is meant to be deliberate, so there's no untitled path and a blank answer is refused. A resumed session keeps the name it has, and `--title` is ignored with a note.
 
 ```bash
-comms session --title "Fix the parser"
+clank session --title "Fix the parser"
 # Type exit to quit
 
 # Omit --title and you'll be prompted for one
-comms session
+clank session
 
 # Override the default model for a new session (ignored when resuming —
 # a resumed session always keeps its own saved model)
-comms session -m anthropic/claude-opus-4.5
+clank session -m anthropic/claude-opus-4.5
 
 # Override the default max tool-calling iterations per turn while in agent mode
-comms session --max-iterations 30
+clank session --max-iterations 30
 
 # Override the default reasoning effort for a new session (ignored when
 # resuming — a resumed session always keeps its own saved value)
-comms session --effort-level high
+clank session --effort-level high
 
 # Resume a previous session by id (or a unique prefix of it) — works
 # whether that session is currently in ask or agent mode
-comms session --resume a1b2c3d4
+clank session --resume a1b2c3d4
 
 # Or omit the id to pick from a numbered list of all your saved sessions
-comms session --resume
+clank session --resume
 ```
 
 #### `agent <task>`
@@ -385,20 +385,20 @@ Run a single agentic task where the LLM can use tools (read/write files) — one
 
 ```bash
 # Create a new file
-comms agent "Create a file called hello.rs that prints 'Hello, world!'"
+clank agent "Create a file called hello.rs that prints 'Hello, world!'"
 
 # Modify existing code
-comms agent "Read src/main.rs, identify improvements, and write an optimized version"
+clank agent "Read src/main.rs, identify improvements, and write an optimized version"
 
 # Show detailed iteration logs
-comms agent "Create utils.rs with a reverse array function" -v
+clank agent "Create utils.rs with a reverse array function" -v
 
 # Override the default max iterations for this call
-comms agent "Generate project structure" --max-iterations 30
+clank agent "Generate project structure" --max-iterations 30
 
 # Override temperature or effort level for this call only
-comms agent "Generate project structure" --temperature 0.3
-comms agent "Design a lock-free queue" --effort-level high
+clank agent "Generate project structure" --temperature 0.3
+clank agent "Design a lock-free queue" --effort-level high
 ```
 
 #### `tui`
@@ -408,7 +408,7 @@ tool approvals appear inline, and a running turn be interrupted. Otherwise
 the two are functionally identical — same commands, same settings, same
 saved sessions, interchangeably resumable from either.
 
-It's not a subcommand — there are no flags. Run `comms` with nothing else on
+It's not a subcommand — there are no flags. Run `clank` with nothing else on
 the command line, and it opens on a **launch screen**: start a new session,
 or pick up any saved one. Sessions are grouped by where they live — the ones
 started in your current directory first, then everything else — and each row
@@ -416,7 +416,7 @@ shows its directory, since that's where it will resume and what its sandbox
 will be bounded to.
 
 ```bash
-comms
+clank
 ```
 
 Every new session starts in plain ask mode; use `/agent` from inside it to
@@ -481,7 +481,7 @@ that session again.
 
 Opening a session whose directory no longer exists asks whether to resume in
 the current one instead, repointing the session there — the same thing
-`comms session --resume <id> --here` does from the shell.
+`clank session --resume <id> --here` does from the shell.
 
 **In a conversation**
 
@@ -512,7 +512,7 @@ the current one instead, repointing the session there — the same thing
 | `/effort clear` | Nullify it — no effort field is sent at all until set again |
 | `/effort default` | Read the *currently* configured default effort and save that to the session |
 | `/verbose <on\|off>` | Show the model's thinking and full tool call arguments/results, or a one-line notice per call. Bare `/verbose` shows the current setting |
-| `/stream <on\|off>` | Stream this session's replies token-by-token, or wait for the whole reply. Bare `/stream` shows the current setting. Overrides `comms stream` for this session |
+| `/stream <on\|off>` | Stream this session's replies token-by-token, or wait for the whole reply. Bare `/stream` shows the current setting. Overrides `clank stream` for this session |
 | `/max-iterations <n>` | Switch the tool-calling iteration cap per turn (agent mode only), and remember it |
 | `/max-iterations clear` | Nullify it — agent mode then errors on any turn until a cap is set again |
 | `/max-iterations default` | Read the *currently* configured default cap and save that to the session |
@@ -524,7 +524,7 @@ the current one instead, repointing the session there — the same thing
 | `/approval` | Show the approval gates currently in use |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
-| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
+| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `clank status` |
 | `/highlight <on\|off>` | Band your own messages in the transcript, or don't. Bare `/highlight` shows the current setting |
 | `/session title <new title>` | Rename this session. Bare `/session` (or `/session title`) shows its current name |
 
@@ -542,10 +542,10 @@ merely extend a command name (`/verbosely`), both go through untouched.
 All of the above persist to the session, so they stick across
 `Ctrl-B`/`--resume` too.
 
-A session records the directory it was started in. Resuming moves the process back into it, because that directory is the sandbox's boundary and what the session's relative paths resolve against — resuming somewhere else would silently rebind both to wherever your shell happened to be. If the directory no longer exists, resuming stops and says so — the CLI with an error, the TUI by asking whether to resume here instead and repoint the session. `comms session --resume <id> --here` resumes in the current directory and repoints the session, for a project that moved. Sessions saved before this was tracked have no recorded directory and resume wherever they're run, as they always did.
+A session records the directory it was started in. Resuming moves the process back into it, because that directory is the sandbox's boundary and what the session's relative paths resolve against — resuming somewhere else would silently rebind both to wherever your shell happened to be. If the directory no longer exists, resuming stops and says so — the CLI with an error, the TUI by asking whether to resume here instead and repoint the session. `clank session --resume <id> --here` resumes in the current directory and repoints the session, for a project that moved. Sessions saved before this was tracked have no recorded directory and resume wherever they're run, as they always did.
 
 Sessions are saved exactly as the other commands save them, so a `tui`
-session can be resumed with `comms session --resume` and vice versa — mode,
+session can be resumed with `clank session --resume` and vice versa — mode,
 model, and effort level all carry over either way. A session is kept from the
 moment you name it, whether or not anything is ever said in it — naming one
 is the deliberate act of starting it. (Sessions created before names were
@@ -559,9 +559,9 @@ providers that handle streaming — particularly streaming alongside tool calls 
 badly; the CLI then waits for the whole reply as it used to.
 
 ```bash
-comms stream          # show the current setting
-comms stream off      # wait for complete replies
-comms stream on
+clank stream          # show the current setting
+clank stream off      # wait for complete replies
+clank stream on
 ```
 
 #### `sessions`
@@ -569,16 +569,16 @@ List, inspect, or delete saved `session`/`tui` sessions.
 
 ```bash
 # List all saved sessions (id prefix, kind, state, model, title)
-comms sessions list
+clank sessions list
 #   a1b2c3d4  [agent]  working   openrouter/auto  Fix the Windows build
 #             run_terminal_command: cargo test --all
 #   b2c3d4e5  [ask]    replied   openrouter/auto  Notes on the picker
 
 # Show a session's full message history
-comms sessions show a1b2c3d4
+clank sessions show a1b2c3d4
 
 # Delete a saved session
-comms sessions delete a1b2c3d4
+clank sessions delete a1b2c3d4
 ```
 
 The state column is the same one the launch screen shows, from the same
@@ -745,7 +745,7 @@ order the model saw it. Past five waiting, the rest are summarised as
 
 | Scope | Changed by | Read |
 |---|---|---|
-| Global default | `comms <setting> <value>` | when a session is created |
+| Global default | `clank <setting> <value>` | when a session is created |
 | Session | `/model`, `/temperature`, … | stored on the session row |
 | Per-turn snapshot | — | once, when a turn starts |
 | Live gates | `/approval`, `/sandbox` | before every tool call |
@@ -799,7 +799,7 @@ something is an attack, and the approval prompt is what stands in the way.
 
 ## Configuration
 
-Configuration is stored at `~/.comms/config.json`:
+Configuration is stored at `~/.clank/config.json`:
 
 ```json
 {
@@ -823,56 +823,56 @@ Configuration is stored at `~/.comms/config.json`:
 }
 ```
 
-- The file is created the first time you change a setting, not on first run — until then every value comes from the defaults above, which `comms status` will show you. You can also write it by hand: any keys you leave out fall back to their defaults, so a file containing only `{"temperature": 1.5}` is valid, and the next `comms` setting command fills in the rest around what you wrote.
+- The file is created the first time you change a setting, not on first run — until then every value comes from the defaults above, which `clank status` will show you. You can also write it by hand: any keys you leave out fall back to their defaults, so a file containing only `{"temperature": 1.5}` is valid, and the next `clank` setting command fills in the rest around what you wrote.
 - If the file can't be parsed, commands stop with the parse position rather than silently reverting to defaults, and nothing is written over it — a malformed config would otherwise send your API key to the default endpoint instead of the one you configured, and the next setting command would overwrite everything else you'd set. Fix it, or delete it to start over.
-- Your API key is **not** in this file — `comms login`/`logout` store and remove it from the OS keychain instead (see [Security](#security)). If you have an old config with a plaintext `api_key` field, the next command that loads config transparently migrates it into the OS keychain and rewrites the file without it.
-- `base_url` is managed via `comms endpoint` and is the API endpoint used by every command. Defaults to OpenRouter; point it at any OpenAI-compatible service.
-- `default_model` is managed via `comms model` and is used by `ask`, `session`, and `agent` when `-m`/`--model` isn't passed, and always by `tui`, which has no flags at all.
-- `approval` settings control whether the agent prompts before performing actions. Managed via `comms approval`.
-- `max_iterations` is managed via `comms max-iterations` and is the default for `session`/`agent` when `--max-iterations` isn't passed, and for `tui`, which has no flags at all. `null` (after `comms max-iterations --clear`) means agent mode has no cap until one is set somewhere — it does not fall back to 20.
-- `temperature` is managed via `comms temperature` and is the default for `ask`, `session`, and `agent` when `--temperature` isn't passed, and for `tui`, which has no flags at all. `null` (after `comms temperature --clear`) means requests are sent with no `temperature` field at all — it does not fall back to 0.7.
-- `verbose` is managed via `comms verbose` and is the value new sessions start with; `/verbose` changes the session you're in, not this.
-- `highlight` is managed via `comms highlight` and is the value new sessions start with for banding your own messages; `/highlight` changes the session you're in, not this.
-- `selection` is managed via `comms selection` and controls the band on the launch screen's selected row. Global only — that screen belongs to no session, so there is no per-session counterpart and no slash command.
-- `effort_level` is managed via `comms effort-level` and is sent for `ask`, `session`, and `agent` when set, shaped according to `effort_style`.
-- `effort_style` is managed via `comms effort-style` and controls whether the effort level is sent flat, nested, or omitted (see [`effort-style`](#effort-style-value)).
-- `extra_headers` is managed via `comms headers` and is merged into every API request.
+- Your API key is **not** in this file — `clank login`/`logout` store and remove it from the OS keychain instead (see [Security](#security)). If you have an old config with a plaintext `api_key` field, the next command that loads config transparently migrates it into the OS keychain and rewrites the file without it.
+- `base_url` is managed via `clank endpoint` and is the API endpoint used by every command. Defaults to OpenRouter; point it at any OpenAI-compatible service.
+- `default_model` is managed via `clank model` and is used by `ask`, `session`, and `agent` when `-m`/`--model` isn't passed, and always by `tui`, which has no flags at all.
+- `approval` settings control whether the agent prompts before performing actions. Managed via `clank approval`.
+- `max_iterations` is managed via `clank max-iterations` and is the default for `session`/`agent` when `--max-iterations` isn't passed, and for `tui`, which has no flags at all. `null` (after `clank max-iterations --clear`) means agent mode has no cap until one is set somewhere — it does not fall back to 20.
+- `temperature` is managed via `clank temperature` and is the default for `ask`, `session`, and `agent` when `--temperature` isn't passed, and for `tui`, which has no flags at all. `null` (after `clank temperature --clear`) means requests are sent with no `temperature` field at all — it does not fall back to 0.7.
+- `verbose` is managed via `clank verbose` and is the value new sessions start with; `/verbose` changes the session you're in, not this.
+- `highlight` is managed via `clank highlight` and is the value new sessions start with for banding your own messages; `/highlight` changes the session you're in, not this.
+- `selection` is managed via `clank selection` and controls the band on the launch screen's selected row. Global only — that screen belongs to no session, so there is no per-session counterpart and no slash command.
+- `effort_level` is managed via `clank effort-level` and is sent for `ask`, `session`, and `agent` when set, shaped according to `effort_style`.
+- `effort_style` is managed via `clank effort-style` and controls whether the effort level is sent flat, nested, or omitted (see [`effort-style`](#effort-style-value)).
+- `extra_headers` is managed via `clank headers` and is merged into every API request.
 
 ### Using other providers
 
-AI Comms CLI talks to any service exposing an OpenAI-compatible `/chat/completions` and `/models` API over `Authorization: Bearer` auth — this covers OpenRouter, OrcaRouter, Together, Groq, Fireworks, and self-hosted gateways (vLLM, Ollama's OpenAI shim, LM Studio). It does not cover providers with a different auth scheme or URL shape, like Azure OpenAI.
+Clanker Command Center talks to any service exposing an OpenAI-compatible `/chat/completions` and `/models` API over `Authorization: Bearer` auth — this covers OpenRouter, OrcaRouter, Together, Groq, Fireworks, and self-hosted gateways (vLLM, Ollama's OpenAI shim, LM Studio). It does not cover providers with a different auth scheme or URL shape, like Azure OpenAI.
 
 To switch to OrcaRouter, for example:
 
 ```bash
-comms endpoint https://api.orcarouter.ai/v1
-comms login                          # enter your OrcaRouter key
-comms model orcarouter/auto          # or any model OrcaRouter serves
-comms effort-style flat              # OrcaRouter expects reasoning as a top-level field
+clank endpoint https://api.orcarouter.ai/v1
+clank login                          # enter your OrcaRouter key
+clank model orcarouter/auto          # or any model OrcaRouter serves
+clank effort-style flat              # OrcaRouter expects reasoning as a top-level field
 ```
 
-Only one provider is active at a time today — switching back to OpenRouter means re-running `comms endpoint`, `comms login`, `comms model`, and `comms effort-style` for it. Named provider profiles (switch between saved providers with one command) are tracked in `TODO.md`.
+Only one provider is active at a time today — switching back to OpenRouter means re-running `clank endpoint`, `clank login`, `clank model`, and `clank effort-style` for it. Named provider profiles (switch between saved providers with one command) are tracked in `TODO.md`.
 
 ## Session Persistence
 
-`session` and `tui` conversations are saved automatically to a SQLite database at `~/.comms/chats.db`. Every message (yours, the assistant's, and any tool calls/results while in agent mode) is written as the conversation happens, so you don't lose anything if you exit or your terminal closes — including a turn you cancelled partway through.
+`session` and `tui` conversations are saved automatically to a SQLite database at `~/.clank/chats.db`. Every message (yours, the assistant's, and any tool calls/results while in agent mode) is written as the conversation happens, so you don't lose anything if you exit or your terminal closes — including a turn you cancelled partway through.
 
-**Settings are a snapshot, not a live link to your config.** A session's row — model, effort level, max iterations, temperature, approval gates — is written to the database the moment it's created, before your first message, not after. `tui` has no flags at all, so a session it creates is always a straight snapshot of your persistent config defaults; `comms session` is the only place a brand new session can start away from those defaults, via its `--model`/`--effort-level`/`--max-iterations`/`--temperature` flags. That snapshot can itself be `None` for effort/max-iterations/temperature, if nothing is configured anywhere — same as `ask`/`agent`, which merge a `--flag` with the config default the same way but only ever for that one call, never a session.
+**Settings are a snapshot, not a live link to your config.** A session's row — model, effort level, max iterations, temperature, approval gates — is written to the database the moment it's created, before your first message, not after. `tui` has no flags at all, so a session it creates is always a straight snapshot of your persistent config defaults; `clank session` is the only place a brand new session can start away from those defaults, via its `--model`/`--effort-level`/`--max-iterations`/`--temperature` flags. That snapshot can itself be `None` for effort/max-iterations/temperature, if nothing is configured anywhere — same as `ask`/`agent`, which merge a `--flag` with the config default the same way but only ever for that one call, never a session.
 
 From then on, the session's settings are entirely its own: `/model` and `/approval` changes always write a concrete value straight back to that same row; `/effort`, `/max-iterations`, and `/temperature` additionally support two different resets, since a session can also nullify these three:
 
 - **`/setting clear`** nullifies it outright, with no fallback substituted anywhere: `/effort clear` and `/temperature clear` mean no effort/temperature field is sent in the request at all (the provider uses its own default); `/max-iterations clear` means agent mode has no cap, so any turn that actually needs one fails immediately with an error telling you to set one, rather than the loop running unbounded or guessing a number.
 - **`/setting default`** is a one-time snapshot instead: it reads whatever the global default currently is and saves that concrete value to the session right now — frozen from that point on, exactly like typing the value itself, and distinct from `clear` even when the global default happens to be unset (an `/effort default` with no global default configured saves `None` explicitly, the same as `clear` would, but as a deliberate choice rather than an indefinite fallback).
 
-Either way, every outgoing request from a session reads its own stored settings directly, never your global config — including for a value that's currently `None`. Later changing a global default with `comms model`/`comms temperature`/etc. never reaches into any session that already exists, whether that session has an explicit value, is nullified, or was created before you ever set the global default at all. The global defaults themselves work the same way: `comms max-iterations --clear`/`comms temperature --clear` null them out too (see [`max-iterations`](#max-iterations-value) and [`temperature`](#temperature-value)), and nothing brings them back except setting one explicitly again.
+Either way, every outgoing request from a session reads its own stored settings directly, never your global config — including for a value that's currently `None`. Later changing a global default with `clank model`/`clank temperature`/etc. never reaches into any session that already exists, whether that session has an explicit value, is nullified, or was created before you ever set the global default at all. The global defaults themselves work the same way: `clank max-iterations --clear`/`clank temperature --clear` null them out too (see [`max-iterations`](#max-iterations-value) and [`temperature`](#temperature-value)), and nothing brings them back except setting one explicitly again.
 
 Each session gets an id (a UUID) and a title derived from your first message (or one you choose up front, in the TUI). Use:
 
-- `comms sessions list` to see saved sessions (shown by 8-character id prefix, kind, state, model, and title)
-- `comms sessions show <id>` to view a session's full transcript
-- `comms sessions delete <id>` to remove one
-- `comms session --resume <id>` to continue a saved session — works for one currently in ask mode or agent mode alike, since mode is just session state now, not a separate command
-- `comms session --resume` with no id to pick one from a numbered list of all your saved sessions
+- `clank sessions list` to see saved sessions (shown by 8-character id prefix, kind, state, model, and title)
+- `clank sessions show <id>` to view a session's full transcript
+- `clank sessions delete <id>` to remove one
+- `clank session --resume <id>` to continue a saved session — works for one currently in ask mode or agent mode alike, since mode is just session state now, not a separate command
+- `clank session --resume` with no id to pick one from a numbered list of all your saved sessions
 
 Any unique prefix of a session's id works wherever a full id is expected.
 
@@ -881,32 +881,32 @@ Any unique prefix of a session's id works wherever a full id is expected.
 ### Generate and save code
 
 ```bash
-comms agent "Write a function that calculates fibonacci numbers and save it to math.rs"
+clank agent "Write a function that calculates fibonacci numbers and save it to math.rs"
 ```
 
 ### Multi-file project setup
 
 ```bash
-comms agent "Create a basic Rust project structure with Cargo.toml, src/main.rs, and src/lib.rs"
+clank agent "Create a basic Rust project structure with Cargo.toml, src/main.rs, and src/lib.rs"
 ```
 
 ### Fix existing code
 
 ```bash
-comms agent "Read main.rs, find any issues, and write a corrected version"
+clank agent "Read main.rs, find any issues, and write a corrected version"
 ```
 
 ### Using different models
 
 ```bash
 # Claude for code review
-comms agent "Read app.rs and provide detailed code review feedback" -m anthropic/claude-opus-4.5
+clank agent "Read app.rs and provide detailed code review feedback" -m anthropic/claude-opus-4.5
 
 # GPT-4 for complex logic
-comms agent "Create an algorithm to solve the traveling salesman problem" -m openai/gpt-4o
+clank agent "Create an algorithm to solve the traveling salesman problem" -m openai/gpt-4o
 
 # Adaptive routing (default)
-comms agent "Generate boilerplate code" -m openrouter/auto
+clank agent "Generate boilerplate code" -m openrouter/auto
 ```
 
 ## Building for Different Platforms
@@ -929,11 +929,11 @@ cargo build --release --target x86_64-unknown-linux-gnu
 
 ### "API key not configured"
 
-Run `comms login` and enter your key from [openrouter.ai/keys](https://openrouter.ai/keys).
+Run `clank login` and enter your key from [openrouter.ai/keys](https://openrouter.ai/keys).
 
 ### "Model not found"
 
-Run `comms models` to see available models, then use the correct model ID with `-m`.
+Run `clank models` to see available models, then use the correct model ID with `-m`.
 
 ### Build errors on macOS
 
@@ -953,11 +953,11 @@ sudo dnf groupinstall "Development Tools"
 
 ## Security
 
-- The agent's file-writing tools (`write_file`, `replace_in_file`) are confined to your current working directory by default, checked against the path a write resolves to so `..` and symlinks can't step outside it. Turn it off per session with `/sandbox off` or globally with `comms sandbox off`. Reads and terminal commands are not bounded this way — a terminal command runs whatever you approve. This gates the agent's tools only; `comms` writes its own `~/.comms` state directly and is unaffected
-- API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.comms/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `comms` command, and the field is stripped from the file afterward
-- `session`/`tui` history is stored in `~/.comms/chats.db` with message content, tool calls, reasoning, and titles encrypted at rest (AES-256-GCM, key held in your OS keychain under a separate `db_encryption_key` entry) — but the surrounding session metadata (roles, model names, effort levels, timestamps) is stored in the clear, and rows written before encryption existed stay plaintext until they're next written. The key lives in the same keychain `comms` already uses, so this protects the file at rest (backups, drive theft) rather than against someone who can run `comms` as you; avoid pasting secrets into a session if you plan to share the database file
-- The last 100 LLM API errors (a non-2xx response, a stalled/dropped connection, a malformed stream) are kept at `~/.comms/errors.log`, so a confusing one can be looked back at without having to catch and copy it in the moment — plain text, one line per entry, oldest dropped as new ones come in
-- Each of those entries records the shape of the request that failed — role sequence, tool-call and reasoning counts — but no message text. To capture the request itself, set `COMMS_DEBUG_REQUESTS=1`: the failing request's full JSON body is written to `~/.comms/failed-request.json` (only the most recent one, overwritten each time) and the log entry names the file. **That file contains the entire conversation verbatim** — every message, tool call and tool result — so it's off by default, and worth deleting once you're done with it
+- The agent's file-writing tools (`write_file`, `replace_in_file`) are confined to your current working directory by default, checked against the path a write resolves to so `..` and symlinks can't step outside it. Turn it off per session with `/sandbox off` or globally with `clank sandbox off`. Reads and terminal commands are not bounded this way — a terminal command runs whatever you approve. This gates the agent's tools only; `clank` writes its own `~/.clank` state directly and is unaffected
+- API keys are stored in your OS keychain (macOS Keychain, Windows Credential Manager, or the Linux Secret Service via `keyring`), not in a plaintext file. An older `~/.clank/config.json` with a plaintext `api_key` field is migrated into the keychain automatically the next time you run any `clank` command, and the field is stripped from the file afterward
+- `session`/`tui` history is stored in `~/.clank/chats.db` with message content, tool calls, reasoning, and titles encrypted at rest (AES-256-GCM, key held in your OS keychain under a separate `db_encryption_key` entry) — but the surrounding session metadata (roles, model names, effort levels, timestamps) is stored in the clear, and rows written before encryption existed stay plaintext until they're next written. The key lives in the same keychain `clank` already uses, so this protects the file at rest (backups, drive theft) rather than against someone who can run `clank` as you; avoid pasting secrets into a session if you plan to share the database file
+- The last 100 LLM API errors (a non-2xx response, a stalled/dropped connection, a malformed stream) are kept at `~/.clank/errors.log`, so a confusing one can be looked back at without having to catch and copy it in the moment — plain text, one line per entry, oldest dropped as new ones come in
+- Each of those entries records the shape of the request that failed — role sequence, tool-call and reasoning counts — but no message text. To capture the request itself, set `CLANK_DEBUG_REQUESTS=1`: the failing request's full JSON body is written to `~/.clank/failed-request.json` (only the most recent one, overwritten each time) and the log entry names the file. **That file contains the entire conversation verbatim** — every message, tool call and tool result — so it's off by default, and worth deleting once you're done with it
 
 ## Development
 
@@ -980,7 +980,7 @@ cargo clippy
 ## Performance
 
 ```bash
-time comms ask "Hello"
+time clank ask "Hello"
 # real    0m0.015s
 ```
 

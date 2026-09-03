@@ -876,7 +876,7 @@ mod tests {
         // The session's sandbox is anchored to a directory that isn't there,
         // so neither front end can honour it — and quietly rebinding the
         // bound to whatever is current is the one outcome worth refusing.
-        let session = session_in(Some("/comms-no-such-directory-exists"));
+        let session = session_in(Some("/clank-no-such-directory-exists"));
         assert!(matches!(
             enter_working_dir(&session).unwrap(),
             EnteredDir::Missing(_)
@@ -884,13 +884,13 @@ mod tests {
         // Nothing moved.
         assert_ne!(
             std::env::current_dir().unwrap().display().to_string(),
-            "/comms-no-such-directory-exists"
+            "/clank-no-such-directory-exists"
         );
     }
 
     #[test]
     fn repointing_a_session_records_the_new_directory() {
-        let mut session = session_in(Some("/comms-no-such-directory-exists"));
+        let mut session = session_in(Some("/clank-no-such-directory-exists"));
         session.set_working_dir("/tmp".to_string()).unwrap();
 
         assert_eq!(session.working_dir(), Some("/tmp"));

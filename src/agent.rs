@@ -267,7 +267,7 @@ pub async fn run_chat_turn(
 /// between a `tool_calls` message and its results would make the request
 /// invalid.
 ///
-/// Empty for callers with nowhere to type — a one-shot `comms agent` task
+/// Empty for callers with nowhere to type — a one-shot `clank agent` task
 /// has no seam to steer through, and passing an idle handle is how they say
 /// so.
 ///
@@ -313,7 +313,7 @@ pub async fn run_agent_turn(
     let max_iterations = max_iterations.ok_or_else(|| {
         anyhow::anyhow!(
             "No max-iterations cap is set. Set one with /max-iterations <n> for this session, \
-             or comms max-iterations <n> as the persistent default."
+             or clank max-iterations <n> as the persistent default."
         )
     })?;
 
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn an_idle_handle_yields_nothing() {
-        // What `comms agent` and the CLI's blocking loop pass: no way to
+        // What `clank agent` and the CLI's blocking loop pass: no way to
         // type mid-turn, so every iteration takes an empty list.
         assert!(Steering::default().take().is_empty());
     }
@@ -543,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_mode_refuses_to_run_without_an_iteration_cap() {
-        // `comms max-iterations --clear` leaves no cap anywhere, and agent
+        // `clank max-iterations --clear` leaves no cap anywhere, and agent
         // mode fails loudly rather than picking a number on the user's
         // behalf — the one setting where null is an error instead of
         // "send nothing". Checked before any request goes out, which is why
@@ -574,7 +574,7 @@ mod tests {
         );
         // Says both ways out, since the fix differs by where you are.
         assert!(message.contains("/max-iterations"), "{message}");
-        assert!(message.contains("comms max-iterations"), "{message}");
+        assert!(message.contains("clank max-iterations"), "{message}");
     }
 
     #[test]

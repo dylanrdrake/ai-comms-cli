@@ -59,7 +59,7 @@ pub enum TranscriptItem {
     /// a snapshot of the moment it was asked for, and shouldn't quietly
     /// change under the reader when a later `/effort` scrolls past.
     SessionStatus(Vec<(String, String)>),
-    /// This session's approval gates, pretty-printed the same way `comms
+    /// This session's approval gates, pretty-printed the same way `clank
     /// approval` shows them in the CLI rather than packed into one
     /// `Notice` line. Shown both after `/approval <category> <on|off>`
     /// changes something and after a bare `/approval` query.
@@ -488,7 +488,7 @@ impl App {
     }
 
     /// The first eight characters of the id — enough to name the session at
-    /// `comms resume`, and what `/status` shows.
+    /// `clank resume`, and what `/status` shows.
     pub fn short_id(&self) -> &str {
         &self.session_id[..8.min(self.session_id.len())]
     }

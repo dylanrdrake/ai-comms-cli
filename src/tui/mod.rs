@@ -424,7 +424,7 @@ fn draw(terminal: &mut Tui, screen: &Screen, tick: usize, selection: bool) -> Re
         Screen::Launch(p) => picker::draw(
             frame,
             p,
-            "COMMS",
+            "CLANKER COMMAND CENTER",
             current_dir().as_deref(),
             selection,
             "↑/↓ move · Enter open · r rename · d delete · q quit",

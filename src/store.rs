@@ -560,7 +560,7 @@ pub enum LastState {
 /// failed. The rest are read from the messages, and are what a session
 /// nobody is running can still tell you.
 ///
-/// Shared so the launch screen and `comms sessions list` cannot come to
+/// Shared so the launch screen and `clank sessions list` cannot come to
 /// disagree about what a session is doing.
 pub fn last_state(activity: Option<Activity>, last: Option<&LastMessage>) -> LastState {
     match activity {

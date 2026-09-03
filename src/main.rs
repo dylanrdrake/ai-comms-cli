@@ -32,11 +32,11 @@ use terminal_ui::TerminalAgentUi;
 use ui::{parse_bool, response_label};
 
 #[derive(Parser)]
-#[command(name = "comms")]
-#[command(about = "AI Comms CLI - An OpenAI-compatible frontend for any LLM provider", long_about = None)]
+#[command(name = "clank")]
+#[command(about = "Clanker Command Center - An OpenAI-compatible frontend for any LLM provider", long_about = None)]
 #[command(version = "0.1.0")]
 struct Cli {
-    /// With no subcommand at all, `comms` launches the full-screen TUI on
+    /// With no subcommand at all, `clank` launches the full-screen TUI on
     /// its launch screen — the only way in; there's no `tui` subcommand or
     /// flags to skip straight into a new or resumed session.
     #[command(subcommand)]
@@ -484,7 +484,7 @@ async fn cmd_login() -> Result<()> {
     let mut config = load_config()?;
 
     // Pre-filled with the current endpoint (which is itself the configured
-    // default until `comms endpoint` changes it), so accepting it is just
+    // default until `clank endpoint` changes it), so accepting it is just
     // pressing Enter — only typing something else actually changes it.
     let mut rl = DefaultEditor::new()?;
     let endpoint = match rl.readline_with_initial("Endpoint URL: ", (&config.base_url, "")) {
@@ -535,7 +535,7 @@ async fn cmd_logout() -> Result<()> {
 
 async fn cmd_status() -> Result<()> {
     let config = load_config()?;
-    println!("\n{}", "AI Comms CLI Configuration:".blue());
+    println!("\n{}", "Clanker Command Center Configuration:".blue());
     println!("  Base URL: {}", config.base_url);
     println!(
         "  API Key: {}",
@@ -651,10 +651,10 @@ async fn cmd_approval(action: Option<ApprovalCommands>) -> Result<()> {
             println!("{}", "Approval Settings:".blue());
             print_approval_status(&config.approval);
             println!("\n{}", "Usage:".bright_black());
-            println!("  comms approval read <on|off>     Set read approval");
-            println!("  comms approval write <on|off>    Set write approval");
-            println!("  comms approval terminal <on|off> Set terminal approval");
-            println!("  comms approval all <on|off>      Set all approvals");
+            println!("  clank approval read <on|off>     Set read approval");
+            println!("  clank approval write <on|off>    Set write approval");
+            println!("  clank approval terminal <on|off> Set terminal approval");
+            println!("  clank approval all <on|off>      Set all approvals");
         }
         Some(ApprovalCommands::Read { enabled }) => {
             let value = parse_bool(&enabled).map_err(|e| anyhow::anyhow!(e))?;
@@ -758,7 +758,7 @@ async fn cmd_endpoint(url: Option<String>, clear: bool) -> Result<()> {
             save_config(&config)?;
             println!("{} Endpoint set to {}", "✓".green(), trimmed);
             println!(
-                "{} Remember to run `comms login` if this provider uses a different API key",
+                "{} Remember to run `clank login` if this provider uses a different API key",
                 "i".bright_black()
             );
         }
@@ -1065,7 +1065,7 @@ async fn cmd_effort_level(value: Option<String>, clear: bool) -> Result<()> {
         Some(value) => {
             // Not checked against a fixed low/medium/high list — models
             // vary in what reasoning-effort values they actually accept,
-            // and this is easy to correct with another `comms effort-level`
+            // and this is easy to correct with another `clank effort-level`
             // if it turns out wrong for whatever you're pointed at.
             config.effort_level = Some(value.clone());
             save_config(&config)?;
@@ -1219,7 +1219,7 @@ fn apply_submission(
         | ui::Submission::DenyTool
         | ui::Submission::Back => {
             println!(
-                "{} that's a TUI command (`comms tui`), not available here",
+                "{} that's a TUI command (`clank tui`), not available here",
                 "✗".red()
             );
         }
@@ -1422,7 +1422,7 @@ fn apply_submission(
     Ok(())
 }
 
-/// Asks for a session title, for `comms session` without `--title`.
+/// Asks for a session title, for `clank session` without `--title`.
 ///
 /// Refuses a blank one rather than falling back to naming the session from
 /// its first message: creating a session should be deliberate, and a name is
@@ -1688,7 +1688,7 @@ async fn cmd_session(
     }
 
     println!(
-        "{} Session saved. Resume with: comms session --resume {}",
+        "{} Session saved. Resume with: clank session --resume {}",
         "✓".green(),
         session.short_id()
     );
@@ -1852,7 +1852,7 @@ mod tests {
         );
         assert_eq!(resolve_model(&config, None), "config-model");
 
-        // Cleared with `comms model --clear`, which writes null: the
+        // Cleared with `clank model --clear`, which writes null: the
         // fallback is what a request is actually made with.
         let cleared = config_with(None, None, None, None);
         assert_eq!(resolve_model(&cleared, None), config::DEFAULT_MODEL);
@@ -1862,7 +1862,7 @@ mod tests {
     fn a_cleared_temperature_stays_cleared() {
         // The documented contract: null means "send no temperature field",
         // not "fall back to 0.7". Resolving it to a number would silently
-        // undo `comms temperature --clear`.
+        // undo `clank temperature --clear`.
         let cleared = config_with(None, None, None, None);
         assert_eq!(resolve_temperature(&cleared, None), None);
         // A flag still overrides it for that one call.

@@ -14,16 +14,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin_name: comms
-            asset_name: comms-linux-x86_64.tar.gz
+            bin_name: clank
+            asset_name: clank-linux-x86_64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            bin_name: comms
-            asset_name: comms-macos-aarch64.tar.gz
+            bin_name: clank
+            asset_name: clank-macos-aarch64.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin_name: comms.exe
-            asset_name: comms-windows-x86_64.zip
+            bin_name: clank.exe
+            asset_name: clank-windows-x86_64.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

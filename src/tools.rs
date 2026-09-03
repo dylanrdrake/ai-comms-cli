@@ -148,7 +148,7 @@ const FETCH_TIMEOUT_SECS: u64 = 30;
 
 /// Named and versioned, so a site owner seeing it in their logs can tell what
 /// it is. Anonymous requests get refused outright by some sites.
-const FETCH_USER_AGENT: &str = concat!("comms/", env!("CARGO_PKG_VERSION"), " (+web_fetch)");
+const FETCH_USER_AGENT: &str = concat!("clank/", env!("CARGO_PKG_VERSION"), " (+web_fetch)");
 
 /// Width the text is wrapped to. Wide enough not to mangle tables, narrow
 /// enough to stay readable when the model quotes it back.
@@ -480,7 +480,7 @@ fn sandbox_refusal(path: &Path, sandbox: bool) -> Option<serde_json::Value> {
         "success": false,
         "error": format!(
             "Sandbox: {} is outside the working directory. \
-             Allow writes anywhere with /sandbox off (or comms sandbox off).",
+             Allow writes anywhere with /sandbox off (or clank sandbox off).",
             path.display()
         )
     }))
@@ -773,7 +773,7 @@ mod tests {
     fn the_user_agent_identifies_the_tool() {
         // Anonymous requests get 403s — Wikipedia answers one with a note
         // asking for a user agent.
-        assert!(FETCH_USER_AGENT.starts_with("comms/"));
+        assert!(FETCH_USER_AGENT.starts_with("clank/"));
         assert!(FETCH_USER_AGENT.contains(env!("CARGO_PKG_VERSION")));
     }
 
@@ -856,7 +856,7 @@ mod tests {
     /// correctly never comes. A root-relative path lands on the current
     /// drive's root instead, outside both bounds everywhere.
     fn outside_the_sandbox() -> String {
-        format!("/comms-sandbox-should-never-exist-{}/x", std::process::id())
+        format!("/clank-sandbox-should-never-exist-{}/x", std::process::id())
     }
 
     #[test]
@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn replace_in_file_rewrites_a_file_inside_the_workspace() {
-        let name = format!("comms-sandbox-test-{}-replace.txt", std::process::id());
+        let name = format!("clank-sandbox-test-{}-replace.txt", std::process::id());
         fs::write(&name, "before").unwrap();
 
         let result = replace_in_file(&name, "before", "after", true).unwrap();
@@ -910,7 +910,7 @@ mod tests {
 
         // A relative path resolves against the working directory, which is
         // inside the bound.
-        let inside = format!("comms-sandbox-test-{}-write.txt", std::process::id());
+        let inside = format!("clank-sandbox-test-{}-write.txt", std::process::id());
         let allowed = write_file(&inside, "x", "write", true).unwrap();
         assert_eq!(allowed["success"], true, "{allowed}");
         fs::remove_file(&inside).ok();
@@ -931,7 +931,7 @@ mod tests {
             return;
         }
 
-        let under_home = home.join(format!("comms-sandbox-test-{}-sibling", std::process::id()));
+        let under_home = home.join(format!("clank-sandbox-test-{}-sibling", std::process::id()));
         let result = write_file(under_home.to_str().unwrap(), "x", "write", true).unwrap();
 
         assert_eq!(result["success"], false, "{result}");
@@ -943,7 +943,7 @@ mod tests {
         // Canonicalization is what makes this true: a path that walks out of
         // the workspace with `..` is judged on where it ends up.
         let escape = format!(
-            "{}/../../../../../../comms-sandbox-should-never-exist",
+            "{}/../../../../../../clank-sandbox-should-never-exist",
             std::env::current_dir().unwrap().display()
         );
         let result = write_file(&escape, "x", "write", true).unwrap();
