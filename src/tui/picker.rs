@@ -10,7 +10,7 @@
 //! [`Activation`] returned when a row is chosen.
 
 use super::render::{band, draw_rule, home_relative, identicon, pad_to};
-use crate::store::{mode_label, Activity, LastMessage, SessionSummary, KIND_AGENT_CHAT};
+use crate::store::{mode_label, Activity, LastMessage, LastState, SessionSummary, KIND_AGENT_CHAT};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -77,6 +77,88 @@ pub enum Activation {
     /// one, repointing it there.
     Repoint(SessionRow),
 }
+
+impl SessionRow {
+    /// What to show for this session.
+    ///
+    /// The process's own word wins when it gave one: it knows things the
+    /// stored messages can't say, like that a request is in flight or that
+    /// somebody is being asked a question. Otherwise the last message
+    /// speaks, which is all a session nobody is running can offer.
+    pub fn last_state(&self) -> LastState {
+        crate::store::last_state(self.activity, self.last.as_ref())
+    }
+}
+
+impl SessionRow {
+    /// The line to show after the state, when there is one worth showing.
+    ///
+    /// A pending approval displaces the conversation preview: what the
+    /// session last said matters far less than what it is stuck asking, and
+    /// that is the row someone reading this list needs to act on.
+    pub fn preview(&self) -> Option<String> {
+        if self.activity == Some(Activity::AwaitingApproval) {
+            if let Some(detail) = &self.activity_detail {
+                return Some(format!("needs approval — {detail}"));
+            }
+        }
+        self.last
+            .as_ref()
+            .map(|last| last.preview.clone())
+            .filter(|preview| !preview.is_empty())
+    }
+}
+
+/// The glyph and colour for a session's state.
+///
+/// The glyph carries the meaning and the colour only reinforces it, so the
+/// list still reads on a terminal without colour.
+///
+/// Every glyph here is East Asian Width *Neutral* or *Narrow*, which is what
+/// keeps the column aligned. The obvious circles — `●`, `◐`, `○`, `•` — are
+/// *Ambiguous*, and a terminal may draw those two cells wide while drawing
+/// the rest one, which pushed some rows a column right of the others.
+fn state_badge(state: LastState, tick: usize) -> (String, Style) {
+    let (glyph, style) = match state {
+        LastState::New => (" ", Style::new()),
+        // The conversation's own spinner, frame for frame and in the same
+        // yellow, so a busy session animates identically whether you're
+        // watching it from the list or sitting inside it.
+        LastState::Working => (
+            super::render::FRAMES[tick % super::render::FRAMES.len()],
+            Style::new().yellow(),
+        ),
+        LastState::AwaitingApproval => ("?", Style::new().yellow().bold()),
+        LastState::Failed => ("✗", Style::new().red().bold()),
+        LastState::Replied => ("✓", Style::new().green()),
+        LastState::NoReply => ("⋯", Style::new().cyan()),
+        LastState::Interrupted => ("⚑", Style::new().yellow()),
+    };
+    (format!("{glyph:<BADGE_WIDTH$}"), style)
+}
+
+/// The label whose rows share the directory the process is in, so they
+/// needn't each repeat it.
+const HERE_SECTION: &str = "In this directory";
+
+// Fixed columns, so the preview can be given whatever the line has left.
+const MARKER_WIDTH: usize = 2 + ICON_WIDTH + 1 + BADGE_WIDTH + 1; // marker, mark, badge, gaps
+const KIND_WIDTH: usize = 7;
+const TITLE_WIDTH: usize = 24;
+const DIR_WIDTH: usize = 24;
+const WHEN_WIDTH: usize = 8;
+
+/// Below this a preview says too little to be worth the clutter.
+const MIN_PREVIEW: usize = 12;
+/// Every badge is a single cell — see `state_badge` — and padded to this so
+/// the column stays straight.
+const BADGE_WIDTH: usize = 1;
+
+/// The mark is two braille cells: 4 dots across by 4 down. One cell is 2
+/// dots wide by 4 tall in a character box about half as wide as it is tall,
+/// so the dots already sit on a square lattice — it's the glyph that's a
+/// 1:2 rectangle. Two of them side by side makes the block square as well.
+const ICON_WIDTH: usize = 2;
 
 /// A list with a moving selection. Empty lists are allowed (a fresh install
 /// has no sessions), in which case there is nothing to activate.
@@ -358,130 +440,14 @@ impl Picker {
     }
 }
 
-/// What a session row reports, whichever source can answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LastState {
-    /// A request is in flight right now.
-    Working,
-    /// Blocked on an approval nobody has answered.
-    AwaitingApproval,
-    /// The last turn ended in an error.
-    Failed,
-    /// Created, never used.
-    New,
-    /// The model answered. A turn that ran to completion.
-    Replied,
-    /// A message was sent and nothing came back — the turn is either running
-    /// somewhere right now or it ended badly. Nothing on disk tells the two
-    /// apart, because a turn's messages are only written when it finishes.
-    NoReply,
-    /// It stopped part-way through working: after a tool result with no
-    /// answer after it, or on a tool call that never ran.
-    Interrupted,
-}
-
-impl SessionRow {
-    /// What to show for this session.
-    ///
-    /// The process's own word wins when it gave one: it knows things the
-    /// stored messages can't say, like that a request is in flight or that
-    /// somebody is being asked a question. Otherwise the last message
-    /// speaks, which is all a session nobody is running can offer.
-    pub fn last_state(&self) -> LastState {
-        match self.activity {
-            Some(Activity::Working) => return LastState::Working,
-            Some(Activity::AwaitingApproval) => return LastState::AwaitingApproval,
-            Some(Activity::Failed) => return LastState::Failed,
-            None => {}
-        }
-        let Some(last) = &self.last else {
-            return LastState::New;
-        };
-        match last.role.as_str() {
-            "assistant" if last.has_tool_calls => LastState::Interrupted,
-            "assistant" => LastState::Replied,
-            "tool" => LastState::Interrupted,
-            // A user message with nothing after it.
-            _ => LastState::NoReply,
-        }
-    }
-}
-
-impl SessionRow {
-    /// The line to show after the state, when there is one worth showing.
-    ///
-    /// A pending approval displaces the conversation preview: what the
-    /// session last said matters far less than what it is stuck asking, and
-    /// that is the row someone reading this list needs to act on.
-    pub fn preview(&self) -> Option<String> {
-        if self.activity == Some(Activity::AwaitingApproval) {
-            if let Some(detail) = &self.activity_detail {
-                return Some(format!("needs approval — {detail}"));
-            }
-        }
-        self.last
-            .as_ref()
-            .map(|last| last.preview.clone())
-            .filter(|preview| !preview.is_empty())
-    }
-}
-
-/// The glyph and colour for a session's state.
-///
-/// The glyph carries the meaning and the colour only reinforces it, so the
-/// list still reads on a terminal without colour.
-///
-/// Every glyph here is East Asian Width *Neutral* or *Narrow*, which is what
-/// keeps the column aligned. The obvious circles — `●`, `◐`, `○`, `•` — are
-/// *Ambiguous*, and a terminal may draw those two cells wide while drawing
-/// the rest one, which pushed some rows a column right of the others.
-fn state_badge(state: LastState, tick: usize) -> (String, Style) {
-    let (glyph, style) = match state {
-        LastState::New => (" ", Style::new()),
-        // The conversation's own spinner, frame for frame and in the same
-        // yellow, so a busy session animates identically whether you're
-        // watching it from the list or sitting inside it.
-        LastState::Working => (
-            super::render::FRAMES[tick % super::render::FRAMES.len()],
-            Style::new().yellow(),
-        ),
-        LastState::AwaitingApproval => ("?", Style::new().yellow().bold()),
-        LastState::Failed => ("✗", Style::new().red().bold()),
-        LastState::Replied => ("✓", Style::new().green()),
-        LastState::NoReply => ("⋯", Style::new().cyan()),
-        LastState::Interrupted => ("⚑", Style::new().yellow()),
-    };
-    (format!("{glyph:<BADGE_WIDTH$}"), style)
-}
-
-/// The label whose rows share the directory the process is in, so they
-/// needn't each repeat it.
-const HERE_SECTION: &str = "In this directory";
-
-// Fixed columns, so the preview can be given whatever the line has left.
-const MARKER_WIDTH: usize = 2 + ICON_WIDTH + 1 + BADGE_WIDTH + 1; // marker, mark, badge, gaps
-const KIND_WIDTH: usize = 7;
-const TITLE_WIDTH: usize = 24;
-const DIR_WIDTH: usize = 24;
-const WHEN_WIDTH: usize = 8;
-
-/// Below this a preview says too little to be worth the clutter.
-const MIN_PREVIEW: usize = 12;
-/// Every badge is a single cell — see `state_badge` — and padded to this so
-/// the column stays straight.
-const BADGE_WIDTH: usize = 1;
-
-/// The mark is two braille cells: 4 dots across by 4 down. One cell is 2
-/// dots wide by 4 tall in a character box about half as wide as it is tall,
-/// so the dots already sit on a square lattice — it's the glyph that's a
-/// 1:2 rectangle. Two of them side by side makes the block square as well.
-const ICON_WIDTH: usize = 2;
-
 pub fn draw(
     frame: &mut Frame,
     picker: &Picker,
     title: &str,
     dir: Option<&str>,
+    // Whether the selected row is banded. Global rather than per-session:
+    // this screen belongs to no session, so there is nothing to override.
+    selection: bool,
     hint: &str,
     tick: usize,
 ) {
@@ -591,7 +557,7 @@ pub fn draw(
         let mut line = Line::from(spans);
         // The same band the transcript puts behind your own messages: the
         // cursor is easy to lose in a list where several rows are animating.
-        if selected {
+        if selected && selection {
             pad_to(&mut line, width);
             line.style = line.style.patch(band());
         }
@@ -747,37 +713,6 @@ fn relative_time(timestamp: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn the_selected_row_carries_a_band_across_the_whole_row() {
-        use ratatui::{backend::TestBackend, Terminal};
-        let picker = picker_of(vec![
-            row_in("00000001", KIND_AGENT_CHAT, "first", Some(HERE)),
-            row_in("00000002", KIND_AGENT_CHAT, "second", Some(HERE)),
-        ]);
-        let mut terminal = Terminal::new(TestBackend::new(70, 10)).unwrap();
-        terminal
-            .draw(|f| draw(f, &picker, "COMMS", None, "hint", 0))
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-
-        let row_of = |needle: &str| {
-            (0..buffer.area.height)
-                .find(|y| {
-                    (0..buffer.area.width)
-                        .map(|x| buffer[(x, *y)].symbol().to_string())
-                        .collect::<String>()
-                        .contains(needle)
-                })
-                .unwrap_or_else(|| panic!("{needle} not drawn"))
-        };
-
-        // "New session" is selected by default.
-        let selected = row_of("New session");
-        let other = row_of("first");
-        assert_eq!(buffer[(65, selected)].style().bg, band().bg);
-        assert_ne!(buffer[(65, other)].style().bg, band().bg);
-    }
 
     #[test]
     fn the_kind_column_says_ask_not_chat() {

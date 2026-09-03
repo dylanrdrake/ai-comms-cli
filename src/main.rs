@@ -130,6 +130,23 @@ enum Commands {
         value: Option<bool>,
     },
 
+    /// View or set whether new sessions band your own messages in the
+    /// transcript
+    Highlight {
+        /// on/off (also accepts true/false, yes/no, 1/0). Omit to show the
+        /// current setting.
+        #[arg(value_parser = parse_bool)]
+        value: Option<bool>,
+    },
+
+    /// View or set whether the launch screen bands its selected row
+    Selection {
+        /// on/off (also accepts true/false, yes/no, 1/0). Omit to show the
+        /// current setting.
+        #[arg(value_parser = parse_bool)]
+        value: Option<bool>,
+    },
+
     /// View or set whether new sessions start showing full tool-call detail
     Verbose {
         /// on/off (also accepts true/false, yes/no, 1/0). Omit to show the
@@ -409,6 +426,8 @@ async fn main() -> Result<()> {
         Some(Commands::Temperature { value, clear }) => cmd_temperature(value, clear).await?,
         Some(Commands::Stream { value }) => cmd_stream(value).await?,
         Some(Commands::Sandbox { value }) => cmd_sandbox(value).await?,
+        Some(Commands::Highlight { value }) => cmd_highlight(value).await?,
+        Some(Commands::Selection { value }) => cmd_selection(value).await?,
         Some(Commands::Verbose { value }) => cmd_verbose(value).await?,
         Some(Commands::EffortLevel { value, clear }) => cmd_effort_level(value, clear).await?,
         Some(Commands::Ask {
@@ -563,11 +582,18 @@ async fn cmd_status() -> Result<()> {
     );
     println!("  Streaming: {}", if config.stream { "on" } else { "off" });
     println!("  Sandbox: {}", if config.sandbox { "on" } else { "off" });
+    println!("  Verbose: {}", if config.verbose { "on" } else { "off" });
     println!(
-        "  New sessions: {}",
-        if config.verbose { "verbose" } else { "quiet" }
+        "  Message highlighting: {}",
+        if config.highlight { "on" } else { "off" }
     );
-    if !config.extra_headers.is_empty() {
+    println!(
+        "  Launch screen selection: {}",
+        if config.selection { "on" } else { "off" }
+    );
+    if config.extra_headers.is_empty() {
+        println!("  Extra headers: none");
+    } else {
         println!("  Extra headers: {}", config.extra_headers.len());
     }
     println!("  Config file: {}", get_config_path()?.display());
@@ -583,6 +609,23 @@ fn format_approval(enabled: bool) -> String {
     } else {
         format!("{} Auto", "✗".yellow())
     }
+}
+
+/// A session's state as one padded, coloured word, matching the launch
+/// screen's badges: yellow for anything wanting attention, red for a
+/// failure, green for a turn that finished.
+fn format_state(state: store::LastState) -> colored::ColoredString {
+    use store::LastState;
+    let (word, colour): (&str, fn(&str) -> colored::ColoredString) = match state {
+        LastState::Working => ("working", |s| s.yellow()),
+        LastState::AwaitingApproval => ("approval", |s| s.yellow()),
+        LastState::Failed => ("failed", |s| s.red()),
+        LastState::Interrupted => ("stopped", |s| s.yellow()),
+        LastState::Replied => ("replied", |s| s.green()),
+        LastState::NoReply => ("no reply", |s| s.cyan()),
+        LastState::New => ("new", |s| s.bright_black()),
+    };
+    colour(&format!("{word:<8}"))
 }
 
 fn print_approval_status(approval: &ApprovalSettings) {
@@ -806,6 +849,61 @@ async fn cmd_headers(action: Option<HeaderCommands>) -> Result<()> {
 /// The persistent default for showing full tool-call detail. A session
 /// snapshots this when it's created, so changing it here affects new
 /// sessions; `/verbose` toggles the one you're in.
+/// The band behind your own messages. Per-session like `verbose`, so this
+/// only sets what a *new* session starts with; `/highlight` changes one that
+/// already exists.
+async fn cmd_highlight(value: Option<bool>) -> Result<()> {
+    let mut config = load_config()?;
+    let state = |on: bool| if on { "highlighted" } else { "plain" };
+
+    match value {
+        Some(enabled) => {
+            config.highlight = enabled;
+            save_config(&config)?;
+            println!(
+                "{} New sessions start with your messages {}",
+                "✓".green(),
+                state(enabled)
+            );
+        }
+        None => {
+            println!(
+                "New sessions start with your messages: {}",
+                state(config.highlight)
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// The band on the launch screen's selected row. Global only — that screen
+/// belongs to no session, so there is nothing to override it with.
+async fn cmd_selection(value: Option<bool>) -> Result<()> {
+    let mut config = load_config()?;
+    let state = |on: bool| if on { "highlighted" } else { "plain" };
+
+    match value {
+        Some(enabled) => {
+            config.selection = enabled;
+            save_config(&config)?;
+            println!(
+                "{} The launch screen's selected row is {}",
+                "✓".green(),
+                state(enabled)
+            );
+        }
+        None => {
+            println!(
+                "The launch screen's selected row is: {}",
+                state(config.selection)
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn cmd_verbose(value: Option<bool>) -> Result<()> {
     let mut config = load_config()?;
 
@@ -1180,6 +1278,19 @@ fn apply_submission(
             ui.set_verbose(verbose);
             println!("{}", ui::verbose_notice(verbose, true).blue());
         }
+        ui::Submission::SetHighlight(highlight) => {
+            // Recorded either way: the CLI draws no band, but the setting
+            // belongs to the session, so switching it here is what the TUI
+            // picks up on its next resume.
+            session.set_highlight(highlight)?;
+            println!("{}", ui::highlight_notice(highlight, true).blue());
+        }
+        ui::Submission::ShowHighlight => {
+            println!(
+                "{}",
+                ui::highlight_notice(session.highlight(), false).blue()
+            );
+        }
         ui::Submission::SetStream(stream) => {
             session.set_stream(stream)?;
             println!("{}", ui::stream_notice(stream, true).blue());
@@ -1250,12 +1361,15 @@ fn apply_submission(
             let updated = session.approval().with_category(&category, enabled);
             let changed = updated != *session.approval();
             session.set_approval(updated)?;
+            // All three, not just the one that moved: "Approval set to ✗
+            // Auto" named neither the gate it changed nor what the others
+            // were left at. The TUI has always shown the full set here.
             println!(
-                "{} Approval {} {}",
+                "{} Approval {}:",
                 "✓".green(),
-                if changed { "set to" } else { "is" },
-                format_approval(enabled)
+                if changed { "set to" } else { "is" }
             );
+            print_approval_status(session.approval());
         }
         ui::Submission::ShowApproval => {
             println!("{}", "Approval Settings:".blue());
@@ -1283,6 +1397,7 @@ fn apply_submission(
                 temperature: session.temperature(),
                 max_iterations: session.max_iterations(),
                 verbose: session.verbose(),
+                highlight: session.highlight(),
                 sandbox: session.sandbox(),
                 stream: session.stream(),
                 working_dir: session.working_dir(),
@@ -1427,6 +1542,7 @@ async fn cmd_session(
                 config.approval.clone(),
                 config.sandbox,
                 config.verbose,
+                config.highlight,
                 config.stream,
                 std::env::current_dir()
                     .ok()
@@ -1630,6 +1746,8 @@ async fn cmd_tui() -> Result<()> {
         approval: config.approval.clone(),
         sandbox: config.sandbox,
         verbose: config.verbose,
+        highlight: config.highlight,
+        selection: config.selection,
         stream: config.stream,
         client: Arc::new(Client::new(config)?),
     };
@@ -1648,15 +1766,32 @@ async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
                 return Ok(());
             }
 
+            // The same state the launch screen shows, from the same
+            // derivation — without a picker this is the only way to see a
+            // session that is running in another terminal.
+            let last = store::last_messages(&conn).unwrap_or_default();
+
             println!("{}\n", "Saved sessions:".blue());
             for s in &sessions {
+                let state = store::last_state(s.activity, last.get(&s.id));
                 println!(
-                    "  {}  {}  {}  {}",
+                    "  {}  {}  {}  {}  {}",
                     (&s.id[..8]).bright_black(),
-                    format!("[{}]", store::mode_label(s.kind == KIND_AGENT_CHAT)).bright_black(),
+                    // Padded: "[ask]" and "[agent]" differ in width, so
+                    // everything after them was landing raggedly.
+                    format!(
+                        "{:<7}",
+                        format!("[{}]", store::mode_label(s.kind == KIND_AGENT_CHAT))
+                    )
+                    .bright_black(),
+                    format_state(state),
                     s.model,
                     s.title
                 );
+                // What it is waiting on, when it is waiting on you.
+                if let Some(detail) = &s.activity_detail {
+                    println!("            {}", detail.bright_black());
+                }
             }
         }
         SessionCommands::Show { id } => {

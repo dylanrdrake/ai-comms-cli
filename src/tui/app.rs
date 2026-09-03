@@ -144,6 +144,8 @@ pub struct App {
     /// Mirrors the plain CLI's `-v`: gates whether tool call arguments and
     /// results are shown, not just that a tool ran. Toggled with `/verbose`.
     pub verbose: bool,
+    /// Whether this session bands the user's own messages.
+    pub highlight: bool,
     /// Whether the agent's file writes are confined to the working
     /// directory. Changed with `/sandbox`.
     pub sandbox: bool,
@@ -193,6 +195,7 @@ impl App {
             title: "Untitled".to_string(),
             agentic: false,
             verbose: false,
+            highlight: true,
             sandbox: true,
             stream: true,
             working_dir: None,
@@ -333,6 +336,13 @@ impl App {
                             sandbox, true,
                         )));
                 }
+            }
+            Event::HighlightChanged { highlight } => {
+                self.highlight = highlight;
+                self.transcript
+                    .push(TranscriptItem::Notice(crate::ui::highlight_notice(
+                        highlight, true,
+                    )));
             }
             Event::VerboseChanged { verbose } => {
                 self.verbose = verbose;

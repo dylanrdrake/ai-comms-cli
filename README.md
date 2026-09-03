@@ -156,6 +156,37 @@ comms verbose on
 
 Off by default. This is the *starting* value: a session snapshots it at creation, and `/verbose` from then on toggles that session, which is remembered per session rather than changing this. `comms agent -v` is unaffected — it's a per-run flag.
 
+#### `highlight [on|off]`
+View or set whether new sessions band your own messages in the transcript, so
+they stand out when scrolling back through a long turn.
+
+```bash
+# Show the current setting
+comms highlight
+
+# Start new sessions without the band
+comms highlight off
+```
+
+On by default, and the *starting* value like `verbose`: a session snapshots it
+at creation, and `/highlight` changes that one session from then on.
+
+The band is derived from your terminal's own background — a step lighter on a
+dark theme, darker on a light one — rather than a fixed colour, so it stays a
+tint of whatever you're using. If your terminal doesn't answer the query that
+asks, no band is drawn at all rather than one guessed at.
+
+#### `selection [on|off]`
+View or set whether the launch screen bands its selected row.
+
+```bash
+comms selection off
+```
+
+On by default. Global only, with no per-session counterpart and no slash
+command: the launch screen belongs to no session, so there is nothing to
+override it with.
+
 #### `sandbox [on|off]`
 View or set whether the agent's file-writing tools are confined to your current working directory.
 
@@ -309,7 +340,8 @@ exactly:
 | `/approval` | Show the approval gates currently in use |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
-| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
+| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
+| `/highlight <on\|off>` | Band your own messages in the transcript, or don't. Bare `/highlight` shows the current setting |
 | `/session title <new title>` | Rename this session. Bare `/session` (or `/session title`) shows its current name |
 | `/send`, `/discard` | Answer the `$` command box — the same as `Ctrl-S` and `Ctrl-D`. Typed forms exist because terminals claim chords: Zed's takes `Ctrl-S` |
 | `/allow`, `/deny` | Answer a tool approval — the same as `Ctrl-Y` and `Ctrl-N`. Without a way to answer, a turn waits on a decision it can never be given |
@@ -492,7 +524,8 @@ the current one instead, repointing the session there — the same thing
 | `/approval` | Show the approval gates currently in use |
 | `/sandbox <on\|off>` | Confine the agent's file writes to the working directory, or allow them anywhere. Takes effect immediately, including partway through a running turn |
 | `/sandbox` | Show whether writes are currently confined |
-| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
+| `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, highlighting, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
+| `/highlight <on\|off>` | Band your own messages in the transcript, or don't. Bare `/highlight` shows the current setting |
 | `/session title <new title>` | Rename this session. Bare `/session` (or `/session title`) shows its current name |
 
 Only recognized commands are intercepted — including a *mistyped* one.
@@ -535,8 +568,11 @@ comms stream on
 List, inspect, or delete saved `session`/`tui` sessions.
 
 ```bash
-# List all saved sessions (id prefix, kind, model, title)
+# List all saved sessions (id prefix, kind, state, model, title)
 comms sessions list
+#   a1b2c3d4  [agent]  working   openrouter/auto  Fix the Windows build
+#             run_terminal_command: cargo test --all
+#   b2c3d4e5  [ask]    replied   openrouter/auto  Notes on the picker
 
 # Show a session's full message history
 comms sessions show a1b2c3d4
@@ -544,6 +580,16 @@ comms sessions show a1b2c3d4
 # Delete a saved session
 comms sessions delete a1b2c3d4
 ```
+
+The state column is the same one the launch screen shows, from the same
+derivation: `working`, `approval`, `failed`, `stopped`, `replied`, `no reply`
+or `new`. A session waiting on an approval also prints what it is asking
+about on the line beneath. Without the TUI's launch screen this is the only
+way to see a session running in another terminal.
+
+The first three come from the process running the session, which is the only
+thing that knows them — a turn's messages are written when it *finishes*, so
+from storage alone a request in flight looks exactly like a turn that failed.
 
 ## Concepts
 
@@ -771,6 +817,8 @@ Configuration is stored at `~/.comms/config.json`:
   "extra_headers": {},
   "sandbox": true,
   "verbose": false,
+  "highlight": true,
+  "selection": true,
   "stream": true
 }
 ```
@@ -784,6 +832,8 @@ Configuration is stored at `~/.comms/config.json`:
 - `max_iterations` is managed via `comms max-iterations` and is the default for `session`/`agent` when `--max-iterations` isn't passed, and for `tui`, which has no flags at all. `null` (after `comms max-iterations --clear`) means agent mode has no cap until one is set somewhere — it does not fall back to 20.
 - `temperature` is managed via `comms temperature` and is the default for `ask`, `session`, and `agent` when `--temperature` isn't passed, and for `tui`, which has no flags at all. `null` (after `comms temperature --clear`) means requests are sent with no `temperature` field at all — it does not fall back to 0.7.
 - `verbose` is managed via `comms verbose` and is the value new sessions start with; `/verbose` changes the session you're in, not this.
+- `highlight` is managed via `comms highlight` and is the value new sessions start with for banding your own messages; `/highlight` changes the session you're in, not this.
+- `selection` is managed via `comms selection` and controls the band on the launch screen's selected row. Global only — that screen belongs to no session, so there is no per-session counterpart and no slash command.
 - `effort_level` is managed via `comms effort-level` and is sent for `ask`, `session`, and `agent` when set, shaped according to `effort_style`.
 - `effort_style` is managed via `comms effort-style` and controls whether the effort level is sent flat, nested, or omitted (see [`effort-style`](#effort-style-value)).
 - `extra_headers` is managed via `comms headers` and is merged into every API request.
@@ -818,7 +868,7 @@ Either way, every outgoing request from a session reads its own stored settings 
 
 Each session gets an id (a UUID) and a title derived from your first message (or one you choose up front, in the TUI). Use:
 
-- `comms sessions list` to see saved sessions (shown by 8-character id prefix, kind, model, and title)
+- `comms sessions list` to see saved sessions (shown by 8-character id prefix, kind, state, model, and title)
 - `comms sessions show <id>` to view a session's full transcript
 - `comms sessions delete <id>` to remove one
 - `comms session --resume <id>` to continue a saved session — works for one currently in ask mode or agent mode alike, since mode is just session state now, not a separate command

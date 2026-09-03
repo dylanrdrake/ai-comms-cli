@@ -60,6 +60,9 @@ pub enum Command {
     /// setting; the agent loop never sees it.
     /// Show full tool-call detail for this session, or stop.
     SetVerbose(bool),
+    /// Whether this session bands the user's own messages. A display
+    /// preference, recorded so a resume comes back looking the same.
+    SetHighlight(bool),
     /// Stream replies token-by-token for this session, or wait for the whole reply.
     SetStream(bool),
     /// Rename this session.
@@ -150,6 +153,9 @@ pub enum Event {
         effort_level: Option<String>,
     },
     /// Verbose tool detail was turned on or off.
+    HighlightChanged {
+        highlight: bool,
+    },
     VerboseChanged {
         verbose: bool,
     },
@@ -204,6 +210,7 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         Submission::SetEffort(effort_level) => Some(Command::SetEffort(effort_level.clone())),
         Submission::ResetEffort => Some(Command::ResetEffort),
         Submission::SetVerbose(verbose) => Some(Command::SetVerbose(*verbose)),
+        Submission::SetHighlight(highlight) => Some(Command::SetHighlight(*highlight)),
         Submission::SetStream(stream) => Some(Command::SetStream(*stream)),
         Submission::SetTitle(title) => Some(Command::SetTitle(title.clone())),
         Submission::SetSandbox(sandbox) => Some(Command::SetSandbox(*sandbox)),
@@ -228,6 +235,7 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         | Submission::ShowSandbox
         | Submission::ShowStatus
         | Submission::ShowVerbose
+        | Submission::ShowHighlight
         | Submission::ShowStream
         | Submission::ShowTitle
         | Submission::ShowTemperature
@@ -392,6 +400,7 @@ impl Worker {
                 Command::SetEffort(effort_level) => self.set_effort(effort_level),
                 Command::ResetEffort => self.reset_effort(),
                 Command::SetVerbose(verbose) => self.set_verbose(verbose),
+                Command::SetHighlight(highlight) => self.set_highlight(highlight),
                 Command::SetStream(stream) => self.set_stream(stream),
                 Command::SetTitle(title) => self.rename(title),
                 Command::SetSandbox(sandbox) => self.set_sandbox(sandbox),
@@ -576,6 +585,7 @@ impl Worker {
                         Some(Command::SetEffort(effort_level)) => self.set_effort(effort_level),
                         Some(Command::ResetEffort) => self.reset_effort(),
                         Some(Command::SetVerbose(verbose)) => self.set_verbose(verbose),
+                        Some(Command::SetHighlight(highlight)) => self.set_highlight(highlight),
                         Some(Command::SetStream(stream)) => self.set_stream(stream),
                         Some(Command::SetTitle(title)) => self.rename(title),
                         // Like approval, this reaches the running turn: it
@@ -742,6 +752,17 @@ impl Worker {
         }
         let _ = self.events.send(Event::VerboseChanged {
             verbose: self.session.verbose(),
+        });
+    }
+
+    fn set_highlight(&mut self, highlight: bool) {
+        if let Err(e) = self.session.set_highlight(highlight) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to switch highlighting: {e}"),
+            }));
+        }
+        let _ = self.events.send(Event::HighlightChanged {
+            highlight: self.session.highlight(),
         });
     }
 

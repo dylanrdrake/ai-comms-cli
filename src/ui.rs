@@ -120,6 +120,10 @@ pub enum Submission {
     /// terminal or multiplexer that has claimed those chords.
     SendShell,
     DiscardShell,
+    /// `/highlight <on|off>` — whether this session bands your own messages.
+    SetHighlight(bool),
+    /// Prints it without changing it.
+    ShowHighlight,
     /// Answer a tool approval. Typed forms of `Ctrl-Y`/`Ctrl-N`, and not
     /// optional: where those chords are intercepted — Zed's terminal claims
     /// several — an approval would otherwise be unanswerable and the turn
@@ -219,6 +223,7 @@ pub struct SessionSettings<'a> {
     pub temperature: Option<f32>,
     pub max_iterations: Option<usize>,
     pub verbose: bool,
+    pub highlight: bool,
     pub sandbox: bool,
     pub stream: bool,
     pub working_dir: Option<&'a str>,
@@ -269,6 +274,7 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
         ),
         ("Sandbox".to_string(), on_off(settings.sandbox)),
         ("Verbose".to_string(), on_off(settings.verbose)),
+        ("Highlight".to_string(), on_off(settings.highlight)),
         ("Streaming".to_string(), on_off(settings.stream)),
         (
             "Directory".to_string(),
@@ -338,6 +344,13 @@ pub fn verbose_notice(verbose: bool, changed: bool) -> String {
 /// How the temperature reads back to the user. `None` is a real value —
 /// requests go out with no temperature field — so it says that rather than
 /// showing a blank.
+/// How the message band reads back to the user.
+pub fn highlight_notice(highlight: bool, changed: bool) -> String {
+    let verb = if changed { "is now" } else { "is" };
+    let state = if highlight { "on" } else { "off" };
+    format!("Message highlighting {verb} {state}")
+}
+
 pub fn temperature_notice(temperature: Option<f32>, changed: bool) -> String {
     let verb = if changed { "set to" } else { "is" };
     match temperature {
@@ -384,6 +397,16 @@ pub fn classify(text: &str) -> Submission {
         _ => {}
     }
 
+    if let Some(rest) = trimmed.strip_prefix("/highlight") {
+        if rest.trim().is_empty() {
+            return Submission::ShowHighlight;
+        }
+    }
+    if let Some(value) = argument(trimmed, "/highlight") {
+        if let Ok(enabled) = parse_bool(value) {
+            return Submission::SetHighlight(enabled);
+        }
+    }
     if bare_command(trimmed, "/allow") {
         return Submission::AllowTool;
     }
@@ -592,7 +615,7 @@ fn command_word(trimmed: &str) -> Option<&str> {
 /// Every command word [`classify`] knows, for spotting a near miss. The four
 /// that always parse are here too: `/mdoel` should still be caught as a
 /// typo for `/model` even though `/model` itself can't be invoked wrongly.
-const KNOWN_COMMANDS: [&str; 18] = [
+const KNOWN_COMMANDS: [&str; 19] = [
     "model",
     "agent",
     "ask",
@@ -610,6 +633,7 @@ const KNOWN_COMMANDS: [&str; 18] = [
     "allow",
     "deny",
     "back",
+    "highlight",
     "verbose",
 ];
 
@@ -703,6 +727,7 @@ fn command_usage(word: &str) -> Option<String> {
         "temperature" | "temp" => {
             format!("/{word} <n> | clear | default (n must be 0 or greater)")
         }
+        "highlight" => format!("/{word} <on|off>"),
         "approval" => format!("/{word} <read|write|terminal|all> <on|off>"),
         "sandbox" | "verbose" | "stream" => format!("/{word} <on|off>"),
         // Takes no argument at all, so anything after it is a mistake.
@@ -840,6 +865,18 @@ pub trait AgentUi {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn classify_recognizes_highlight() {
+        assert_eq!(classify("/highlight on"), Submission::SetHighlight(true));
+        assert_eq!(classify("/highlight off"), Submission::SetHighlight(false));
+        assert_eq!(classify("/highlight"), Submission::ShowHighlight);
+        // A bad value is a usage error, not a message reaching the model.
+        assert!(matches!(
+            classify("/highlight maybe"),
+            Submission::UnknownCommand(_)
+        ));
+    }
 
     #[test]
     fn a_leading_dollar_runs_a_command() {
@@ -1359,6 +1396,7 @@ mod tests {
             temperature: None,
             max_iterations: None,
             verbose: false,
+            highlight: true,
             sandbox: true,
             stream: true,
             working_dir: None,
@@ -1397,6 +1435,7 @@ mod tests {
             temperature: Some(0.7),
             max_iterations: Some(20),
             verbose: true,
+            highlight: true,
             sandbox: false,
             stream: false,
             working_dir: Some("/home/dev/project"),

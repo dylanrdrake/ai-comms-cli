@@ -64,6 +64,11 @@ pub struct Context {
     /// The configured default for showing full tool-call detail, taken as
     /// this session's starting value.
     pub verbose: bool,
+    /// The configured default for banding your own messages, same deal.
+    pub highlight: bool,
+    /// Whether the launch screen bands its selected row. Global only — the
+    /// launch screen belongs to no session, so there is nothing to override.
+    pub selection: bool,
     /// The configured default for streaming replies, same deal.
     pub stream: bool,
 }
@@ -146,6 +151,7 @@ fn open_new(context: &Context, agentic: bool, title: String) -> Result<Chat> {
         context.approval.clone(),
         context.sandbox,
         context.verbose,
+        context.highlight,
         context.stream,
         std::env::current_dir()
             .ok()
@@ -249,6 +255,7 @@ fn start_chat(
     );
     app.agentic = agentic;
     app.verbose = session.verbose();
+    app.highlight = session.highlight();
     app.max_iterations = session.max_iterations();
     app.temperature = session.temperature();
     app.approval = session.approval().clone();
@@ -412,13 +419,14 @@ async fn next_conversation_event(screen: &mut Screen) -> Option<crate::conversat
     }
 }
 
-fn draw(terminal: &mut Tui, screen: &Screen, tick: usize) -> Result<()> {
+fn draw(terminal: &mut Tui, screen: &Screen, tick: usize, selection: bool) -> Result<()> {
     terminal.draw(|frame| match screen {
         Screen::Launch(p) => picker::draw(
             frame,
             p,
             "COMMS",
             current_dir().as_deref(),
+            selection,
             "↑/↓ move · Enter open · r rename · d delete · q quit",
             tick,
         ),
@@ -435,7 +443,7 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
     let mut tick = 0usize;
     let mut quit = false;
 
-    draw(terminal, screen, tick)?;
+    draw(terminal, screen, tick, context.selection)?;
 
     while !quit {
         let wake = tokio::select! {
@@ -503,7 +511,7 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
         }
 
         if dirty && !quit {
-            draw(terminal, screen, tick)?;
+            draw(terminal, screen, tick, context.selection)?;
         }
     }
 
@@ -829,12 +837,18 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                                         temperature: app.temperature,
                                         max_iterations: app.max_iterations,
                                         verbose: app.verbose,
+                                        highlight: app.highlight,
                                         sandbox: app.sandbox,
                                         stream: app.stream,
                                         working_dir: app.working_dir.as_deref(),
                                         approval: &approval,
                                     });
                                 app.transcript.push(TranscriptItem::SessionStatus(rows));
+                            }
+                            app::Submission::ShowHighlight => {
+                                app.transcript.push(TranscriptItem::Notice(
+                                    crate::ui::highlight_notice(app.highlight, false),
+                                ));
                             }
                             app::Submission::ShowVerbose => {
                                 app.transcript.push(TranscriptItem::Notice(
@@ -887,6 +901,7 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                             | app::Submission::SetEffort(_)
                             | app::Submission::ResetEffort
                             | app::Submission::SetVerbose(_)
+                            | app::Submission::SetHighlight(_)
                             | app::Submission::SetStream(_)
                             | app::Submission::SetTitle(_)
                             | app::Submission::SetSandbox(_)
@@ -949,6 +964,8 @@ mod tests {
             approval: ApprovalSettings::default(),
             sandbox: true,
             verbose: false,
+            highlight: true,
+            selection: true,
             stream: true,
         }
     }

@@ -109,6 +109,17 @@ pub struct Config {
     /// choice is remembered per session rather than changing this.
     #[serde(default)]
     pub verbose: bool,
+    /// Whether a session shows a band behind your own messages. A display
+    /// preference rather than a behaviour, so it changes nothing a turn
+    /// does — but it is per-session like `verbose`, because a session you
+    /// read back through and one you are working in want different amounts
+    /// of decoration.
+    #[serde(default = "default_true")]
+    pub highlight: bool,
+    /// Whether the launch screen bands its selected row. Global only: the
+    /// launch screen belongs to no session.
+    #[serde(default = "default_true")]
+    pub selection: bool,
     /// Whether the agent's file writes are confined to the working
     /// directory. On by default; turning it off lets its write tools touch
     /// any path the process can. Reads are never bounded either way — they
@@ -169,6 +180,8 @@ impl Default for Config {
             temperature: default_temperature(),
             sandbox: true,
             verbose: false,
+            highlight: true,
+            selection: true,
             effort_level: None,
             effort_style: default_effort_style(),
             extra_headers: HashMap::new(),

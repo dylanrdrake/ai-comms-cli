@@ -29,6 +29,7 @@ pub struct ChatSession {
     /// Whether this session's TUI view currently shows verbose tool detail.
     /// Purely a display setting — the agent loop never reads it.
     verbose: bool,
+    highlight: bool,
     /// This session's tool-calling iteration cap per turn, while in agent
     /// mode. Starts as a snapshot of the configured default (merged with any
     /// `--max-iterations` given at creation), mutable from inside it with
@@ -121,6 +122,7 @@ impl ChatSession {
         approval: ApprovalSettings,
         sandbox: bool,
         verbose: bool,
+        highlight: bool,
         stream: bool,
         working_dir: Option<String>,
     ) -> Result<Self> {
@@ -134,6 +136,7 @@ impl ChatSession {
             &approval,
             sandbox,
             verbose,
+            highlight,
             stream,
             working_dir.as_deref(),
         )?;
@@ -145,6 +148,7 @@ impl ChatSession {
             kind: kind.to_string(),
             effort_level,
             verbose,
+            highlight,
             max_iterations,
             temperature,
             approval,
@@ -194,6 +198,7 @@ impl ChatSession {
                 kind: summary.kind.clone(),
                 effort_level: summary.effort_level.clone(),
                 verbose: summary.verbose,
+                highlight: summary.highlight,
                 max_iterations: summary.max_iterations.map(|n| n as usize),
                 sandbox: summary.sandbox,
                 stream: summary.stream,
@@ -268,6 +273,21 @@ impl ChatSession {
     }
 
     /// Whether this session's TUI view currently shows verbose tool detail.
+    /// Whether this session bands your own messages.
+    pub fn highlight(&self) -> bool {
+        self.highlight
+    }
+
+    /// Switches it and records it, so a resume comes back the same.
+    pub fn set_highlight(&mut self, highlight: bool) -> Result<()> {
+        if self.highlight == highlight {
+            return Ok(());
+        }
+        store::set_session_highlight(&self.conn, &self.id, highlight)?;
+        self.highlight = highlight;
+        Ok(())
+    }
+
     pub fn verbose(&self) -> bool {
         self.verbose
     }
@@ -527,6 +547,20 @@ impl ChatSession {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn highlight_persists_so_a_later_resume_looks_the_same() {
+        let mut session = memory_session();
+        assert!(session.highlight(), "on unless the config said otherwise");
+
+        session.set_highlight(false).unwrap();
+        assert!(!session.highlight());
+
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert!(!summary.highlight, "recorded, not just held in memory");
+    }
     use super::*;
     use crate::store::KIND_CHAT;
 
@@ -544,6 +578,7 @@ mod tests {
                 kind            TEXT NOT NULL,
                 effort_level    TEXT,
                 verbose         INTEGER NOT NULL DEFAULT 0,
+                highlight       INTEGER NOT NULL DEFAULT 1,
                 max_iterations  INTEGER,
                 temperature     REAL,
                 approval_read      INTEGER NOT NULL DEFAULT 1,
@@ -587,6 +622,7 @@ mod tests {
             ApprovalSettings::default(),
             true,
             false,
+            true,
             true,
             None,
         )
@@ -805,6 +841,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             dir.map(str::to_string),
         )
         .unwrap()
@@ -877,6 +914,7 @@ mod tests {
             Some(20),
             Some(0.7),
             ApprovalSettings::default(),
+            true,
             true,
             true,
             true,

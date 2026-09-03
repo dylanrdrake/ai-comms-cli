@@ -45,6 +45,8 @@ pub struct SessionSummary {
     pub effort_level: Option<String>,
     /// Whether this session's TUI view currently shows verbose tool detail.
     pub verbose: bool,
+    /// Whether this session bands your own messages — see `Config::highlight`.
+    pub highlight: bool,
     /// The max tool-calling iterations per turn this session is currently
     /// set to. Starts as a snapshot of the configured default taken when it
     /// was created, mutable from inside it with `/max-iterations <n>`.
@@ -108,6 +110,7 @@ pub fn open_db() -> Result<Connection> {
             kind            TEXT NOT NULL,
             effort_level    TEXT,
             verbose         INTEGER NOT NULL DEFAULT 0,
+            highlight       INTEGER NOT NULL DEFAULT 1,
             max_iterations  INTEGER,
             temperature     REAL,
             approval_read      INTEGER NOT NULL DEFAULT 1,
@@ -180,6 +183,10 @@ pub fn open_db() -> Result<Connection> {
     // `Config::sandbox`. Defaults on, so a session written before this
     // existed comes back confined rather than unbounded.
     ensure_column(&conn, "sessions", "sandbox", "INTEGER NOT NULL DEFAULT 1")?;
+    // Whether your own messages get a band behind them. On by default, so a
+    // session written before this existed comes back looking like a new one
+    // rather than subtly plainer.
+    ensure_column(&conn, "sessions", "highlight", "INTEGER NOT NULL DEFAULT 1")?;
     // Whether replies stream token-by-token, per session — see
     // `Config::stream` for the configured default this snapshots.
     ensure_column(&conn, "sessions", "stream", "INTEGER NOT NULL DEFAULT 1")?;
@@ -247,6 +254,7 @@ pub fn create_session(
     approval: &ApprovalSettings,
     sandbox: bool,
     verbose: bool,
+    highlight: bool,
     stream: bool,
     working_dir: Option<&str>,
 ) -> Result<String> {
@@ -255,7 +263,7 @@ pub fn create_session(
     let title = crypto::encrypt("Untitled")?;
 
     conn.execute(
-        "INSERT INTO sessions (id, title, model, kind, effort_level, max_iterations, temperature, approval_read, approval_write, approval_terminal, sandbox, verbose, stream, working_dir, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
+        "INSERT INTO sessions (id, title, model, kind, effort_level, max_iterations, temperature, approval_read, approval_write, approval_terminal, sandbox, verbose, highlight, stream, working_dir, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
         params![
             id,
             title,
@@ -269,6 +277,7 @@ pub fn create_session(
             approval.terminal,
             sandbox,
             verbose,
+            highlight,
             stream,
             working_dir,
             ts
@@ -325,6 +334,16 @@ pub fn set_session_effort_level(
 }
 
 /// Records a `/verbose`-style toggle for this session's TUI view.
+/// Records a `/highlight`-style override for whether this session bands your
+/// own messages.
+pub fn set_session_highlight(conn: &Connection, session_id: &str, highlight: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET highlight = ?1 WHERE id = ?2",
+        params![highlight, session_id],
+    )?;
+    Ok(())
+}
+
 pub fn set_session_verbose(conn: &Connection, session_id: &str, verbose: bool) -> Result<()> {
     conn.execute(
         "UPDATE sessions SET verbose = ?1 WHERE id = ?2",
@@ -511,6 +530,57 @@ impl Activity {
     }
 }
 
+/// What a session row reports, whichever source can answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastState {
+    /// A request is in flight right now.
+    Working,
+    /// Blocked on an approval nobody has answered.
+    AwaitingApproval,
+    /// The last turn ended in an error.
+    Failed,
+    /// Created, never used.
+    New,
+    /// The model answered. A turn that ran to completion.
+    Replied,
+    /// A message was sent and nothing came back — the turn is either running
+    /// somewhere right now or it ended badly. Nothing on disk tells the two
+    /// apart, because a turn's messages are only written when it finishes.
+    NoReply,
+    /// It stopped part-way through working: after a tool result with no
+    /// answer after it, or on a tool call that never ran.
+    Interrupted,
+}
+
+/// What a session's row should say it is doing.
+///
+/// The first three come from the process running it, which is the only thing
+/// that knows them: a turn's messages are only written when it *finishes*,
+/// so from storage alone a request in flight looks exactly like a turn that
+/// failed. The rest are read from the messages, and are what a session
+/// nobody is running can still tell you.
+///
+/// Shared so the launch screen and `comms sessions list` cannot come to
+/// disagree about what a session is doing.
+pub fn last_state(activity: Option<Activity>, last: Option<&LastMessage>) -> LastState {
+    match activity {
+        Some(Activity::Working) => return LastState::Working,
+        Some(Activity::AwaitingApproval) => return LastState::AwaitingApproval,
+        Some(Activity::Failed) => return LastState::Failed,
+        None => {}
+    }
+    let Some(last) = last else {
+        return LastState::New;
+    };
+    match last.role.as_str() {
+        "assistant" if last.has_tool_calls => LastState::Interrupted,
+        "assistant" => LastState::Replied,
+        "tool" => LastState::Interrupted,
+        // A user message with nothing after it.
+        _ => LastState::NoReply,
+    }
+}
+
 /// Records what a session's process is doing, or clears it with `None`.
 ///
 /// `detail` is the one line worth showing alongside it — for an approval,
@@ -622,7 +692,7 @@ fn message_preview(content: Option<&str>, tool_calls: Option<&str>) -> String {
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight \
          FROM sessions ORDER BY updated_at DESC",
     )?;
 
@@ -648,6 +718,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
             activity_detail: row.get(15)?,
             created_at: row.get(16)?,
             updated_at: row.get(17)?,
+            highlight: row.get(18)?,
         })
     })?;
 
@@ -665,7 +736,7 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
 pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight \
          FROM sessions WHERE id = ?1 OR id LIKE ?2",
     )?;
 
@@ -695,6 +766,7 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
             activity_detail: row.get(15)?,
             created_at: row.get(16)?,
             updated_at: row.get(17)?,
+            highlight: row.get(18)?,
         }))
     } else {
         Ok(None)
@@ -791,6 +863,53 @@ pub fn session_exists(conn: &Connection, session_id: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn last_state_prefers_what_the_running_process_says() {
+        let replied = LastMessage {
+            role: "assistant".to_string(),
+            has_tool_calls: false,
+            preview: "done".to_string(),
+        };
+        // The process knows things the messages can't say — a turn's
+        // messages are only written when it finishes.
+        assert_eq!(
+            last_state(Some(Activity::Working), Some(&replied)),
+            LastState::Working
+        );
+        assert_eq!(
+            last_state(Some(Activity::AwaitingApproval), None),
+            LastState::AwaitingApproval
+        );
+        assert_eq!(last_state(Some(Activity::Failed), None), LastState::Failed);
+    }
+
+    #[test]
+    fn last_state_falls_back_to_the_messages() {
+        let of = |role: &str, tools: bool| LastMessage {
+            role: role.to_string(),
+            has_tool_calls: tools,
+            preview: String::new(),
+        };
+        assert_eq!(last_state(None, None), LastState::New);
+        assert_eq!(
+            last_state(None, Some(&of("assistant", false))),
+            LastState::Replied
+        );
+        // Asked for a tool and nothing came back after it.
+        assert_eq!(
+            last_state(None, Some(&of("assistant", true))),
+            LastState::Interrupted
+        );
+        assert_eq!(
+            last_state(None, Some(&of("tool", false))),
+            LastState::Interrupted
+        );
+        assert_eq!(
+            last_state(None, Some(&of("user", false))),
+            LastState::NoReply
+        );
+    }
     use super::*;
     use crate::client::{function_call_type, FunctionCall};
 
@@ -806,6 +925,7 @@ mod tests {
                 kind            TEXT NOT NULL,
                 effort_level    TEXT,
                 verbose         INTEGER NOT NULL DEFAULT 0,
+                highlight       INTEGER NOT NULL DEFAULT 1,
                 max_iterations  INTEGER,
                 temperature     REAL,
                 approval_read      INTEGER NOT NULL DEFAULT 1,
@@ -893,6 +1013,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             None,
         )
         .unwrap();
@@ -939,6 +1060,7 @@ mod tests {
             &ApprovalSettings::default(),
             true,
             false,
+            true,
             true,
             None,
         )
@@ -1005,6 +1127,7 @@ mod tests {
                 true,
                 false,
                 true,
+                true,
                 None,
             )
             .unwrap()
@@ -1066,6 +1189,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             None,
         )
         .unwrap();
@@ -1114,6 +1238,7 @@ mod tests {
                 &ApprovalSettings::default(),
                 true,
                 false,
+                true,
                 true,
                 None,
             )
@@ -1178,6 +1303,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             None,
         )
         .unwrap();
@@ -1213,6 +1339,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             None,
         )
         .unwrap();
@@ -1227,6 +1354,7 @@ mod tests {
             &ApprovalSettings::default(),
             true,
             false,
+            true,
             true,
             None,
         )
@@ -1252,6 +1380,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             None,
         )
         .unwrap();
@@ -1274,6 +1403,7 @@ mod tests {
             &ApprovalSettings::default(),
             true,
             false,
+            true,
             true,
             None,
         )
@@ -1303,6 +1433,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             None,
         )
         .unwrap();
@@ -1331,6 +1462,7 @@ mod tests {
             &ApprovalSettings::default(),
             true,
             false,
+            true,
             true,
             None,
         )
@@ -1363,6 +1495,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             None,
         )
         .unwrap();
@@ -1387,6 +1520,7 @@ mod tests {
             &ApprovalSettings::default(),
             true,
             false,
+            true,
             true,
             None,
         )
@@ -1419,6 +1553,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             None,
         )
         .unwrap();
@@ -1447,6 +1582,7 @@ mod tests {
             true,
             false,
             true,
+            true,
             None,
         )
         .unwrap();
@@ -1474,6 +1610,7 @@ mod tests {
             &ApprovalSettings::default(),
             true,
             false,
+            true,
             true,
             None,
         )

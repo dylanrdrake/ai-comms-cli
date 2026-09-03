@@ -238,7 +238,7 @@ everything in one `comms agent` call.
 
 ```bash
 comms sessions list
-#   a1b2c3d4  [agent]  openrouter/auto  Create a Cargo project for a CLI todo app...
+#   a1b2c3d4  [agent]  replied   openrouter/auto  Create a Cargo project for a CLI todo app...
 
 comms session --resume a1b2c3d4
 # prints the prior transcript, then drops you back into the prompt

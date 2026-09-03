@@ -401,10 +401,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
                 // having to read them. Padded to the full width first: a
                 // background only paints the cells a line actually covers,
                 // so an unpadded one would end raggedly at the text.
-                for line in &mut lines[start..] {
-                    pad_to(line, area.width as usize);
-                    line.style = line.style.patch(band());
-                }
+                highlight_rows(&mut lines[start..], area.width as usize, app.highlight);
                 lines.push(Line::raw(""));
             }
             TranscriptItem::Shell {
@@ -979,28 +976,69 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
 /// heavy bar on a light theme, which is the opposite of subtle.
 static BAND: std::sync::OnceLock<Style> = std::sync::OnceLock::new();
 
-/// Asks the terminal what colour it is, once, and remembers the answer.
+/// Asks the terminal what colour it actually is, once, and remembers the
+/// band derived from it.
 ///
 /// Must run before the alternate screen is entered: the query writes an
 /// escape sequence and reads the reply, and doing that mid-draw would race
-/// the renderer for the terminal. Terminals that don't answer fall back to
-/// dark, which is the safer guess for a tool that lives in one.
+/// the renderer for the terminal.
 pub(super) fn detect_band() {
-    use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
-    let light = matches!(theme_mode(QueryOptions::default()), Ok(ThemeMode::Light));
-    let _ = BAND.set(band_for(light));
+    use terminal_colorsaurus::{background_color, QueryOptions};
+    if let Ok(background) = background_color(QueryOptions::default()) {
+        let _ = BAND.set(band_for(
+            background.perceived_lightness(),
+            (
+                scale(background.r),
+                scale(background.g),
+                scale(background.b),
+            ),
+        ));
+    }
 }
 
-/// The band for a known theme. Split from the query so the choice can be
-/// tested both ways — the query itself answers whatever terminal the test
-/// happens to run under, which is no test at all.
-fn band_for(light: bool) -> Style {
-    Style::new().bg(Color::Indexed(if light { 254 } else { 236 }))
+/// The reply gives 16 bits per channel; a terminal colour takes 8.
+fn scale(channel: u16) -> u8 {
+    (channel >> 8) as u8
 }
 
-/// The band, dark until [`detect_band`] has said otherwise.
+/// A band a fixed step off the terminal's own background, in the direction
+/// that keeps it subtle: lighter on a dark terminal, darker on a light one.
+///
+/// Derived from the real background rather than named as a palette slot.
+/// `Indexed(234)` is only #1c1c1c on a terminal that hasn't remapped its
+/// palette, and themes remap it — which is how a light theme ended up
+/// showing a near-black band. An RGB value is the colour we asked for.
+fn band_for(lightness: f32, (r, g, b): (u8, u8, u8)) -> Style {
+    // Small enough to read as a tint of the background rather than a bar
+    // drawn over it.
+    const STEP: i16 = 14;
+    let step = if lightness < 0.5 { STEP } else { -STEP };
+    let shift = |channel: u8| (channel as i16 + step).clamp(0, 255) as u8;
+    Style::new().bg(Color::Rgb(shift(r), shift(g), shift(b)))
+}
+
+/// The band, or no band at all when the terminal never said what colour it
+/// is. Guessing is what produced a near-black bar on a light theme, and a
+/// missing highlight is a far smaller failure than a wrong one — the
+/// selection still has its marker and its bold.
 pub(super) fn band() -> Style {
-    *BAND.get_or_init(|| Style::new().bg(Color::Indexed(236)))
+    BAND.get().copied().unwrap_or_default()
+}
+
+/// Puts the band behind a block of rows, when the session asks for one.
+///
+/// Padding and tinting together: a background only paints the cells a line
+/// covers, so the two always go with each other. Split out so the `off` case
+/// is testable — under test no terminal has answered, and with no band both
+/// paths would otherwise look identical.
+pub(super) fn highlight_rows(rows: &mut [Line<'static>], width: usize, on: bool) {
+    if !on {
+        return;
+    }
+    for line in rows {
+        pad_to(line, width);
+        line.style = line.style.patch(band());
+    }
 }
 
 /// Fills a line out to `width` so a background paints the whole row rather
@@ -1205,56 +1243,88 @@ fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 mod tests {
 
     #[test]
-    fn the_band_steps_the_right_way_for_each_theme() {
-        // A fixed dark band reads as a heavy bar on a light theme, which is
-        // the opposite of subtle — so the two must differ, and each must sit
-        // on its own side of mid-grey.
-        let (dark, light) = (band_for(false), band_for(true));
-        assert_ne!(dark.bg, light.bg);
+    fn highlighting_off_leaves_the_rows_alone() {
+        // Observable through the padding rather than the colour: with no
+        // terminal to answer the query there is no band under test, so the
+        // tint alone would make both paths look the same.
+        let width =
+            |line: &Line| -> usize { line.spans.iter().map(|s| s.content.chars().count()).sum() };
 
-        let shade = |style: Style| match style.bg {
-            Some(Color::Indexed(n)) => n,
-            other => panic!("expected an indexed background, got {other:?}"),
-        };
-        assert!(shade(dark) < 240, "dark theme wants a darker band");
-        assert!(shade(light) > 240, "light theme wants a lighter one");
+        let mut off = [Line::from(vec![Span::raw("short")])];
+        highlight_rows(&mut off, 40, false);
+        assert_eq!(width(&off[0]), 5, "untouched");
+
+        let mut on = [Line::from(vec![Span::raw("short")])];
+        highlight_rows(&mut on, 40, true);
+        assert_eq!(width(&on[0]), 40, "padded so the band covers the row");
+    }
+
+    fn rgb(style: Style) -> (u8, u8, u8) {
+        match style.bg {
+            Some(Color::Rgb(r, g, b)) => (r, g, b),
+            other => panic!("expected an RGB background, got {other:?}"),
+        }
     }
 
     #[test]
-    fn the_band_is_remembered_rather_than_re_queried() {
-        // It is asked once, before the alternate screen: querying mid-draw
-        // would race the renderer for the terminal.
-        assert_eq!(band().bg, band().bg);
-        assert!(band().bg.is_some());
+    fn the_band_steps_off_the_terminals_own_background() {
+        // Not a named palette slot: themes remap those, which is how a light
+        // theme came to show a near-black band.
+        let dark_bg = (0x1e, 0x1e, 0x2e);
+        let (r, g, b) = rgb(band_for(0.1, dark_bg));
+        assert!(
+            r > dark_bg.0 && g > dark_bg.1 && b > dark_bg.2,
+            "lift a dark one"
+        );
+        // A tint of the background, keeping its hue — not neutral grey over
+        // a coloured terminal, which reads as a smudge.
+        assert!(b > r, "the background's blue cast survives");
+
+        let light_bg = (0xfa, 0xfa, 0xf8);
+        let (r, g, b) = rgb(band_for(0.9, light_bg));
+        assert!(
+            r < light_bg.0 && g < light_bg.1 && b < light_bg.2,
+            "darken a light one"
+        );
     }
 
     #[test]
-    fn a_user_message_carries_a_band_across_the_whole_row() {
-        let mut app = App::new("m".to_string(), None, "id".to_string());
-        app.transcript
-            .push(TranscriptItem::User("short".to_string()));
+    fn the_step_stays_inside_the_channel_range() {
+        // Pure black and pure white are the ends a naive add or subtract
+        // would run off.
+        let _ = rgb(band_for(0.0, (0, 0, 0)));
+        let _ = rgb(band_for(1.0, (255, 255, 255)));
+    }
 
-        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        terminal.draw(|f| draw(f, &app, 0)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
+    #[test]
+    fn no_band_at_all_when_the_terminal_never_answered() {
+        // The default in tests, where nothing queried anything: a missing
+        // highlight beats a guessed one that fights the theme.
+        assert_eq!(band(), Style::default());
+        assert!(band().bg.is_none());
+    }
 
-        let row = (0..buffer.area.height)
-            .find(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer[(x, *y)].symbol().to_string())
-                    .collect::<String>()
-                    .contains("short")
-            })
-            .expect("user message shown");
+    #[test]
+    fn a_highlighted_row_is_padded_to_the_full_width() {
+        // The band is a background, and a background only paints the cells a
+        // line actually covers — so without this an unpadded row would end
+        // raggedly at its text. Tested here rather than against a rendered
+        // buffer because no band exists until a terminal answers, which it
+        // never does under test.
+        let mut line = Line::from(vec![Span::raw("short")]);
+        pad_to(&mut line, 40);
+        let width: usize = line
+            .spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum();
+        assert_eq!(width, 40);
 
-        // Past the end of the text, not just under it: an unpadded band
-        // would stop at "short" and look like a rendering fault.
-        let far = buffer[(35, row)].style();
-        assert_eq!(far.bg, band().bg, "band should reach the edge");
-
-        // ...and the reply gutter is left alone, so the two are told apart.
-        let elsewhere = buffer[(35, row + 1)].style();
-        assert_ne!(elsewhere.bg, band().bg);
+        // Already wider than the target: left alone rather than truncated,
+        // since cutting a row to fit would lose text.
+        let mut wide = Line::from(vec![Span::raw("x".repeat(50))]);
+        pad_to(&mut wide, 40);
+        assert_eq!(wide.spans.len(), 1);
     }
     #[test]
     fn a_mark_is_two_cells_of_braille_and_the_same_every_time() {

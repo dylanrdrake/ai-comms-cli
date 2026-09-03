@@ -10,7 +10,9 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
-* subtly differentiate user message blocks in the transcript. can be a slight highlight/background color difference. and the current selected row in the pickr screen
+* how to handle $'s that need an answer to std in
+* what happens if you --resume an 'elsewhere' session then ctrl-c? Where does your terminal land to?
+* add a comms ask with no "" text and it immediately asks for input from the user and asks with that input
 * if `$` gets reverted, keep the stdin fix in tools.rs. `run_terminal_command`
   never set stdin, so the child inherited this process's — for the TUI, a
   terminal in raw mode the event loop is already reading. Any command wanting
