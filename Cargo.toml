@@ -42,6 +42,11 @@ tui-markdown = "0.3.9"
 # tables and malformed markup survive the conversion — the point of the
 # tool is handing the model prose instead of a page of markup.
 html2text = "0.17.1"
+# Asks the terminal whether it's light or dark, via OSC 11, so the
+# selection band is a shade darker on a dark theme and lighter on a light
+# one. COLORFGBG is unset on most modern terminals, which is why this
+# needs a real query rather than an environment variable.
+terminal-colorsaurus = "1.0.3"
 
 [profile.release]
 opt-level = 3

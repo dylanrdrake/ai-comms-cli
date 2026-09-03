@@ -1,6 +1,6 @@
 //! Drawing the TUI. Pure presentation over [`App`] — no state changes here.
 
-use super::app::{App, ToolStatus, TranscriptItem};
+use super::app::{App, ShellState, ToolStatus, TranscriptItem};
 use crate::ui::{json_fields, summarize, tool_call_fields, ApprovalRequest};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -13,6 +13,74 @@ pub(super) const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴",
 /// Most rows the message box will grow to before it scrolls internally,
 /// so a long paste can't squeeze the conversation off the screen.
 const MAX_INPUT_ROWS: u16 = 10;
+
+/// Braille patterns of three to seven dots. Nothing emptier (a mark with a
+/// blank half reads as a rendering fault) and nothing solid (every solid
+/// half looks like every other one).
+const MARK_PATTERNS: [u8; 218] = {
+    let mut patterns = [0u8; 218];
+    let (mut bits, mut found) = (0usize, 0usize);
+    while bits < 256 {
+        let dots = (bits as u8).count_ones();
+        if dots >= 3 && dots <= 7 {
+            patterns[found] = bits as u8;
+            found += 1;
+        }
+        bits += 1;
+    }
+    patterns
+};
+
+/// Mid-tone 256-colour indices: saturated enough to tell apart, dark enough
+/// to read on a light terminal and light enough to read on a dark one. The
+/// mark draws on whatever background the row has, so the palette can't lean
+/// on one being behind it. Deliberately clear of the colours that carry
+/// meaning here — the cyan and yellow of the mode column, and the badge
+/// colours for state.
+const IDENTICON_FG: [u8; 12] = [33, 30, 70, 61, 96, 100, 130, 133, 136, 166, 172, 25];
+
+/// A path with the home directory shown as `~`, so the column stays
+/// readable on the long paths most projects have.
+pub(super) fn home_relative(dir: &str) -> String {
+    let Some(home) = home::home_dir() else {
+        return dir.to_string();
+    };
+    let home = home.display().to_string();
+    match dir.strip_prefix(&home) {
+        Some(rest) => format!("~{rest}"),
+        None => dir.to_string(),
+    }
+}
+
+/// A mark: a square of braille dots derived from `seed`, and the same every
+/// time for the same seed.
+///
+/// It identifies nothing you can type — the id column was removed because
+/// nothing in the picker needs it. This is for recognition: a list that
+/// refreshes under you, with rows moving as sessions are touched, is easier
+/// to keep your place in when the row you were watching carries the same
+/// mark it had a moment ago.
+pub(super) fn identicon(seed: &str) -> (String, Style) {
+    // FNV-1a, 64-bit: the mark has to be identical in every process that
+    // draws this session, so it can come from nothing but the id, and the
+    // wider hash leaves room to slice a half, a half and a colour out of
+    // independent bits.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    let half = |bits: u64| {
+        let pattern = MARK_PATTERNS[bits as usize % MARK_PATTERNS.len()];
+        char::from_u32(0x2800 + u32::from(pattern)).unwrap_or('?')
+    };
+    let fg = IDENTICON_FG[(hash >> 24) as usize % IDENTICON_FG.len()];
+
+    (
+        format!("{}{}", half(hash), half(hash >> 12)),
+        Style::new().fg(Color::Indexed(fg)),
+    )
+}
 
 pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
     // The message box grows with what's been typed into it, and with nothing
@@ -30,6 +98,10 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
         Some(request) => approval_height(request, frame.area().width),
         None => 0,
     };
+    let shell_rows = match &app.pending_shell {
+        Some(shell) => shell_height(shell, frame.area().width),
+        None => 0,
+    };
 
     let input_rows = content_rows
         .clamp(1, MAX_INPUT_ROWS)
@@ -41,7 +113,7 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
             frame
                 .area()
                 .height
-                .saturating_sub(7 + pending_rows + approval_rows)
+                .saturating_sub(7 + pending_rows + approval_rows + shell_rows)
                 .max(1),
         );
 
@@ -50,6 +122,7 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
         Constraint::Length(1),              // rule
         Constraint::Min(1),                 // chat history
         Constraint::Length(approval_rows),  // a tool waiting on a decision
+        Constraint::Length(shell_rows),     // a $ command, running or waiting
         Constraint::Length(pending_rows),   // messages waiting, if any
         Constraint::Length(input_rows + 2), // message prompt, bordered, plus its borders
         Constraint::Length(1),              // settings: ask/agent, model, effort, temp, verbose
@@ -63,12 +136,15 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
     if let Some(request) = &app.pending_approval {
         draw_approval(frame, areas[3], request);
     }
-    if pending_rows > 0 {
-        draw_pending(frame, areas[4], app);
+    if let Some(shell) = &app.pending_shell {
+        draw_shell(frame, areas[4], shell, tick);
     }
-    draw_input(frame, areas[5], app, scrolled);
-    draw_settings(frame, areas[6], app, tick);
-    draw_keybindings(frame, areas[7], app);
+    if pending_rows > 0 {
+        draw_pending(frame, areas[5], app);
+    }
+    draw_input(frame, areas[6], app, scrolled);
+    draw_settings(frame, areas[7], app, tick);
+    draw_keybindings(frame, areas[8], app);
 }
 
 /// The blank row between the transcript and the approval box, matching the
@@ -113,6 +189,93 @@ fn pending_height(waiting: usize) -> u16 {
 
 /// The blank row between the transcript and the box.
 const PENDING_GAP: u16 = 1;
+
+/// How tall the `$` box is: the command line, its output once there is any,
+/// and the borders. Capped the same way the approval box is.
+fn shell_height(shell: &ShellState, width: u16) -> u16 {
+    let inner = width.saturating_sub(2).max(1);
+    let output_rows = match shell {
+        // The command line is all there is until it finishes.
+        ShellState::Running { .. } => 0,
+        ShellState::Finished { output, .. } => Paragraph::new(output.trim_end().to_string())
+            .wrap(Wrap { trim: false })
+            .line_count(inner) as u16,
+    };
+    (1 + output_rows).clamp(1, MAX_APPROVAL_ROWS) + 2 + APPROVAL_GAP
+}
+
+/// A command the user ran with `$`: the command itself on the first line,
+/// spinning while it runs, then its output beneath — the shape a terminal
+/// would show it in. The border carries only the keys that decide whether
+/// the model sees it, since that is the part you act on.
+///
+/// Green against the approval box's yellow. The prompt marker is already
+/// green, so green reads as "yours" where yellow reads as "the agent is
+/// asking" — which matters because both boxes can be on screen at once.
+fn draw_shell(frame: &mut Frame, area: Rect, shell: &ShellState, tick: usize) {
+    let green = Style::new().green();
+    let (title, mut lines) = match shell {
+        ShellState::Running { command } => (
+            String::new(),
+            vec![Line::from(vec![
+                Span::styled("$ ", green.bold()),
+                Span::styled(command.clone(), green),
+                Span::styled(
+                    format!(" {}", FRAMES[tick % FRAMES.len()]),
+                    Style::new().green(),
+                ),
+            ])],
+        ),
+        ShellState::Finished {
+            command,
+            output,
+            exit_code,
+        } => {
+            // Beside the command, not in the border: the border says what
+            // you can do about the output, and how the command ended belongs
+            // with the command.
+            let mut first = vec![
+                Span::styled("$ ", green.bold()),
+                Span::styled(command.clone(), green),
+            ];
+            if *exit_code != 0 {
+                first.push(Span::styled(
+                    format!("  exit {exit_code}"),
+                    Style::new().red(),
+                ));
+            }
+            let mut lines = vec![Line::from(first)];
+            match output.trim_end() {
+                "" => lines.push(Line::from(Span::styled(
+                    "(no output)",
+                    Style::new().dark_gray().italic(),
+                ))),
+                text => lines.extend(text.lines().map(|line| Line::raw(line.to_string()))),
+            }
+            (
+                " Ctrl-S send with next message · Ctrl-D discard ".to_string(),
+                lines,
+            )
+        }
+    };
+    lines.shrink_to_fit();
+
+    let box_area = Rect {
+        y: area.y + APPROVAL_GAP,
+        height: area.height.saturating_sub(APPROVAL_GAP),
+        ..area
+    };
+    let mut block = Block::default().borders(Borders::ALL).border_style(green);
+    if !title.is_empty() {
+        block = block.title(Span::styled(title, green.bold()));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(block),
+        box_area,
+    );
+}
 
 /// The messages typed while a turn is running, in the order they will be
 /// taken.
@@ -179,13 +342,17 @@ fn clip(text: &str, width: usize) -> String {
 
 /// The session's title, plain — no border, no "comms -" prefix.
 fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            app.title.clone(),
-            Style::new().bold(),
-        ))),
-        area,
-    );
+    let mut spans = vec![Span::styled(app.title.clone(), Style::new().bold())];
+    // Where this session runs, beside its name: it is the directory the
+    // agent's tools act in and the sandbox bounds, so it is worth being able
+    // to see without asking for `/status`.
+    if let Some(dir) = &app.working_dir {
+        spans.push(Span::styled(
+            format!("  {}", home_relative(dir)),
+            Style::new().dark_gray(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// A subtle full-width divider, standing in for the borders the screen used
@@ -221,6 +388,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
     for item in &app.transcript {
         match item {
             TranscriptItem::User(text) => {
+                let start = lines.len();
                 push_block(
                     &mut lines,
                     Span::styled("❯ ", Style::new().green().bold()),
@@ -228,28 +396,88 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
                     None,
                     content_width,
                 );
+                // A band behind what you said, so your own messages are
+                // findable while scrolling back through a long turn without
+                // having to read them. Padded to the full width first: a
+                // background only paints the cells a line actually covers,
+                // so an unpadded one would end raggedly at the text.
+                for line in &mut lines[start..] {
+                    pad_to(line, area.width as usize);
+                    line.style = line.style.patch(band());
+                }
+                lines.push(Line::raw(""));
+            }
+            TranscriptItem::Shell {
+                command,
+                output,
+                exit_code,
+                sent,
+            } => {
+                // Green like the user's own prompt marker: this is something
+                // you ran, not something the agent did.
+                lines.push(Line::from(vec![
+                    Span::styled("$ ", Style::new().green().bold()),
+                    Span::styled(command.clone(), Style::new().green()),
+                    // Sending adds the output to the conversation without
+                    // starting a turn, so that it arrives together with the
+                    // question you were going to ask about it. Said outright
+                    // because "sent" alone reads as "sent a message", and
+                    // then the absence of a reply looks like a fault.
+                    Span::styled(
+                        match (sent, exit_code) {
+                            (true, 0) => "  sent — goes with your next message".to_string(),
+                            (true, code) => {
+                                format!("  exit {code} · sent — goes with your next message")
+                            }
+                            (false, 0) => "  not sent".to_string(),
+                            (false, code) => format!("  exit {code} · not sent"),
+                        },
+                        Style::new().dark_gray().italic(),
+                    ),
+                ]));
+                if !output.trim().is_empty() {
+                    push_block(
+                        &mut lines,
+                        Span::raw("  "),
+                        output.trim_end(),
+                        None,
+                        content_width,
+                    );
+                }
                 lines.push(Line::raw(""));
             }
             TranscriptItem::Assistant {
                 text, streaming, ..
             } => {
-                // No model label — just a plain dot marking it as a reply,
-                // and the text.
-                let prefix = Span::styled("● ", Style::new().cyan());
+                // The session's own mark, the same one its row carries on the
+                // picker — so the conversation you are reading is tied to the
+                // one you picked, rather than the gutter saying nothing.
+                //
+                // Braille is also the only block where every pattern is East
+                // Asian Width Neutral. The `●` this replaces is Ambiguous —
+                // some terminals draw it two cells wide, which shifted the
+                // whole gutter against the wrapped lines beneath it.
+                let (glyph, mark_style) = identicon(&app.session_id);
+                let prefix = Span::styled(format!("{glyph} "), mark_style);
                 let cursor = streaming.then(|| Span::styled("▌", Style::new().cyan()));
                 if *streaming {
                     // Mid-stream the text is usually mid-construct — an
                     // unclosed fence or a half-written list — so render it
                     // plainly and let the finished message reformat once.
-                    push_block(&mut lines, prefix, text, cursor, content_width);
+                    push_block(&mut lines, prefix, text, cursor, content_width - 1);
                 } else {
                     push_rendered(
                         &mut lines,
                         prefix,
                         markdown_lines(text),
                         cursor,
-                        content_width,
-                        GUTTER_CONTINUATION,
+                        // The same treatment as the tool gutter: this one is
+                        // 3 columns (two braille cells and a space) where
+                        // `content_width` assumes 2, so wrap one narrower or
+                        // a full-width row overflows and gets wrapped again,
+                        // out from under the gutter.
+                        content_width.saturating_sub(1),
+                        SQUARE_CONTINUATION,
                     );
                 }
                 lines.push(Line::raw(""));
@@ -537,17 +765,16 @@ fn effort_style(effort_level: Option<&str>) -> Style {
 }
 
 /// A cool-to-hot gradient matching the word itself; unset stays the same
-/// dark_gray every other "no override" field uses. Pink rather than red at
-/// the top — red and orange read too similarly next to each other.
+/// dark_gray every other "no override" field uses. Red at the top, the same
+/// as `effort_style`'s highest band, so the two settings read alike.
 fn temperature_style(temperature: Option<f32>) -> Style {
     const ORANGE: Color = Color::Rgb(255, 140, 0);
-    const PINK: Color = Color::Rgb(255, 105, 180);
     match temperature {
         None => Style::new().dark_gray(),
         Some(t) if t < 0.5 => Style::new().cyan(),
         Some(t) if t < 1.0 => Style::new().yellow(),
         Some(t) if t < 1.5 => Style::new().fg(ORANGE),
-        Some(_) => Style::new().fg(PINK),
+        Some(_) => Style::new().red(),
     }
 }
 
@@ -618,6 +845,8 @@ fn draw_keybindings(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::from(Span::styled(
             if app.pending_approval.is_some() {
                 " Ctrl-Y allow · Ctrl-N deny · Enter send · Esc cancel · Ctrl-B back · Ctrl-C quit"
+            } else if matches!(app.pending_shell, Some(ShellState::Finished { .. })) {
+                " Ctrl-S send with next message · Ctrl-D discard · Ctrl-B back · Ctrl-C quit"
             } else {
                 " Enter send · Esc cancel · PgUp/PgDn scroll · Ctrl-B back · Ctrl-C quit"
             },
@@ -741,7 +970,57 @@ fn markdown_lines(text: &str) -> Vec<Line<'static>> {
 /// embedded newline, or a row `wrap_styled` broke a long one into — get
 /// this same blank width instead of the glyph, so their text lines up
 /// under the first line's content rather than under the icon.
+/// The band behind a user's own messages, and behind the selected row on
+/// the launch screen. Deliberately slight — a step off the background rather
+/// than a colour, so it separates without competing with the text.
+///
+/// Which step depends on the terminal: one shade *darker* than a dark
+/// background, one *lighter* than a light one. A fixed dark band reads as a
+/// heavy bar on a light theme, which is the opposite of subtle.
+static BAND: std::sync::OnceLock<Style> = std::sync::OnceLock::new();
+
+/// Asks the terminal what colour it is, once, and remembers the answer.
+///
+/// Must run before the alternate screen is entered: the query writes an
+/// escape sequence and reads the reply, and doing that mid-draw would race
+/// the renderer for the terminal. Terminals that don't answer fall back to
+/// dark, which is the safer guess for a tool that lives in one.
+pub(super) fn detect_band() {
+    use terminal_colorsaurus::{theme_mode, QueryOptions, ThemeMode};
+    let light = matches!(theme_mode(QueryOptions::default()), Ok(ThemeMode::Light));
+    let _ = BAND.set(band_for(light));
+}
+
+/// The band for a known theme. Split from the query so the choice can be
+/// tested both ways — the query itself answers whatever terminal the test
+/// happens to run under, which is no test at all.
+fn band_for(light: bool) -> Style {
+    Style::new().bg(Color::Indexed(if light { 254 } else { 236 }))
+}
+
+/// The band, dark until [`detect_band`] has said otherwise.
+pub(super) fn band() -> Style {
+    *BAND.get_or_init(|| Style::new().bg(Color::Indexed(236)))
+}
+
+/// Fills a line out to `width` so a background paints the whole row rather
+/// than stopping where the text does.
+pub(super) fn pad_to(line: &mut Line<'static>, width: usize) {
+    let used: usize = line
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    if used < width {
+        line.spans.push(Span::raw(" ".repeat(width - used)));
+    }
+}
+
 const GUTTER_CONTINUATION: &str = "  ";
+
+/// The continuation for a gutter three columns wide — the session's braille
+/// square and a space, like the tool gutter's double-width hammer.
+const SQUARE_CONTINUATION: &str = "   ";
 
 /// Pushes a "label  value" row, one level of indent deeper than the
 /// message gutter — a verbose tool-call field or result. The value wraps
@@ -924,6 +1203,175 @@ fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_band_steps_the_right_way_for_each_theme() {
+        // A fixed dark band reads as a heavy bar on a light theme, which is
+        // the opposite of subtle — so the two must differ, and each must sit
+        // on its own side of mid-grey.
+        let (dark, light) = (band_for(false), band_for(true));
+        assert_ne!(dark.bg, light.bg);
+
+        let shade = |style: Style| match style.bg {
+            Some(Color::Indexed(n)) => n,
+            other => panic!("expected an indexed background, got {other:?}"),
+        };
+        assert!(shade(dark) < 240, "dark theme wants a darker band");
+        assert!(shade(light) > 240, "light theme wants a lighter one");
+    }
+
+    #[test]
+    fn the_band_is_remembered_rather_than_re_queried() {
+        // It is asked once, before the alternate screen: querying mid-draw
+        // would race the renderer for the terminal.
+        assert_eq!(band().bg, band().bg);
+        assert!(band().bg.is_some());
+    }
+
+    #[test]
+    fn a_user_message_carries_a_band_across_the_whole_row() {
+        let mut app = App::new("m".to_string(), None, "id".to_string());
+        app.transcript
+            .push(TranscriptItem::User("short".to_string()));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|f| draw(f, &app, 0)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let row = (0..buffer.area.height)
+            .find(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, *y)].symbol().to_string())
+                    .collect::<String>()
+                    .contains("short")
+            })
+            .expect("user message shown");
+
+        // Past the end of the text, not just under it: an unpadded band
+        // would stop at "short" and look like a rendering fault.
+        let far = buffer[(35, row)].style();
+        assert_eq!(far.bg, band().bg, "band should reach the edge");
+
+        // ...and the reply gutter is left alone, so the two are told apart.
+        let elsewhere = buffer[(35, row + 1)].style();
+        assert_ne!(elsewhere.bg, band().bg);
+    }
+    #[test]
+    fn a_mark_is_two_cells_of_braille_and_the_same_every_time() {
+        let (mark, style) = identicon("4f2a91b2-0000-0000-0000-000000000000");
+        assert_eq!(mark, identicon("4f2a91b2-0000-0000-0000-000000000000").0);
+        assert_eq!(mark.chars().count(), 2);
+        for dot in mark.chars() {
+            let pattern = dot as u32 - 0x2800;
+            assert!(pattern < 256, "{dot:?} is not a braille pattern");
+            // Never blank, never solid: a half of either kind reads as a
+            // fault rather than as a mark.
+            assert!((3..=7).contains(&pattern.count_ones()), "{dot:?}");
+        }
+        assert!(style.fg.is_some());
+        assert!(style.bg.is_none(), "the row's own background shows through");
+    }
+
+    #[test]
+    fn marks_use_the_whole_palette_and_rarely_repeat() {
+        let ids: Vec<String> = (0..500).map(|n| format!("{n:08x}-session")).collect();
+        let marks: std::collections::HashSet<_> = ids.iter().map(|id| identicon(id).0).collect();
+        // Two of 500 sharing a glyph pair is fine; a hash collapsing onto a
+        // handful of patterns is not.
+        assert!(marks.len() > 450, "only {} distinct marks", marks.len());
+
+        let fgs: std::collections::HashSet<_> =
+            ids.iter().filter_map(|id| identicon(id).1.fg).collect();
+        assert_eq!(fgs.len(), IDENTICON_FG.len());
+    }
+
+    #[test]
+    fn the_gutter_mark_is_the_session_mark() {
+        // Seeded with the id the App actually holds, not a literal chosen to
+        // make the comparison work: feeding both sides the same string was
+        // what let the app hash a truncated id unnoticed.
+        let full = "4f2a91b2-3c1d-4e8a-9f02-7b6c5d4e3a21";
+        let app = App::new("m".to_string(), None, full.to_string());
+        let (mark, style) = identicon(&app.session_id);
+
+        // Two cells, so the gutter is three columns and wraps one narrower —
+        // the same treatment the double-width tool hammer gets.
+        assert_eq!(mark.chars().count(), 2);
+        assert_eq!(SQUARE_CONTINUATION.len(), 3);
+        assert!(style.fg.is_some());
+
+        // A truncated id is a different session as far as the hash is
+        // concerned, which is how the picker and the gutter came to disagree.
+        assert_ne!(mark, identicon(app.short_id()).0);
+    }
+
+    #[test]
+    fn a_running_command_is_just_a_titled_border() {
+        let mut app = sample_app();
+        app.pending_shell = Some(ShellState::Running {
+            command: "cargo test".into(),
+        });
+        let out = render_to_string(&app, 74, 14);
+        assert!(out.contains("$ cargo test"), "{out}");
+        // No decision to offer yet.
+        assert!(!out.contains("Ctrl-S"), "{out}");
+    }
+
+    #[test]
+    fn a_finished_command_shows_its_output_and_its_keys() {
+        let mut app = sample_app();
+        app.pending_shell = Some(ShellState::Finished {
+            command: "cargo test".into(),
+            output: "299 passed; 0 failed".into(),
+            exit_code: 0,
+        });
+        let out = render_to_string(&app, 74, 16);
+        assert!(out.contains("299 passed"), "{out}");
+        assert!(out.contains("Ctrl-S send"), "{out}");
+        assert!(out.contains("Ctrl-D discard"), "{out}");
+    }
+
+    #[test]
+    fn a_failing_command_shows_its_code_beside_the_command() {
+        let mut app = sample_app();
+        app.pending_shell = Some(ShellState::Finished {
+            command: "cargo build".into(),
+            output: "error".into(),
+            exit_code: 101,
+        });
+        let out = render_to_string(&app, 74, 16);
+        assert!(out.contains("exit 101"), "{out}");
+    }
+
+    #[test]
+    fn the_two_boxes_name_different_keys() {
+        // Both can be open at once, so a shared chord would act on whichever
+        // happened to be there. They must not advertise the same keys.
+        let mut app = sample_app();
+        app.pending_approval = Some(ApprovalRequest {
+            tool_name: "write_file".into(),
+            category: "write",
+            arguments: "{}".into(),
+        });
+        app.pending_shell = Some(ShellState::Finished {
+            command: "ls".into(),
+            output: "src".into(),
+            exit_code: 0,
+        });
+        let out = render_to_string(&app, 78, 22);
+
+        assert!(out.contains("Ctrl-Y allow"), "{out}");
+        assert!(out.contains("Ctrl-S send"), "{out}");
+        let approval_at = out.find("Write to disk").expect("approval shown");
+        let shell_at = out.find("$ ls").expect("command shown");
+        assert!(approval_at < shell_at, "approval sits above: {out}");
+    }
+
+    #[test]
+    fn no_box_when_no_command_has_been_run() {
+        let out = render_to_string(&sample_app(), 74, 14);
+        assert!(!out.contains("Ctrl-S"), "{out}");
+    }
     use super::*;
     use crate::tui::app::App;
     use crate::ui::ApprovalRequest;
@@ -1020,10 +1468,7 @@ mod tests {
             temperature_style(Some(1.2)),
             Style::new().fg(Color::Rgb(255, 140, 0))
         );
-        assert_eq!(
-            temperature_style(Some(2.0)),
-            Style::new().fg(Color::Rgb(255, 105, 180))
-        );
+        assert_eq!(temperature_style(Some(2.0)), Style::new().red());
     }
 
     #[test]
@@ -1129,8 +1574,9 @@ mod tests {
             .lines()
             .find(|l| l.contains("return 1"))
             .expect("indented line shown");
-        // Gutter (2 cols) + the code's own 4-space indent.
-        assert!(indented.starts_with("      return 1"), "{indented:?}");
+        // Reply gutter (3 cols: the session's braille square and a space)
+        // plus the code's own 4-space indent.
+        assert!(indented.starts_with("       return 1"), "{indented:?}");
     }
 
     #[test]

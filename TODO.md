@@ -1,5 +1,6 @@
 
 **TODOs**
+* rebrand: clank, Agent Command Center, Clanker Command Center
 * display intermediate actions whilte thinking
 * connect providers directly, like Anthropic, OpenAI, etc..
 
@@ -9,7 +10,23 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
-* $ for running terminal commands
+* subtly differentiate user message blocks in the transcript. can be a slight highlight/background color difference. and the current selected row in the pickr screen
+* if `$` gets reverted, keep the stdin fix in tools.rs. `run_terminal_command`
+  never set stdin, so the child inherited this process's — for the TUI, a
+  terminal in raw mode the event loop is already reading. Any command wanting
+  input blocked until the 30s timeout with its prompt trapped in the piped
+  stdout, while it and the TUI fought over keystrokes. It is a pre-existing bug
+  in the *agent's* tool, not something `$` introduced: a model running
+  `sudo apt install` hangs the same way. `.stdin(Stdio::null())` makes those
+  fail in milliseconds with their own error instead (`sudo: a password is
+  required`, exit 1).
+* $ commands are TUI-only. The CLI's blocking prompt loop has no box to show
+  output in and no decision to display, so `$` there would have to mean
+  something different — probably run-and-print with no send step at all.
+* $ output is captured, not streamed: `run_terminal_command` returns when the
+  process exits, so the box sits empty and then fills all at once. Fine for a
+  test run, poor for anything long. Streaming needs a different execution path
+  and its own event per chunk.
 * a steered message is lost if the turn it joined is cancelled. `absorb` runs
   only on the arm where a turn completes (conversation.rs), so cancelling
   discards everything the task accumulated — which is intended, except that a

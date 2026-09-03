@@ -42,6 +42,16 @@ pub enum TranscriptItem {
         arguments: String,
         status: ToolStatus,
     },
+    /// A command the *user* ran with `$`, kept distinct from `ToolCall` so
+    /// it reads as yours rather than as something the agent did. Stays in
+    /// the transcript whether or not it was sent to the model: discarding
+    /// decides what the model sees, not what you see.
+    Shell {
+        command: String,
+        output: String,
+        exit_code: i32,
+        sent: bool,
+    },
     Error(String),
     Notice(String),
     /// Every setting this session is running with, from `/session`. Held as
@@ -70,6 +80,31 @@ pub enum ToolStatus {
     Done { result: String },
 }
 
+/// How a command's output reads to the model: the command, then what it
+/// printed. Labelled as the user's own run so the model doesn't mistake it
+/// for something it did — it is a user message, and it says why.
+fn shell_message(command: &str, output: &str, exit_code: i32) -> String {
+    let output = if output.trim().is_empty() {
+        "(no output)"
+    } else {
+        output.trim_end()
+    };
+    format!("I ran `{command}` (exit {exit_code}):\n\n{output}")
+}
+
+/// Where a `$` command has got to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShellState {
+    Running {
+        command: String,
+    },
+    Finished {
+        command: String,
+        output: String,
+        exit_code: i32,
+    },
+}
+
 pub struct App {
     pub transcript: Vec<TranscriptItem>,
     pub input: String,
@@ -81,6 +116,10 @@ pub struct App {
     /// prompt can show what is waiting; the count is just its length.
     pub pending: VecDeque<String>,
     pub pending_approval: Option<ApprovalRequest>,
+    /// The `$` command in flight, or the one whose output is waiting on a
+    /// decision. Only the finished state offers keys — a spinner has nothing
+    /// to decide.
+    pub pending_shell: Option<ShellState>,
     /// Lines scrolled up from the bottom. 0 means pinned to the newest
     /// content, which is where it stays unless the user scrolls back.
     pub scroll_back: u16,
@@ -91,6 +130,10 @@ pub struct App {
     /// Not shown in the UI, but sessions are worth keeping uniquely
     /// identifiable regardless.
     #[allow(dead_code)]
+    /// The session's full id. Full, not the short form shown to the user:
+    /// the picker hashes the whole id for its mark, and the gutter has to
+    /// hash exactly the same string or the two marks disagree. `short_id`
+    /// derives the display form, so there is only ever one id to get wrong.
     pub session_id: String,
     /// The session's current title, shown in the header. "Untitled" until
     /// the first user message names it.
@@ -142,6 +185,7 @@ impl App {
             busy: false,
             pending: VecDeque::new(),
             pending_approval: None,
+            pending_shell: None,
             scroll_back: 0,
             model,
             effort_level,
@@ -189,6 +233,27 @@ impl App {
                 }
             }
             Event::Queued { text } => self.pending.push_back(text),
+            Event::ShellStarted { command } => {
+                // A result still waiting when the next command starts is
+                // dropped from the conversation — but recorded, because
+                // losing output you were deciding about with no trace of it
+                // is the worse failure. Discarding is the safe reading:
+                // sending on your behalf puts something in the context you
+                // never agreed to.
+                self.settle_shell(false);
+                self.pending_shell = Some(ShellState::Running { command });
+            }
+            Event::ShellFinished {
+                command,
+                output,
+                exit_code,
+            } => {
+                self.pending_shell = Some(ShellState::Finished {
+                    command,
+                    output,
+                    exit_code,
+                });
+            }
             Event::Cancelled => {
                 self.finish_streaming();
                 self.pending.clear();
@@ -377,6 +442,45 @@ impl App {
             | AgentEvent::IterationStarted { .. }
             | AgentEvent::TurnFinished => {}
         }
+    }
+
+    /// Settles a finished `$` command: it leaves the box and joins the
+    /// transcript either way, marked with whether the model was given it.
+    ///
+    /// Returns the text to send, when it is being sent. Sending appends it
+    /// to the conversation without starting a turn — the model reads it when
+    /// you next say something, so the output and the question you have about
+    /// it arrive together instead of costing two round trips.
+    pub fn settle_shell(&mut self, sent: bool) -> Option<String> {
+        // Checked before taking: the keys are live the whole time a command
+        // is on screen, and taking first would throw away one that is still
+        // running.
+        if !matches!(self.pending_shell, Some(ShellState::Finished { .. })) {
+            return None;
+        }
+        let Some(ShellState::Finished {
+            command,
+            output,
+            exit_code,
+        }) = self.pending_shell.take()
+        else {
+            return None;
+        };
+
+        let message = sent.then(|| shell_message(&command, &output, exit_code));
+        self.transcript.push(TranscriptItem::Shell {
+            command,
+            output,
+            exit_code,
+            sent,
+        });
+        message
+    }
+
+    /// The first eight characters of the id — enough to name the session at
+    /// `comms resume`, and what `/status` shows.
+    pub fn short_id(&self) -> &str {
+        &self.session_id[..8.min(self.session_id.len())]
     }
 
     /// Drops the first message waiting with this text, if any.
@@ -571,6 +675,152 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_app_holds_the_full_id_so_its_mark_matches_the_picker() {
+        // The bug this pins: the app used to hold `short_id`, so the reply
+        // gutter hashed eight characters while the picker hashed all
+        // thirty-six. Same function, different seeds, unrelated marks — and
+        // no test comparing the two functions could have caught it, because
+        // the fault was in what the call sites fed them.
+        let full = "4f2a91b2-3c1d-4e8a-9f02-7b6c5d4e3a21";
+        let a = App::new("m".to_string(), None, full.to_string());
+
+        assert_eq!(a.session_id, full, "the whole id, not the display form");
+        assert_eq!(a.short_id(), "4f2a91b2");
+    }
+
+    #[test]
+    fn a_short_id_survives_an_id_shorter_than_eight() {
+        let a = App::new("m".to_string(), None, "abc".to_string());
+        assert_eq!(a.short_id(), "abc");
+    }
+
+    #[test]
+    fn a_second_command_records_the_one_it_replaces() {
+        let mut a = app();
+        a.apply(Event::ShellFinished {
+            command: "ls".to_string(),
+            output: "src target".to_string(),
+            exit_code: 0,
+        });
+
+        // Fired before answering the first. The output must not simply
+        // vanish — it was on screen and undecided a moment ago.
+        a.apply(Event::ShellStarted {
+            command: "pwd".to_string(),
+        });
+
+        assert!(matches!(
+            a.transcript.last(),
+            Some(TranscriptItem::Shell { command, sent: false, .. }) if command == "ls"
+        ));
+        assert_eq!(
+            a.pending_shell,
+            Some(ShellState::Running {
+                command: "pwd".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn starting_a_command_while_one_runs_loses_nothing() {
+        // Nothing is waiting on a decision, so there is nothing to record.
+        let mut a = app();
+        a.apply(Event::ShellStarted {
+            command: "sleep 5".to_string(),
+        });
+        a.apply(Event::ShellStarted {
+            command: "ls".to_string(),
+        });
+        assert!(a.transcript.is_empty());
+    }
+
+    #[test]
+    fn a_command_shows_while_it_runs_then_offers_its_output() {
+        let mut a = app();
+        a.apply(Event::ShellStarted {
+            command: "cargo test".to_string(),
+        });
+        assert_eq!(
+            a.pending_shell,
+            Some(ShellState::Running {
+                command: "cargo test".to_string()
+            })
+        );
+
+        a.apply(Event::ShellFinished {
+            command: "cargo test".to_string(),
+            output: "299 passed".to_string(),
+            exit_code: 0,
+        });
+        assert!(matches!(a.pending_shell, Some(ShellState::Finished { .. })));
+    }
+
+    #[test]
+    fn sending_a_command_hands_back_a_message_naming_it() {
+        let mut a = app();
+        a.apply(Event::ShellFinished {
+            command: "cargo test".to_string(),
+            output: "299 passed".to_string(),
+            exit_code: 0,
+        });
+
+        let message = a.settle_shell(true).expect("sent");
+        assert!(message.contains("cargo test"), "{message}");
+        assert!(message.contains("299 passed"), "{message}");
+        assert!(a.pending_shell.is_none(), "the box is done with");
+        // It stays visible either way: discarding decides what the model
+        // sees, not what the user sees.
+        assert!(matches!(
+            a.transcript.last(),
+            Some(TranscriptItem::Shell { sent: true, .. })
+        ));
+    }
+
+    #[test]
+    fn discarding_keeps_it_on_screen_and_out_of_the_conversation() {
+        let mut a = app();
+        a.apply(Event::ShellFinished {
+            command: "ls".to_string(),
+            output: "src".to_string(),
+            exit_code: 0,
+        });
+
+        assert_eq!(a.settle_shell(false), None, "nothing to send");
+        assert!(a.pending_shell.is_none());
+        assert!(matches!(
+            a.transcript.last(),
+            Some(TranscriptItem::Shell { sent: false, .. })
+        ));
+    }
+
+    #[test]
+    fn a_running_command_has_nothing_to_settle_yet() {
+        let mut a = app();
+        a.apply(Event::ShellStarted {
+            command: "sleep 5".to_string(),
+        });
+        // The keys are live the whole time; they must not eat a command
+        // that hasn't produced anything.
+        assert_eq!(a.settle_shell(true), None);
+        assert!(a.pending_shell.is_some(), "still running");
+        assert_eq!(a.settle_shell(false), None);
+        assert!(a.pending_shell.is_some());
+    }
+
+    #[test]
+    fn a_failing_command_says_so_in_what_the_model_reads() {
+        let mut a = app();
+        a.apply(Event::ShellFinished {
+            command: "cargo build".to_string(),
+            output: "error[E0308]: mismatched types".to_string(),
+            exit_code: 101,
+        });
+        let message = a.settle_shell(true).expect("sent");
+        assert!(message.contains("101"), "{message}");
+        assert!(message.contains("E0308"), "{message}");
+    }
 
     fn queued(text: &str) -> Event {
         Event::Queued {

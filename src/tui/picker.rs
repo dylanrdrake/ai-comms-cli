@@ -9,7 +9,7 @@
 //! Kept free of I/O: the caller loads sessions and acts on the
 //! [`Activation`] returned when a row is chosen.
 
-use super::render::draw_rule;
+use super::render::{band, draw_rule, home_relative, identicon, pad_to};
 use crate::store::{mode_label, Activity, LastMessage, SessionSummary, KIND_AGENT_CHAT};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
@@ -477,75 +477,14 @@ const BADGE_WIDTH: usize = 1;
 /// 1:2 rectangle. Two of them side by side makes the block square as well.
 const ICON_WIDTH: usize = 2;
 
-/// Braille patterns of three to seven dots. Nothing emptier (a mark with a
-/// blank half reads as a rendering fault) and nothing solid (every solid
-/// half looks like every other one).
-const MARK_PATTERNS: [u8; 218] = {
-    let mut patterns = [0u8; 218];
-    let (mut bits, mut found) = (0usize, 0usize);
-    while bits < 256 {
-        let dots = (bits as u8).count_ones();
-        if dots >= 3 && dots <= 7 {
-            patterns[found] = bits as u8;
-            found += 1;
-        }
-        bits += 1;
-    }
-    patterns
-};
-
-/// Mid-tone 256-colour indices: saturated enough to tell apart, dark enough
-/// to read on a light terminal and light enough to read on a dark one. The
-/// mark draws on whatever background the row has, so the palette can't lean
-/// on one being behind it. Deliberately clear of the colours that carry
-/// meaning here — the cyan and yellow of the mode column, and the badge
-/// colours for state.
-const IDENTICON_FG: [u8; 12] = [33, 30, 70, 61, 96, 100, 130, 133, 136, 166, 172, 25];
-
-/// A session's mark: a square of braille dots, derived from its id and
-/// stable for the life of the session.
-///
-/// It identifies nothing you can type — the id column was removed because
-/// nothing in the picker needs it. This is for recognition: a list that
-/// refreshes under you, with rows moving as sessions are touched, is easier
-/// to keep your place in when the row you were watching carries the same
-/// mark it had a moment ago.
-fn identicon(id: &str) -> (String, Style) {
-    // FNV-1a, 64-bit: the mark has to be identical in every process that
-    // draws this session, so it can come from nothing but the id, and the
-    // wider hash leaves room to slice a half, a half and a colour out of
-    // independent bits.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in id.bytes() {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-
-    let half = |bits: u64| {
-        let pattern = MARK_PATTERNS[bits as usize % MARK_PATTERNS.len()];
-        char::from_u32(0x2800 + u32::from(pattern)).unwrap_or('?')
-    };
-    let fg = IDENTICON_FG[(hash >> 24) as usize % IDENTICON_FG.len()];
-
-    (
-        format!("{}{}", half(hash), half(hash >> 12)),
-        Style::new().fg(Color::Indexed(fg)),
-    )
-}
-
-/// A path with the home directory shown as `~`, so the column stays
-/// readable on the long paths most projects have.
-fn home_relative(dir: &str) -> String {
-    let Some(home) = home::home_dir() else {
-        return dir.to_string();
-    };
-    let home = home.display().to_string();
-    match dir.strip_prefix(&home) {
-        Some(rest) => format!("~{rest}"),
-        None => dir.to_string(),
-    }
-}
-
-pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str, tick: usize) {
+pub fn draw(
+    frame: &mut Frame,
+    picker: &Picker,
+    title: &str,
+    dir: Option<&str>,
+    hint: &str,
+    tick: usize,
+) {
     let areas = Layout::vertical([
         Constraint::Length(1), // title
         Constraint::Length(1), // rule
@@ -649,7 +588,14 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str, tick: u
                 }
             }
         }
-        lines.push(Line::from(spans));
+        let mut line = Line::from(spans);
+        // The same band the transcript puts behind your own messages: the
+        // cursor is easy to lose in a list where several rows are animating.
+        if selected {
+            pad_to(&mut line, width);
+            line.style = line.style.patch(band());
+        }
+        lines.push(line);
     }
 
     if picker.items.is_empty() {
@@ -694,13 +640,16 @@ pub fn draw(frame: &mut Frame, picker: &Picker, title: &str, hint: &str, tick: u
         Line::from(Span::styled(format!(" {hint}"), Style::new().dark_gray()))
     };
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            title.to_string(),
-            Style::new().bold(),
-        ))),
-        areas[0],
-    );
+    let mut heading = vec![Span::styled(title.to_string(), Style::new().bold())];
+    // The directory the list is grouped around: "In this directory" means
+    // nothing without saying which.
+    if let Some(dir) = dir {
+        heading.push(Span::styled(
+            format!("  {}", home_relative(dir)),
+            Style::new().dark_gray(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(heading)), areas[0]);
     draw_rule(frame, areas[1], None);
     frame.render_widget(Paragraph::new(Text::from(lines)), areas[2]);
     // A failed open replaces the key hints: it's the thing that just
@@ -800,32 +749,34 @@ fn relative_time(timestamp: i64) -> String {
 mod tests {
 
     #[test]
-    fn a_mark_is_two_cells_of_braille_and_the_same_every_time() {
-        let (mark, style) = identicon("4f2a91b2-0000-0000-0000-000000000000");
-        assert_eq!(mark, identicon("4f2a91b2-0000-0000-0000-000000000000").0);
-        assert_eq!(mark.chars().count(), ICON_WIDTH);
-        for dot in mark.chars() {
-            let pattern = dot as u32 - 0x2800;
-            assert!(pattern < 256, "{dot:?} is not a braille pattern");
-            // Never blank, never solid: a half of either kind reads as a
-            // fault rather than as a mark.
-            assert!((3..=7).contains(&pattern.count_ones()), "{dot:?}");
-        }
-        assert!(style.fg.is_some());
-        assert!(style.bg.is_none(), "the row's own background shows through");
-    }
+    fn the_selected_row_carries_a_band_across_the_whole_row() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let picker = picker_of(vec![
+            row_in("00000001", KIND_AGENT_CHAT, "first", Some(HERE)),
+            row_in("00000002", KIND_AGENT_CHAT, "second", Some(HERE)),
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(70, 10)).unwrap();
+        terminal
+            .draw(|f| draw(f, &picker, "COMMS", None, "hint", 0))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
 
-    #[test]
-    fn marks_use_the_whole_palette_and_rarely_repeat() {
-        let ids: Vec<String> = (0..500).map(|n| format!("{n:08x}-session")).collect();
-        let marks: std::collections::HashSet<_> = ids.iter().map(|id| identicon(id).0).collect();
-        // Two of 500 sharing a glyph pair is fine; a hash collapsing onto a
-        // handful of patterns is not.
-        assert!(marks.len() > 450, "only {} distinct marks", marks.len());
+        let row_of = |needle: &str| {
+            (0..buffer.area.height)
+                .find(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, *y)].symbol().to_string())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("{needle} not drawn"))
+        };
 
-        let fgs: std::collections::HashSet<_> =
-            ids.iter().filter_map(|id| identicon(id).1.fg).collect();
-        assert_eq!(fgs.len(), IDENTICON_FG.len());
+        // "New session" is selected by default.
+        let selected = row_of("New session");
+        let other = row_of("first");
+        assert_eq!(buffer[(65, selected)].style().bg, band().bg);
+        assert_ne!(buffer[(65, other)].style().bg, band().bg);
     }
 
     #[test]

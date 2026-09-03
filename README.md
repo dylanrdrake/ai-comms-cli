@@ -311,6 +311,9 @@ exactly:
 | `/sandbox` | Show whether writes are currently confined |
 | `/status` | Show every setting this session is running with — model, mode, effort, temperature, iteration cap, sandbox, verbose, streaming, approval gates, and the directory it runs in. The session-scoped counterpart to `comms status` |
 | `/session title <new title>` | Rename this session. Bare `/session` (or `/session title`) shows its current name |
+| `/send`, `/discard` | Answer the `$` command box — the same as `Ctrl-S` and `Ctrl-D`. Typed forms exist because terminals claim chords: Zed's takes `Ctrl-S` |
+| `/allow`, `/deny` | Answer a tool approval — the same as `Ctrl-Y` and `Ctrl-N`. Without a way to answer, a turn waits on a decision it can never be given |
+| `/back` | Return to the launch screen — the same as `Ctrl-B`, which tmux claims as its own prefix |
 
 A mistyped invocation of one of these (`/effort` with no value, `/approval
 bogus off`), or a misspelled command name (`/mode` for `/model`), is
@@ -394,6 +397,14 @@ one — starting a session is meant to be deliberate, so there's no untitled
 path. The session is kept from the moment you confirm it, whether or not you
 ever say anything in it.
 
+Every session carries a small square of braille dots, hashed from its id and
+the same for the life of the session. It says nothing you can type — the
+session id isn't shown on the launch screen at all — and exists purely so a
+row you have seen before is recognisable while the list refreshes and rows
+move under you. The same mark, in a single cell, is the gutter glyph beside
+every reply once you're inside that session, so the conversation you're
+reading is tied to the row you picked.
+
 Each row also shows what that session is doing, re-read every couple of
 seconds so one you're running in another terminal stays current:
 
@@ -448,11 +459,13 @@ the current one instead, repointing the session there — the same thing
 | `Esc` | Cancel the in-flight turn (kills a running tool command too) |
 | `Alt-Enter` / `Shift-Enter` | Insert a newline instead of sending. `Alt-Enter` works everywhere; `Shift-Enter` needs a terminal that supports the kitty keyboard protocol (kitty, WezTerm, Ghostty, foot, recent Alacritty), because the older input protocol can't tell `Shift-Enter` apart from `Enter` at all |
 | `↑` / `↓` | Recall previous messages into the input box |
-| `Ctrl-Y` / `Ctrl-N` | Allow or deny a tool approval. The approval gets its own box above the prompt rather than taking the prompt over, so you can keep typing — and keep sending — while a decision waits. A chord rather than bare `y`/`n` precisely because the input box stays live |
+| `$ <command>` | Run a shell command yourself, in the session's directory. No model call, no tokens, no approval — you typed it. Output appears in its own box and waits for you to decide whether the model should see it |
+| `Ctrl-S` / `Ctrl-D` | Send that output to the conversation, or discard it. Sending waits for your next message rather than prompting a reply. Different keys from the approval's on purpose, since both boxes can be open at once. Use `/send` and `/discard` where something has claimed the chord — Zed's terminal does |
+| `Ctrl-Y` / `Ctrl-N` | Allow or deny a tool approval. It gets its own box above the prompt rather than taking the prompt over, so you can keep typing — and keep sending — while a decision waits, which is why it's a chord rather than a bare `y`/`n`. Use `/allow` and `/deny` where the chords are claimed; without a way to answer, a turn waits forever |
 | `PgUp` / `PgDn` / `End` | Scroll the transcript; `End` re-pins to the newest |
 | Mouse wheel | Also scrolls the transcript — `↑`/`↓` stay dedicated to prompt history |
 | `Ctrl-Shift-V` / `Shift-Insert` / middle-click | Paste, using your terminal's own paste binding. Multi-line pastes land in the input box as text rather than sending a message per line. `Ctrl-V` is **not** a paste key in most terminals — it never reaches your clipboard |
-| `Ctrl-B` | Back to the launch screen (the session is saved) |
+| `Ctrl-B` | Back to the launch screen (the session is saved). `/back` does the same — tmux takes `Ctrl-B` as its own prefix |
 | `Ctrl-C` | Quit |
 
 **Commands.** Type these in the message box instead of a message:
@@ -580,6 +593,60 @@ two processes from driving one session — see the note in TODO.
 **Activity** — the only thing stored about a turn that hasn't finished:
 working, awaiting approval, failed, or null for "nothing to say, read the
 messages."
+
+### Running a command yourself
+
+`$ cargo test` runs it here and now, in the session's directory, without
+involving the model. There is no approval prompt: you typed it, so there is
+nothing to approve.
+
+A box appears as soon as you press Enter. The command sits on its first line
+with a spinner after it while it runs, and its output fills in underneath:
+
+```
+┌──────────────────────────────────────────────────┐
+│$ cargo test ⠹                                    │
+└──────────────────────────────────────────────────┘
+
+┌ Ctrl-S send with next message · Ctrl-D discard ──┐
+│$ cargo test                                      │
+│running 319 tests                                 │
+│test result: ok. 319 passed; 0 failed             │
+└──────────────────────────────────────────────────┘
+```
+
+A non-zero exit shows in red beside the command. The border carries only what
+you can act on.
+
+`Ctrl-S` puts the output into the conversation; `Ctrl-D` leaves it out. Either
+way the command stays in the transcript, marked sent or not — the decision is
+about what the *model* sees, not what you see.
+
+**Sending does not prompt a reply.** The output is added and waits, so it
+reaches the model together with whatever you type next. That is the point of
+the feature: `$ cargo test`, send, "fix these failures" is one turn, where
+replying to bare output first would cost two. Sending during a turn joins that
+turn, the same as any message.
+
+Running a second command before answering the first drops that output from the
+conversation, but it stays in the transcript marked `not sent` — nothing you
+were deciding about disappears without a trace. A second command *while* one is
+still running is refused: there is one box, and two results would land on top
+of each other.
+
+`Ctrl-S` was historically XOFF, the key that freezes a terminal until
+`Ctrl-Q`. It works here because raw mode turns software flow control off — but
+anything layered above the terminal can still claim it, which is what `/send`
+and `/discard` are for. If a terminal ever does lock up, `Ctrl-Q` releases it.
+
+**Commands get no stdin.** Anything that wants input — `sudo` without a
+cached credential, `git commit` with no `-m`, a script calling `read` — gets
+end-of-file immediately and fails with its own error, rather than blocking
+until it is killed. Use another terminal for anything interactive.
+
+Output is capped, keeping the end rather than the beginning, since a failing
+build says what went wrong on its last lines. Commands are killed after 30
+seconds, and `$` is TUI-only for now.
 
 ### Sending while a turn is running
 

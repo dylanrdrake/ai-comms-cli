@@ -30,6 +30,14 @@ use tokio::task::JoinHandle;
 pub enum Command {
     /// Send a user message. Queued if a turn is already running.
     Send(String),
+    /// Run a shell command here and now, with no model call. Spawned rather
+    /// than awaited in place: the worker's select loops must stay responsive
+    /// while it runs, including for `Cancel`.
+    Shell(String),
+    /// Put a finished command's output into the conversation. Appends it
+    /// without starting a turn, or joins the running one if there is a turn
+    /// in flight — the same routing `Send` does.
+    Include(String),
     /// Answer the outstanding [`Event::ApprovalRequested`].
     Approve(bool),
     /// Abort the in-flight turn and drop anything queued behind it.
@@ -105,6 +113,18 @@ pub enum Event {
     /// carry the text.
     Queued {
         text: String,
+    },
+    /// A `$` command has started. Emitted by the worker rather than assumed
+    /// by the front end, so what is shown is what actually began.
+    ShellStarted {
+        command: String,
+    },
+    /// A `$` command finished; `output` is stdout and stderr together,
+    /// already capped.
+    ShellFinished {
+        command: String,
+        output: String,
+        exit_code: i32,
     },
     /// The in-flight turn was cancelled.
     Cancelled,
@@ -191,6 +211,7 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
             Some(Command::SetMaxIterations(*max_iterations))
         }
         Submission::ResetMaxIterations => Some(Command::ResetMaxIterations),
+        Submission::Shell(command) => Some(Command::Shell(command.clone())),
         Submission::SetTemperature(temperature) => Some(Command::SetTemperature(*temperature)),
         Submission::ResetTemperature => Some(Command::ResetTemperature),
         Submission::SetApproval { category, enabled } => Some(Command::SetApproval {
@@ -210,8 +231,37 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         | Submission::ShowStream
         | Submission::ShowTitle
         | Submission::ShowTemperature
+        // Answered from what the front end already holds: it has the output,
+        // the pending approval, and the screen to leave.
+        | Submission::SendShell
+        | Submission::DiscardShell
+        | Submission::AllowTool
+        | Submission::DenyTool
+        | Submission::Back
         | Submission::UnknownCommand(_) => None,
     }
+}
+
+/// A `$` command gets the same ceiling a tool call does when the model
+/// doesn't name one.
+const SHELL_TIMEOUT: u64 = 30;
+
+/// How much of a command's output is worth keeping. A test run that scrolls
+/// for a thousand lines shouldn't become permanent context — the same reason
+/// `web_fetch` caps a page.
+const MAX_SHELL_OUTPUT: usize = 32 * 1024;
+
+/// Cuts output to `MAX_SHELL_OUTPUT`, keeping the *end* — a failing build
+/// says what went wrong on its last lines, not its first.
+fn truncate_output(output: &str) -> String {
+    if output.len() <= MAX_SHELL_OUTPUT {
+        return output.to_string();
+    }
+    let mut start = output.len() - MAX_SHELL_OUTPUT;
+    while start < output.len() && !output.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[earlier output truncated]\n{}", &output[start..])
 }
 
 pub struct Conversation {
@@ -335,6 +385,8 @@ impl Worker {
                         }
                     }
                 }
+                Command::Shell(command) => self.run_shell(command),
+                Command::Include(text) => self.include(text),
                 Command::SetModel(model) => self.set_model(model),
                 Command::SetAgentic(agentic) => self.set_agentic(agentic),
                 Command::SetEffort(effort_level) => self.set_effort(effort_level),
@@ -504,6 +556,19 @@ impl Worker {
                                 queue.push_back(text);
                             }
                         }
+                        // Never touches the model, so it runs whether or
+                        // not a turn is in flight.
+                        Some(Command::Shell(command)) => self.run_shell(command),
+                        // Steers rather than waiting: the output is context
+                        // the running turn should have, not the next one.
+                        Some(Command::Include(text)) => {
+                            let _ = self.events.send(Event::UserMessage(text.clone()));
+                            if agentic {
+                                self.steering.push(text);
+                            } else {
+                                queue.push_back(text);
+                            }
+                        }
                         // These apply from the next turn on; the running
                         // one already captured its model/mode/effort.
                         Some(Command::SetModel(model)) => self.set_model(model),
@@ -575,6 +640,45 @@ impl Worker {
                 message: e.to_string(),
             }));
         }
+    }
+
+    /// Runs a `$` command in the session's directory and reports the result.
+    ///
+    /// Spawned rather than awaited: the worker is in a `select!` loop, and
+    /// blocking it for the length of a command would stall everything else
+    /// the user can do — cancelling a turn included.
+    fn run_shell(&mut self, command: String) {
+        let _ = self.events.send(Event::ShellStarted {
+            command: command.clone(),
+        });
+
+        // Where the session lives, not where the TUI was launched — the same
+        // directory the sandbox bounds the file tools to.
+        let working_dir = self.session.working_dir().map(str::to_string);
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let result =
+                crate::tools::run_shell_command(&command, working_dir.as_deref(), SHELL_TIMEOUT)
+                    .await;
+            let (output, exit_code) = match result {
+                Ok(finished) => finished,
+                Err(e) => (format!("Could not run it: {e}"), -1),
+            };
+            let _ = events.send(Event::ShellFinished {
+                command,
+                output: truncate_output(&output),
+                exit_code,
+            });
+        });
+    }
+
+    /// Appends a command's output to the conversation without starting a
+    /// turn. Reached only when nothing is running; the mid-turn path steers
+    /// instead, so the output joins the work it is about.
+    fn include(&mut self, text: String) {
+        let _ = self.events.send(Event::UserMessage(text.clone()));
+        self.session.push_user(text);
+        self.persist();
     }
 
     /// Switches the model and tells the front end what it ended up as, so
@@ -789,6 +893,29 @@ impl AgentUi for ChannelUi {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn truncating_output_keeps_the_end() {
+        // A failing build says what went wrong on its last lines.
+        let short = "all good";
+        assert_eq!(truncate_output(short), short);
+
+        let long = format!(
+            "{}error[E0308]: mismatched types",
+            "x".repeat(MAX_SHELL_OUTPUT)
+        );
+        let cut = truncate_output(&long);
+        assert!(cut.len() <= MAX_SHELL_OUTPUT + 40, "{}", cut.len());
+        assert!(cut.contains("E0308"), "the end survived");
+        assert!(cut.starts_with("[earlier output truncated]"));
+    }
+
+    #[test]
+    fn truncating_never_splits_a_character() {
+        let body = "é".repeat(MAX_SHELL_OUTPUT);
+        let cut = truncate_output(&body);
+        assert!(cut.contains('é'));
+    }
     use super::*;
 
     /// Every submission that changes session state, paired with the command
@@ -823,6 +950,10 @@ mod tests {
                 Command::SetTemperature(Some(1.0)),
             ),
             (Submission::ResetTemperature, Command::ResetTemperature),
+            (
+                Submission::Shell("ls".to_string()),
+                Command::Shell("ls".to_string()),
+            ),
             (
                 Submission::SetApproval {
                     category: "write".to_string(),
@@ -862,6 +993,12 @@ mod tests {
             Submission::ShowVerbose,
             Submission::ShowStream,
             Submission::ShowTemperature,
+            // The front end is holding the output being decided about.
+            Submission::SendShell,
+            Submission::DiscardShell,
+            Submission::AllowTool,
+            Submission::DenyTool,
+            Submission::Back,
             Submission::UnknownCommand("nope".to_string()),
         ] {
             assert!(

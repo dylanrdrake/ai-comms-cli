@@ -24,7 +24,7 @@ use crate::session::{self, ChatSession};
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
 use crate::ui::response_label;
 use anyhow::Result;
-use app::{App, TranscriptItem};
+use app::{App, ShellState, TranscriptItem};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -243,7 +243,9 @@ fn start_chat(
     let mut app = App::new(
         session.model().to_string(),
         session.effort_level().map(str::to_string),
-        session.short_id().to_string(),
+        // The full id: the mark in the reply gutter hashes it, and the
+        // picker hashes the same to draw this session's row.
+        session.id().to_string(),
     );
     app.agentic = agentic;
     app.verbose = session.verbose();
@@ -320,6 +322,11 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 static ENHANCED_KEYS: AtomicBool = AtomicBool::new(false);
 
 fn enter() -> Result<Tui> {
+    // Before raw mode and the alternate screen: this writes an escape
+    // sequence and waits for the terminal's reply, which would otherwise
+    // race the renderer for the same stream.
+    render::detect_band();
+
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     // Without this, a terminal delivers a paste as plain keystrokes, and
@@ -410,7 +417,8 @@ fn draw(terminal: &mut Tui, screen: &Screen, tick: usize) -> Result<()> {
         Screen::Launch(p) => picker::draw(
             frame,
             p,
-            "comms",
+            "COMMS",
+            current_dir().as_deref(),
             "↑/↓ move · Enter open · r rename · d delete · q quit",
             tick,
         ),
@@ -465,7 +473,11 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
             // The worker stopped on its own; nothing more will arrive.
             Wake::Conversation(None) => {}
             Wake::Tick => {
-                if matches!(screen, Screen::Chat(chat) if chat.app.busy) {
+                // A `$` command run outside a turn leaves `busy` false, so
+                // without the second half its spinner sits on one frame.
+                if matches!(screen, Screen::Chat(chat)
+                    if chat.app.busy || chat.app.pending_shell.is_some())
+                {
                     tick = tick.wrapping_add(1);
                     dirty = true;
                 }
@@ -688,6 +700,26 @@ fn is_typed_char(key: &KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// Answers a pending approval. Shared by the chord and by `/allow`, `/deny` —
+/// the typed forms exist because a terminal that claims `Ctrl-Y` would
+/// otherwise leave a turn waiting on a decision with no way to give it.
+fn answer_approval(app: &mut App, conversation: &Conversation, allowed: bool) {
+    if app.pending_approval.is_none() {
+        return;
+    }
+    conversation.send(Command::Approve(allowed));
+    app.approval_answered(allowed);
+}
+
+/// Settles a finished `$` command, sending its output to the model or not.
+/// Does nothing when no command is waiting, so the keys and the commands are
+/// both inert the rest of the time.
+fn settle_shell(app: &mut App, conversation: &Conversation, sent: bool) {
+    if let Some(text) = app.settle_shell(sent) {
+        conversation.send(Command::Include(text));
+    }
+}
+
 /// Handles a keypress in the conversation. Returns whether to leave it and
 /// go back to the launch screen.
 fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) -> bool {
@@ -705,13 +737,36 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
         if let KeyCode::Char(c) = key.code {
             match c {
                 'y' => {
-                    conversation.send(Command::Approve(true));
-                    app.approval_answered(true);
+                    answer_approval(app, conversation, true);
                     return false;
                 }
                 'n' => {
-                    conversation.send(Command::Approve(false));
-                    app.approval_answered(false);
+                    answer_approval(app, conversation, false);
+                    return false;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Deciding a finished `$` command. Deliberately different keys from the
+    // approval's: both boxes can be open at once, and an approval can arrive
+    // between reading your output and reaching for the key, so one shared
+    // chord would act on whichever happened to be open.
+    //
+    // Ctrl-S is XOFF on a terminal with flow control on, which would freeze
+    // the display until Ctrl-Q. It reaches us because raw mode clears IXON —
+    // see `enter`. Anything above our tty (tmux, an ssh chain) can still
+    // claim it, which is what `/send` and `/discard` are for.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(c) = key.code {
+            match c {
+                's' => {
+                    settle_shell(app, conversation, true);
+                    return false;
+                }
+                'd' => {
+                    settle_shell(app, conversation, false);
                     return false;
                 }
                 _ => {}
@@ -733,6 +788,20 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
         KeyCode::Enter => {
             if let Some(text) = app.take_input() {
                 let submission = app::classify(&text);
+
+                // One box, one command. Two in flight would race on the same
+                // slot — whichever finished last would land on top of the
+                // other's output, and the first would be lost with no record
+                // that it ran.
+                if matches!(submission, app::Submission::Shell(_))
+                    && matches!(app.pending_shell, Some(ShellState::Running { .. }))
+                {
+                    app.transcript.push(TranscriptItem::Notice(
+                        "A command is still running — wait for it to finish".to_string(),
+                    ));
+                    return false;
+                }
+
                 match command_for(&submission) {
                     // Everything that changes session state is the worker's
                     // to apply; it replies with the event that updates the
@@ -752,7 +821,7 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                                 let approval = app.approval.clone();
                                 let rows =
                                     crate::ui::session_settings_rows(&crate::ui::SessionSettings {
-                                        id: &app.session_id,
+                                        id: app.short_id(),
                                         title: &app.title,
                                         model: &app.model,
                                         agentic: app.agentic,
@@ -798,6 +867,13 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                                     changed: false,
                                 });
                             }
+                            // Typed equivalents of the box's chords, for a
+                            // terminal or multiplexer that has claimed them.
+                            app::Submission::SendShell => settle_shell(app, conversation, true),
+                            app::Submission::DiscardShell => settle_shell(app, conversation, false),
+                            app::Submission::AllowTool => answer_approval(app, conversation, true),
+                            app::Submission::DenyTool => answer_approval(app, conversation, false),
+                            app::Submission::Back => return true,
                             app::Submission::UnknownCommand(message) => {
                                 app.transcript.push(TranscriptItem::Error(message));
                             }
@@ -818,6 +894,7 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                             | app::Submission::ResetMaxIterations
                             | app::Submission::SetTemperature(_)
                             | app::Submission::ResetTemperature
+                            | app::Submission::Shell(_)
                             | app::Submission::SetApproval { .. } => {
                                 unreachable!("command_for routes these to the worker")
                             }

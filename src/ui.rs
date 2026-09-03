@@ -112,6 +112,24 @@ pub fn parse_yes_no(input: &str) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Submission {
     Message(String),
+    /// `$ <command>` — run it here, now, without involving the model. The
+    /// user typed it, so there is nothing to approve.
+    Shell(String),
+    /// Put the last command's output into the conversation, or don't. Typed
+    /// forms of the box's `Ctrl-S`/`Ctrl-D`, so the decision survives a
+    /// terminal or multiplexer that has claimed those chords.
+    SendShell,
+    DiscardShell,
+    /// Answer a tool approval. Typed forms of `Ctrl-Y`/`Ctrl-N`, and not
+    /// optional: where those chords are intercepted — Zed's terminal claims
+    /// several — an approval would otherwise be unanswerable and the turn
+    /// stuck with nothing but cancelling to get out of it.
+    AllowTool,
+    DenyTool,
+    /// Typed form of `Ctrl-B`. tmux takes `Ctrl-B` as its own prefix, so
+    /// without this there is no way back to the launch screen from inside a
+    /// tmux session.
+    Back,
     SetModel(String),
     ShowModel,
     SetAgentic(bool),
@@ -343,6 +361,15 @@ pub fn sandbox_notice(sandbox: bool, changed: bool) -> String {
 pub fn classify(text: &str) -> Submission {
     let trimmed = text.trim();
 
+    // Only a leading `$` runs anything: "it cost me $5" is a message. A bare
+    // `$` is one too — there is no command in it to run.
+    if let Some(command) = trimmed.strip_prefix('$') {
+        let command = command.trim();
+        if !command.is_empty() {
+            return Submission::Shell(command.to_string());
+        }
+    }
+
     match trimmed.strip_prefix("/model") {
         // "/models-are-great" is a message, not a malformed command.
         Some(rest) if rest.is_empty() => return Submission::ShowModel,
@@ -357,6 +384,21 @@ pub fn classify(text: &str) -> Submission {
         _ => {}
     }
 
+    if bare_command(trimmed, "/allow") {
+        return Submission::AllowTool;
+    }
+    if bare_command(trimmed, "/deny") {
+        return Submission::DenyTool;
+    }
+    if bare_command(trimmed, "/back") {
+        return Submission::Back;
+    }
+    if bare_command(trimmed, "/send") {
+        return Submission::SendShell;
+    }
+    if bare_command(trimmed, "/discard") {
+        return Submission::DiscardShell;
+    }
     if bare_command(trimmed, "/agent") {
         return Submission::SetAgentic(true);
     }
@@ -550,7 +592,7 @@ fn command_word(trimmed: &str) -> Option<&str> {
 /// Every command word [`classify`] knows, for spotting a near miss. The four
 /// that always parse are here too: `/mdoel` should still be caught as a
 /// typo for `/model` even though `/model` itself can't be invoked wrongly.
-const KNOWN_COMMANDS: [&str; 13] = [
+const KNOWN_COMMANDS: [&str; 18] = [
     "model",
     "agent",
     "ask",
@@ -563,6 +605,11 @@ const KNOWN_COMMANDS: [&str; 13] = [
     "session",
     "status",
     "stream",
+    "send",
+    "discard",
+    "allow",
+    "deny",
+    "back",
     "verbose",
 ];
 
@@ -793,6 +840,49 @@ pub trait AgentUi {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_leading_dollar_runs_a_command() {
+        assert_eq!(
+            classify("$ cargo test"),
+            Submission::Shell("cargo test".to_string())
+        );
+        assert_eq!(
+            classify("$git status"),
+            Submission::Shell("git status".to_string())
+        );
+    }
+
+    #[test]
+    fn a_dollar_that_is_not_a_command_stays_a_message() {
+        // Only a leading `$` runs anything, and a bare one names nothing to
+        // run.
+        assert_eq!(
+            classify("it cost me $5"),
+            Submission::Message("it cost me $5".to_string())
+        );
+        assert_eq!(classify("$"), Submission::Message("$".to_string()));
+        // `Message` carries what was typed, trailing space and all.
+        assert!(matches!(classify("$   "), Submission::Message(_)));
+    }
+
+    #[test]
+    fn every_chord_has_a_typed_equivalent() {
+        // Not a convenience. Zed's terminal claims Ctrl-S and tmux claims
+        // Ctrl-B, and an approval whose keys are intercepted would leave a
+        // turn waiting on a decision with no way to give it.
+        assert_eq!(classify("/allow"), Submission::AllowTool);
+        assert_eq!(classify("/deny"), Submission::DenyTool);
+        assert_eq!(classify("/back"), Submission::Back);
+    }
+
+    #[test]
+    fn send_and_discard_are_typeable() {
+        // The path that keeps the feature working when a multiplexer has
+        // claimed Ctrl-S — and the one nobody exercises by habit.
+        assert_eq!(classify("/send"), Submission::SendShell);
+        assert_eq!(classify("/discard"), Submission::DiscardShell);
+    }
     use super::*;
 
     #[test]

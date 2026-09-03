@@ -280,6 +280,49 @@ fn to_readable_text(body: &str) -> String {
     }
 }
 
+/// Runs a command the way `$` does: the same execution, timeout and killing
+/// as the agent's own tool, but handed back as text rather than as a tool
+/// result.
+///
+/// stdout and stderr are joined in that order, because reading a failure
+/// means reading both and the interleaving is lost either way — the process
+/// is captured, not streamed.
+pub async fn run_shell_command(
+    command: &str,
+    working_dir: Option<&str>,
+    timeout_secs: u64,
+) -> Result<(String, i32)> {
+    let result = run_terminal_command(command, working_dir, timeout_secs).await?;
+
+    // The timeout and spawn-failure paths report an `error` instead of
+    // output, and there is no exit code to give for a process that never
+    // finished.
+    if let Some(error) = result.get("error").and_then(|v| v.as_str()) {
+        return Ok((error.to_string(), -1));
+    }
+
+    let field = |name: &str| {
+        result
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (stdout, stderr) = (field("stdout"), field("stderr"));
+    let output = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}{stderr}"),
+    };
+
+    let exit_code = result
+        .get("exit_code")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1) as i32;
+    Ok((output, exit_code))
+}
+
 /// Runs one tool call. `sandbox` is the session's current setting: with it
 /// on, the tools that write are confined to the working directory. Reads are
 /// not bounded either way — they mutate nothing, and confining them would
@@ -607,6 +650,16 @@ async fn run_terminal_command(
     let mut cmd = TokioCommand::new(shell);
     cmd.arg(shell_arg)
         .arg(command)
+        // Nothing to read. Left unset, the child inherits this process's
+        // stdin — which for the TUI is a terminal in raw mode that the event
+        // loop is already reading. An interactive command would then block
+        // forever waiting for input, with its own prompt trapped in the
+        // piped stdout where nobody can see it, while it and the TUI fight
+        // over the same keystrokes; the only thing that ends it is the
+        // timeout. With stdin closed, the same command gets EOF at once and
+        // fails with its own error, which is a far better answer than a
+        // thirty-second silence.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Without this, cancelling a turn mid-tool-call drops the Child
@@ -698,6 +751,23 @@ async fn run_terminal_command(
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_command_that_wants_input_fails_instead_of_hanging() {
+        // `cat` with no arguments reads stdin until EOF. With stdin
+        // inherited it would block until the timeout killed it — and on the
+        // TUI it would be competing with the event loop for keystrokes.
+        let started = std::time::Instant::now();
+        let (output, exit_code) = run_shell_command("cat", None, 30).await.unwrap();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?} — stdin is not closed",
+            started.elapsed()
+        );
+        assert_eq!(exit_code, 0);
+        assert!(output.trim().is_empty(), "{output}");
+    }
 
     #[test]
     fn the_user_agent_identifies_the_tool() {

@@ -1109,6 +1109,22 @@ fn apply_submission(
 ) -> Result<()> {
     match submission {
         ui::Submission::Message(_) => unreachable!("handled by the caller"),
+        // TUI-only for now. The box that shows a command's output and asks
+        // whether to send it has no equivalent in a blocking prompt loop, so
+        // `$` here would have to mean something different — see TODO.
+        ui::Submission::Shell(_)
+        | ui::Submission::SendShell
+        | ui::Submission::DiscardShell
+        // The CLI answers an approval at its own blocking prompt, and has no
+        // launch screen to go back to.
+        | ui::Submission::AllowTool
+        | ui::Submission::DenyTool
+        | ui::Submission::Back => {
+            println!(
+                "{} that's a TUI command (`comms tui`), not available here",
+                "✗".red()
+            );
+        }
         ui::Submission::SetModel(model) => {
             let changed = model != session.model();
             session.set_model(model)?;
