@@ -4,6 +4,10 @@ use super::app::{App, ShellState, ToolStatus, TranscriptItem};
 use crate::ui::{json_fields, summarize, tool_call_fields, ApprovalRequest};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use unicode_width::UnicodeWidthStr;
 
 /// Spinner frames, reused from the CLI's so both front ends feel the same.
 /// Shared with the picker's working badge, so a busy session animates the
@@ -82,7 +86,7 @@ pub(super) fn identicon(seed: &str) -> (String, Style) {
     )
 }
 
-pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
+pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usize) {
     // The message box grows with what's been typed into it, and with nothing
     // else. An approval used to take the box over — borrowing the input as
     // its answer buffer — so a decision arriving mid-sentence displaced what
@@ -132,7 +136,7 @@ pub fn draw(frame: &mut Frame, app: &App, tick: usize) {
 
     draw_title(frame, areas[0], app);
     draw_rule(frame, areas[1], None);
-    let scrolled = draw_transcript(frame, areas[2], app);
+    let scrolled = draw_transcript(frame, areas[2], app, cache);
     if let Some(request) = &app.pending_approval {
         draw_approval(frame, areas[3], request);
     }
@@ -377,43 +381,248 @@ pub(super) fn draw_rule(frame: &mut Frame, area: Rect, hint: Option<&str>) {
 
 /// Draws the transcript and reports whether the view is scrolled away from
 /// the newest content, so the top status row can flag it.
-fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
-    let mut lines: Vec<Line> = Vec::new();
+fn draw_transcript(frame: &mut Frame, area: Rect, app: &App, cache: &mut TranscriptCache) -> bool {
     // User/Assistant text is wrapped by hand (see `wrap_styled`) rather
     // than left to ratatui's `Wrap`, specifically so a row broken by
     // wrapping — not just one broken by a literal newline — still lines up
     // under the gutter instead of resuming at column 0.
     let content_width = area.width.saturating_sub(2).max(1) as usize;
 
-    for item in &app.transcript {
-        match item {
-            TranscriptItem::User(text) => {
-                let start = lines.len();
-                push_block(
-                    &mut lines,
-                    Span::styled("❯ ", Style::new().green().bold()),
-                    text,
-                    None,
-                    content_width,
-                );
-                // A band behind what you said, so your own messages are
-                // findable while scrolling back through a long turn without
-                // having to read them. Padded to the full width first: a
-                // background only paints the cells a line actually covers,
-                // so an unpadded one would end raggedly at the text.
-                highlight_rows(&mut lines[start..], area.width as usize, app.highlight);
-                lines.push(Line::raw(""));
+    // No border, and the title now rides in its own row above `area`
+    // (see `draw_title`), so the whole of `area` is free for content.
+    let visible = area.height;
+
+    // Every block's rows, rendered once and kept. Building them fresh every
+    // frame meant re-parsing the markdown of every reply in the conversation
+    // to arrive at rows identical to the ones just thrown away.
+    cache.begin();
+    let keys: Vec<u64> = app
+        .transcript
+        .iter()
+        .map(|item| cache.ensure(item, app, area.width, content_width))
+        .collect();
+    // Swept before anything borrows the rows, since the sweep mutates.
+    cache.end();
+
+    // Pointers to those rows, in transcript order. This is the only pass
+    // that is still proportional to the length of the conversation, and it
+    // copies nothing. Two identical messages share a cache entry and so
+    // appear here twice, which is right — they draw the same.
+    let mut rows: Vec<&Line<'static>> = Vec::new();
+    for key in keys {
+        rows.extend(cache.get(key));
+    }
+
+    // Every block appends a trailing blank; drop it so the newest message
+    // sits flush against the bottom rather than floating above a gap.
+    while matches!(rows.last(), Some(line) if line.spans.iter().all(|s| s.content.is_empty())) {
+        rows.pop();
+    }
+
+    // Rows are already wrapped to `content_width` by hand, so one row is one
+    // line on screen and the height is just the count — no second pass by
+    // ratatui to measure it, and none to draw it. That is also why the
+    // paragraph below sets no `Wrap`: anything it had to fold would be a row
+    // that was mis-measured on the way in, and `no_rendered_row_is_wider_
+    // than_the_pane` is what stops that happening.
+    let total = rows.len() as u16;
+
+    // Grow the conversation up from the input box instead of down from the
+    // title, the way a chat reads: until there's enough to fill the pane,
+    // the newest message still sits at the bottom. Done by standing the
+    // paragraph on the pane's bottom edge rather than padding above it.
+    let target = if total < visible {
+        Rect {
+            y: area.y + (visible - total),
+            height: total,
+            ..area
+        }
+    } else {
+        area
+    };
+
+    let max_offset = total.saturating_sub(visible);
+    // scroll_back counts up from the bottom; 0 pins to the newest content.
+    let offset = max_offset.saturating_sub(app.scroll_back.min(max_offset));
+
+    // Only what will be on screen is copied. Everything above is a pointer
+    // that never gets dereferenced, which is what keeps a frame the same
+    // price in a long conversation as in a short one.
+    let first = offset as usize;
+    let last = (first + target.height as usize).min(rows.len());
+    let window: Vec<Line<'static>> = rows[first..last].iter().map(|row| (*row).clone()).collect();
+
+    frame.render_widget(Paragraph::new(Text::from(window)), target);
+
+    // Reported so the rule below can carry the "scrolled" notice instead of
+    // a border's bottom title, since there's no border to carry it anymore.
+    !app.is_pinned_to_bottom() && max_offset > 0
+}
+
+/// Rendered rows for each transcript block, so a block that hasn't changed
+/// is not built again.
+///
+/// A finished reply renders to exactly the same rows on every frame, but
+/// producing them means parsing its markdown and wrapping it — together
+/// about two thirds of the cost of a frame, spent to reproduce rows that
+/// were just discarded. Redrawing at ten frames a second made that the
+/// dominant cost of a long session.
+///
+/// Keyed by content rather than by position: a block's index shifts when
+/// thinking slots in ahead of the reply it led to, and two identical
+/// messages can share one entry because they render identically anyway.
+#[derive(Default)]
+pub(super) struct TranscriptCache {
+    rows: HashMap<u64, Vec<Line<'static>>>,
+    /// Keys used by the frame being drawn, so everything else can be
+    /// dropped at the end of it. Without this, every streamed delta would
+    /// leave its own superseded entry behind for the rest of the session.
+    live: HashSet<u64>,
+}
+
+impl TranscriptCache {
+    fn begin(&mut self) {
+        self.live.clear();
+    }
+
+    /// Renders `item` if it isn't already held, and returns its key.
+    ///
+    /// Split from [`Self::get`] so a frame can populate the cache in one
+    /// pass and then borrow every block's rows in a second — the rows are
+    /// referenced into the visible window rather than copied out of it, and
+    /// that can't happen while the cache is still being mutated.
+    fn ensure(
+        &mut self,
+        item: &TranscriptItem,
+        app: &App,
+        area_width: u16,
+        content_width: usize,
+    ) -> u64 {
+        let key = item_key(item, app, area_width, content_width);
+        self.live.insert(key);
+        self.rows
+            .entry(key)
+            .or_insert_with(|| render_item(item, app, area_width, content_width));
+        key
+    }
+
+    /// The rows held for `key`, which [`Self::ensure`] has already put there.
+    fn get(&self, key: u64) -> &[Line<'static>] {
+        self.rows.get(&key).map_or(&[], Vec::as_slice)
+    }
+
+    fn end(&mut self) {
+        // Borrowed out so `retain`'s closure isn't reaching through `self`
+        // while `rows` is mutably borrowed.
+        let live = &self.live;
+        self.rows.retain(|key, _| live.contains(key));
+    }
+}
+
+/// Everything that decides how `item` draws, hashed into a cache key.
+///
+/// Deliberately conservative: the layout inputs shared by every block
+/// (`area_width`, `content_width`) and the flags that change how some of
+/// them draw (`verbose`, `highlight`, `session_id`) go into every key, so a
+/// resize or a `/verbose` invalidates the whole cache rather than needing
+/// each variant to declare what it happens to read.
+///
+/// Two different blocks colliding on 64 bits would draw the wrong rows. At
+/// a few thousand blocks the odds are on the order of 1e-12, and the cache
+/// holds only one session's transcript.
+fn item_key(item: &TranscriptItem, app: &App, area_width: u16, content_width: usize) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    area_width.hash(&mut hasher);
+    content_width.hash(&mut hasher);
+    app.verbose.hash(&mut hasher);
+    app.highlight.hash(&mut hasher);
+    app.session_id.hash(&mut hasher);
+    // The discriminant is hashed by hand alongside the fields: two variants
+    // that happen to hold the same string must not land on the same key.
+    match item {
+        TranscriptItem::User(text) => (0u8, text).hash(&mut hasher),
+        TranscriptItem::Assistant {
+            text,
+            streaming,
+            label,
+        } => (1u8, text, streaming, label).hash(&mut hasher),
+        TranscriptItem::Thinking(text) => (2u8, text).hash(&mut hasher),
+        TranscriptItem::ToolCall {
+            name,
+            arguments,
+            status,
+        } => {
+            (3u8, name, arguments).hash(&mut hasher);
+            match status {
+                ToolStatus::AwaitingApproval => 0u8.hash(&mut hasher),
+                ToolStatus::Running => 1u8.hash(&mut hasher),
+                ToolStatus::Denied => 2u8.hash(&mut hasher),
+                ToolStatus::Done { result } => (3u8, result).hash(&mut hasher),
             }
-            TranscriptItem::Shell {
-                command,
-                output,
-                exit_code,
-                sent,
-            } => {
-                // Green like the user's own prompt marker: this is something
-                // you ran, not something the agent did.
-                lines.push(Line::from(vec![
-                    Span::styled("$ ", Style::new().green().bold()),
+        }
+        TranscriptItem::Shell {
+            command,
+            output,
+            exit_code,
+            sent,
+        } => (4u8, command, output, exit_code, sent).hash(&mut hasher),
+        TranscriptItem::Error(message) => (5u8, message).hash(&mut hasher),
+        TranscriptItem::Notice(message) => (6u8, message).hash(&mut hasher),
+        TranscriptItem::SessionStatus(rows) => (7u8, rows).hash(&mut hasher),
+        TranscriptItem::ApprovalStatus { approval, changed } => (
+            8u8,
+            approval.read_disk,
+            approval.write_disk,
+            approval.terminal,
+            changed,
+        )
+            .hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+/// One transcript block's rows: everything the cache stores against an item.
+///
+/// Split out of `draw_transcript` so a block can be rendered on its own and
+/// kept — nothing here reads anything but `item` and the parts of `app`
+/// that [`item_key`] hashes, which is what makes caching it sound.
+fn render_item(
+    item: &TranscriptItem,
+    app: &App,
+    area_width: u16,
+    content_width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    match item {
+        TranscriptItem::User(text) => {
+            let start = lines.len();
+            push_block(
+                &mut lines,
+                Span::styled("❯ ", Style::new().green().bold()),
+                text,
+                None,
+                content_width,
+            );
+            // A band behind what you said, so your own messages are
+            // findable while scrolling back through a long turn without
+            // having to read them. Padded to the full width first: a
+            // background only paints the cells a line actually covers,
+            // so an unpadded one would end raggedly at the text.
+            highlight_rows(&mut lines[start..], area_width as usize, app.highlight);
+            lines.push(Line::raw(""));
+        }
+        TranscriptItem::Shell {
+            command,
+            output,
+            exit_code,
+            sent,
+        } => {
+            // Green like the user's own prompt marker: this is something
+            // you ran, not something the agent did.
+            push_rendered(
+                &mut lines,
+                Span::styled("$ ", Style::new().green().bold()),
+                vec![Line::from(vec![
                     Span::styled(command.clone(), Style::new().green()),
                     // Sending adds the output to the conversation without
                     // starting a turn, so that it arrives together with the
@@ -431,238 +640,213 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &App) -> bool {
                         },
                         Style::new().dark_gray().italic(),
                     ),
-                ]));
-                if !output.trim().is_empty() {
-                    push_block(
-                        &mut lines,
-                        Span::raw("  "),
-                        output.trim_end(),
-                        None,
-                        content_width,
-                    );
-                }
-                lines.push(Line::raw(""));
+                ])],
+                None,
+                content_width,
+                "  ",
+            );
+            if !output.trim().is_empty() {
+                push_block(
+                    &mut lines,
+                    Span::raw("  "),
+                    output.trim_end(),
+                    None,
+                    content_width,
+                );
             }
-            TranscriptItem::Assistant {
-                text, streaming, ..
-            } => {
-                // The session's own mark, the same one its row carries on the
-                // picker — so the conversation you are reading is tied to the
-                // one you picked, rather than the gutter saying nothing.
-                //
-                // Braille is also the only block where every pattern is East
-                // Asian Width Neutral. The `●` this replaces is Ambiguous —
-                // some terminals draw it two cells wide, which shifted the
-                // whole gutter against the wrapped lines beneath it.
-                let (glyph, mark_style) = identicon(&app.session_id);
-                let prefix = Span::styled(format!("{glyph} "), mark_style);
-                let cursor = streaming.then(|| Span::styled("▌", Style::new().cyan()));
-                if *streaming {
-                    // Mid-stream the text is usually mid-construct — an
-                    // unclosed fence or a half-written list — so render it
-                    // plainly and let the finished message reformat once.
-                    push_block(&mut lines, prefix, text, cursor, content_width - 1);
-                } else {
-                    push_rendered(
-                        &mut lines,
-                        prefix,
-                        markdown_lines(text),
-                        cursor,
-                        // The same treatment as the tool gutter: this one is
-                        // 3 columns (two braille cells and a space) where
-                        // `content_width` assumes 2, so wrap one narrower or
-                        // a full-width row overflows and gets wrapped again,
-                        // out from under the gutter.
-                        content_width.saturating_sub(1),
-                        SQUARE_CONTINUATION,
-                    );
-                }
-                lines.push(Line::raw(""));
-            }
-            TranscriptItem::ToolCall {
-                name,
-                arguments,
-                status,
-            } => {
-                // No trailing marker while running — the spinner-driven
-                // "working" state in the settings row already says so; a
-                // static triangle here didn't add anything.
-                let marker: Option<(&str, Style)> = match status {
-                    ToolStatus::AwaitingApproval => Some(("?", Style::new().yellow())),
-                    ToolStatus::Running => None,
-                    ToolStatus::Denied => Some(("✗", Style::new().red())),
-                    ToolStatus::Done { .. } => Some(("✓", Style::new().green())),
-                };
-                let mut header = vec![Span::styled(name.clone(), Style::new().bold())];
-                // The file or command a call is acting on identifies it well
-                // enough to show even without -v; the rest of its arguments
-                // (and its result) are the detail that gates behind verbose.
-                if let Some(detail) = crate::ui::primary_argument(arguments) {
-                    header.push(Span::styled(
-                        format!("  {}", summarize(&detail, 60)),
-                        Style::new().dark_gray(),
-                    ));
-                }
+            lines.push(Line::raw(""));
+        }
+        TranscriptItem::Assistant {
+            text, streaming, ..
+        } => {
+            // The session's own mark, the same one its row carries on the
+            // picker — so the conversation you are reading is tied to the
+            // one you picked, rather than the gutter saying nothing.
+            //
+            // Braille is also the only block where every pattern is East
+            // Asian Width Neutral. The `●` this replaces is Ambiguous —
+            // some terminals draw it two cells wide, which shifted the
+            // whole gutter against the wrapped lines beneath it.
+            let (glyph, mark_style) = identicon(&app.session_id);
+            let prefix = Span::styled(format!("{glyph} "), mark_style);
+            let cursor = streaming.then(|| Span::styled("▌", Style::new().cyan()));
+            if *streaming {
+                // Mid-stream the text is usually mid-construct — an
+                // unclosed fence or a half-written list — so render it
+                // plainly and let the finished message reformat once.
+                push_block(&mut lines, prefix, text, cursor, content_width - 1);
+            } else {
                 push_rendered(
                     &mut lines,
-                    // The gutter marks the row as a tool call; the status
-                    // (still color-coded) rides at the end instead, as a
-                    // `trailing` marker — same mechanism the streaming
-                    // cursor uses, so it always lands on the last wrapped
-                    // row rather than getting buried mid-wrap.
-                    Span::styled("🔨 ", Style::new().magenta()),
-                    vec![Line::from(header)],
-                    marker.map(|(m, style)| Span::styled(format!(" {m}"), style)),
-                    // `content_width` assumes a 2-column prefix, one less
-                    // than "🔨 "'s actual 3 (🔨 is double-width) — wrap one
-                    // column narrower so the prefixed row still fits, rather
-                    // than overflowing the terminal width and getting
-                    // wrapped a second time, out from under the gutter.
+                    prefix,
+                    markdown_lines(text),
+                    cursor,
+                    // The same treatment as the tool gutter: this one is
+                    // 3 columns (two braille cells and a space) where
+                    // `content_width` assumes 2, so wrap one narrower or
+                    // a full-width row overflows and gets wrapped again,
+                    // out from under the gutter.
+                    content_width.saturating_sub(1),
+                    SQUARE_CONTINUATION,
+                );
+            }
+            lines.push(Line::raw(""));
+        }
+        TranscriptItem::ToolCall {
+            name,
+            arguments,
+            status,
+        } => {
+            // No trailing marker while running — the spinner-driven
+            // "working" state in the settings row already says so; a
+            // static triangle here didn't add anything.
+            let marker: Option<(&str, Style)> = match status {
+                ToolStatus::AwaitingApproval => Some(("?", Style::new().yellow())),
+                ToolStatus::Running => None,
+                ToolStatus::Denied => Some(("✗", Style::new().red())),
+                ToolStatus::Done { .. } => Some(("✓", Style::new().green())),
+            };
+            let mut header = vec![Span::styled(name.clone(), Style::new().bold())];
+            // The file or command a call is acting on identifies it well
+            // enough to show even without -v; the rest of its arguments
+            // (and its result) are the detail that gates behind verbose.
+            if let Some(detail) = crate::ui::primary_argument(arguments) {
+                header.push(Span::styled(
+                    format!("  {}", summarize(&detail, 60)),
+                    Style::new().dark_gray(),
+                ));
+            }
+            push_rendered(
+                &mut lines,
+                // The gutter marks the row as a tool call; the status
+                // (still color-coded) rides at the end instead, as a
+                // `trailing` marker — same mechanism the streaming
+                // cursor uses, so it always lands on the last wrapped
+                // row rather than getting buried mid-wrap.
+                Span::styled("🔨 ", Style::new().magenta()),
+                vec![Line::from(header)],
+                marker.map(|(m, style)| Span::styled(format!(" {m}"), style)),
+                // `content_width` assumes a 2-column prefix, one less
+                // than "🔨 "'s actual 3 (🔨 is double-width) — wrap one
+                // column narrower so the prefixed row still fits, rather
+                // than overflowing the terminal width and getting
+                // wrapped a second time, out from under the gutter.
+                content_width.saturating_sub(1),
+                "   ",
+            );
+            if app.verbose {
+                for (key, shown) in tool_call_fields(name, arguments) {
+                    push_labeled(&mut lines, format!("     {key}  "), shown, content_width);
+                }
+                if let ToolStatus::Done { result } = status {
+                    for (key, shown) in json_fields(result) {
+                        push_labeled(&mut lines, format!("     {key}  "), shown, content_width);
+                    }
+                }
+            }
+            lines.push(Line::raw(""));
+        }
+        TranscriptItem::Thinking(text) => {
+            if app.verbose {
+                let thought: Vec<Line<'static>> = text
+                    .lines()
+                    .map(|line| {
+                        Line::from(Span::styled(
+                            line.to_string(),
+                            Style::new().dark_gray().italic(),
+                        ))
+                    })
+                    .collect();
+                push_rendered(
+                    &mut lines,
+                    Span::styled("💭 ", Style::new().dark_gray()),
+                    thought,
+                    None,
+                    // 💭 is double-width, so wrap a column narrower —
+                    // same adjustment the tool-call gutter makes.
                     content_width.saturating_sub(1),
                     "   ",
                 );
-                if app.verbose {
-                    for (key, shown) in tool_call_fields(name, arguments) {
-                        push_labeled(&mut lines, format!("     {key}  "), shown, content_width);
-                    }
-                    if let ToolStatus::Done { result } = status {
-                        for (key, shown) in json_fields(result) {
-                            push_labeled(&mut lines, format!("     {key}  "), shown, content_width);
-                        }
-                    }
-                }
-                lines.push(Line::raw(""));
-            }
-            TranscriptItem::Thinking(text) => {
-                if app.verbose {
-                    let thought: Vec<Line<'static>> = text
-                        .lines()
-                        .map(|line| {
-                            Line::from(Span::styled(
-                                line.to_string(),
-                                Style::new().dark_gray().italic(),
-                            ))
-                        })
-                        .collect();
-                    push_rendered(
-                        &mut lines,
-                        Span::styled("💭 ", Style::new().dark_gray()),
-                        thought,
-                        None,
-                        // 💭 is double-width, so wrap a column narrower —
-                        // same adjustment the tool-call gutter makes.
-                        content_width.saturating_sub(1),
-                        "   ",
-                    );
-                    lines.push(Line::raw(""));
-                }
-            }
-            TranscriptItem::Error(message) => {
-                lines.push(Line::from(vec![
-                    Span::styled("✗ ", Style::new().red().bold()),
-                    Span::styled(message.clone(), Style::new().red()),
-                ]));
-                lines.push(Line::raw(""));
-            }
-            TranscriptItem::Notice(message) => {
-                lines.push(Line::from(vec![
-                    Span::styled("— ", Style::new().dark_gray().italic()),
-                    Span::styled(message.clone(), Style::new().dark_gray().italic()),
-                ]));
-                lines.push(Line::raw(""));
-            }
-            TranscriptItem::SessionStatus(rows) => {
-                lines.push(Line::from(vec![
-                    Span::styled("— ", Style::new().dark_gray().italic()),
-                    Span::styled("Session:", Style::new().dark_gray().italic()),
-                ]));
-                // Values line up under each other, so the column of labels
-                // reads as a list rather than as ragged prose.
-                let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
-                for (label, value) in rows {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("      {label:<width$}  "), Style::new().dark_gray()),
-                        Span::raw(value.clone()),
-                    ]));
-                }
-                lines.push(Line::raw(""));
-            }
-            TranscriptItem::ApprovalStatus { approval, changed } => {
-                lines.push(Line::from(vec![
-                    Span::styled("— ", Style::new().dark_gray().italic()),
-                    Span::styled(
-                        format!("Approval {}:", if *changed { "set to" } else { "is" }),
-                        Style::new().dark_gray().italic(),
-                    ),
-                ]));
-                for (label, enabled) in [
-                    ("Read from disk:    ", approval.read_disk),
-                    ("Write to disk:     ", approval.write_disk),
-                    ("Terminal commands: ", approval.terminal),
-                ] {
-                    let (mark, word, style) = if enabled {
-                        ("✓", "Ask", Style::new().green())
-                    } else {
-                        ("✗", "Auto", Style::new().yellow())
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("      {label}"), Style::new().dark_gray()),
-                        Span::styled(format!("{mark} {word}"), style),
-                    ]));
-                }
                 lines.push(Line::raw(""));
             }
         }
+        TranscriptItem::Error(message) => {
+            push_rendered(
+                &mut lines,
+                Span::styled("✗ ", Style::new().red().bold()),
+                vec![Line::from(Span::styled(message.clone(), Style::new().red()))],
+                None,
+                content_width,
+                "  ",
+            );
+            lines.push(Line::raw(""));
+        }
+        TranscriptItem::Notice(message) => {
+            push_rendered(
+                &mut lines,
+                Span::styled("— ", Style::new().dark_gray().italic()),
+                vec![Line::from(Span::styled(
+                    message.clone(),
+                    Style::new().dark_gray().italic(),
+                ))],
+                None,
+                content_width,
+                "  ",
+            );
+            lines.push(Line::raw(""));
+        }
+        TranscriptItem::SessionStatus(rows) => {
+            lines.push(Line::from(vec![
+                Span::styled("— ", Style::new().dark_gray().italic()),
+                Span::styled("Session:", Style::new().dark_gray().italic()),
+            ]));
+            // Values line up under each other, so the column of labels
+            // reads as a list rather than as ragged prose.
+            let width = rows
+                .iter()
+                .map(|(label, _)| display_width(label))
+                .max()
+                .unwrap_or(0);
+            for (label, value) in rows {
+                // Through `push_labeled` so a long value — a working
+                // directory, usually — wraps under its label rather than
+                // running off the pane.
+                push_labeled(
+                    &mut lines,
+                    format!("      {label:<width$}  "),
+                    value.clone(),
+                    content_width,
+                );
+            }
+            lines.push(Line::raw(""));
+        }
+        TranscriptItem::ApprovalStatus { approval, changed } => {
+            lines.push(Line::from(vec![
+                Span::styled("— ", Style::new().dark_gray().italic()),
+                Span::styled(
+                    format!("Approval {}:", if *changed { "set to" } else { "is" }),
+                    Style::new().dark_gray().italic(),
+                ),
+            ]));
+            for (label, enabled) in [
+                ("Read from disk:    ", approval.read_disk),
+                ("Write to disk:     ", approval.write_disk),
+                ("Terminal commands: ", approval.terminal),
+            ] {
+                let (mark, word, style) = if enabled {
+                    ("✓", "Ask", Style::new().green())
+                } else {
+                    ("✗", "Auto", Style::new().yellow())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("      {label}"), Style::new().dark_gray()),
+                    Span::styled(format!("{mark} {word}"), style),
+                ]));
+            }
+            lines.push(Line::raw(""));
+        }
     }
-
-    // Every block appends a trailing blank; drop it so the newest message
-    // sits flush against the bottom rather than floating above a gap.
-    while matches!(lines.last(), Some(line) if line.spans.iter().all(|s| s.content.is_empty())) {
-        lines.pop();
-    }
-
-    // No border, and the title now rides in its own row above `area`
-    // (see `draw_title`), so the whole of `area` is free for content.
-    let inner_width = area.width;
-    let visible = area.height;
-
-    // Measured with ratatui's own wrapper rather than estimated: any
-    // disagreement between the estimate and the real layout shows up as the
-    // view scrolling to the wrong place, which on a long transcript means
-    // the newest messages land outside the pane entirely. The clone is only
-    // for measuring; the rendered paragraph is built below.
-    let measure = |lines: Vec<Line<'static>>| -> (u16, Vec<Line<'static>>) {
-        let height = Paragraph::new(Text::from(lines.clone()))
-            .wrap(Wrap { trim: false })
-            .line_count(inner_width) as u16;
-        (height, lines)
-    };
-    let (mut total, mut lines) = measure(lines);
-
-    // Grow the conversation up from the input box instead of down from the
-    // title, the way a chat reads: until there's enough to fill the pane,
-    // pad above so the newest message stays at the bottom.
-    if total < visible {
-        let mut padded = vec![Line::raw(""); (visible - total) as usize];
-        padded.extend(lines);
-        lines = padded;
-        total = visible;
-    }
-
-    let text = Text::from(lines);
-    // Wrapping is recomputed every frame, which is what lets streamed text
-    // re-flow as it grows — the thing a scrolling terminal can't do.
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
-
-    let max_offset = total.saturating_sub(visible);
-    // scroll_back counts up from the bottom; 0 pins to the newest content.
-    let offset = max_offset.saturating_sub(app.scroll_back.min(max_offset));
-
-    frame.render_widget(paragraph.scroll((offset, 0)), area);
-
-    // Reported so the rule below can carry the "scrolled" notice instead of
-    // a border's bottom title, since there's no border to carry it anymore.
-    !app.is_pinned_to_bottom() && max_offset > 0
+    lines
 }
 
 /// `scrolled` carries the "scrolled — End to follow" notice onto the box's
@@ -1052,12 +1236,20 @@ pub(super) fn highlight_rows(rows: &mut [Line<'static>], width: usize, on: bool)
 
 /// Fills a line out to `width` so a background paints the whole row rather
 /// than stopping where the text does.
+/// How many terminal cells a string occupies.
+///
+/// Not `chars().count()`: an emoji or a CJK glyph is one character and two
+/// cells, so counting characters under-measures and the row overflows the
+/// pane. That used to be caught by ratatui's `Wrap` re-wrapping the row —
+/// the "wrapped again, out from under the gutter" the gutter widths above
+/// still subtract 1 to work around — but the transcript now renders
+/// unwrapped, where the same row is silently clipped instead.
+fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
 pub(super) fn pad_to(line: &mut Line<'static>, width: usize) {
-    let used: usize = line
-        .spans
-        .iter()
-        .map(|span| span.content.chars().count())
-        .sum();
+    let used: usize = line.spans.iter().map(|span| display_width(&span.content)).sum();
     if used < width {
         line.spans.push(Span::raw(" ".repeat(width - used)));
     }
@@ -1075,7 +1267,7 @@ const SQUARE_CONTINUATION: &str = "   ";
 /// value itself rather than back at the label, since there's no icon here
 /// competing for that column.
 fn push_labeled(lines: &mut Vec<Line<'static>>, label: String, value: String, width: usize) {
-    let label_width = label.chars().count();
+    let label_width = display_width(&label);
     let value_width = width.saturating_sub(label_width).max(1);
     let blank = " ".repeat(label_width);
     for (index, mut row) in wrap_styled(Line::from(Span::raw(value)), value_width)
@@ -1198,17 +1390,45 @@ fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         }
     }
 
+    // The line's own leading whitespace, lifted off the front and put back
+    // on every row it wraps onto. Without this a long line inside a code
+    // block resumes at column 0, so a wrapped statement reads as though it
+    // had jumped out a nesting level. Prose is unaffected — it has no
+    // leading whitespace, so the indent is empty and nothing changes.
+    let leading: usize = tokens
+        .iter()
+        .take_while(|(_, _, is_space)| *is_space)
+        .count();
+    let indent: String = tokens[..leading].iter().map(|(text, ..)| text.as_str()).collect();
+    let indent_style = tokens.first().map(|(_, style, _)| *style).unwrap_or_default();
+    let indent_width = display_width(&indent);
+
+    // Only worth hanging while it leaves more room than it takes. A deeply
+    // indented line in a narrow pane is better wrapped flush than shredded
+    // into a two-column strip down the right-hand side.
+    let (indent, body_width) = if indent_width > 0 && indent_width * 2 <= width {
+        (indent, width - indent_width)
+    } else {
+        (String::new(), width)
+    };
+    let tokens = if indent.is_empty() {
+        tokens
+    } else {
+        tokens.split_off(leading)
+    };
+    let width = body_width;
+
     let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
     let mut col = 0usize;
     for (index, (text, style, is_space)) in tokens.into_iter().enumerate() {
-        let token_width = text.chars().count();
+        let token_width = display_width(&text);
 
         if is_space {
             // A space landing exactly at the start of a row *a wrap broke
             // onto* is just where the break happened to fall — starting
             // that row indented by it would look like a stray extra space.
-            // But the line's own leading whitespace (`index == 0`, e.g. a
-            // code block's indentation) is real content and must survive.
+            // Leading whitespace never reaches here: it was taken off above
+            // and is re-applied to every row below.
             if col == 0 && index != 0 {
                 continue;
             }
@@ -1245,7 +1465,14 @@ fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         col += token_width;
     }
 
-    rows.into_iter().map(Line::from).collect()
+    rows.into_iter()
+        .map(|mut spans| {
+            if !indent.is_empty() {
+                spans.insert(0, Span::styled(indent.clone(), indent_style));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1460,8 +1687,14 @@ mod tests {
     /// Renders to an off-screen buffer and returns it as text, so layout can
     /// be asserted (and panics caught) without a real terminal.
     fn render_to_string(app: &App, width: u16, height: u16) -> String {
+        render_with(app, &mut TranscriptCache::default(), width, height)
+    }
+
+    /// Renders through a caller-owned cache, so a second call exercises the
+    /// warm path that `render_to_string` never reaches.
+    fn render_with(app: &App, cache: &mut TranscriptCache, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, app, 0)).unwrap();
+        terminal.draw(|frame| draw(frame, app, cache, 0)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
             .map(|y| {
@@ -1483,6 +1716,287 @@ mod tests {
         });
         app
     }
+
+    #[test]
+    fn a_second_frame_off_the_cache_draws_what_the_first_one_did() {
+        let app = sample_app();
+        let mut cache = TranscriptCache::default();
+        let cold = render_with(&app, &mut cache, 60, 20);
+        assert!(!cache.rows.is_empty(), "nothing was cached");
+        let warm = render_with(&app, &mut cache, 60, 20);
+        assert_eq!(cold, warm, "cached rows drew differently from fresh ones");
+    }
+
+    #[test]
+    fn editing_a_message_retires_the_rows_cached_for_it() {
+        let mut app = sample_app();
+        let mut cache = TranscriptCache::default();
+        let before = render_with(&app, &mut cache, 60, 20);
+        assert!(before.contains("hi there"));
+
+        let Some(TranscriptItem::Assistant { text, .. }) = app.transcript.last_mut() else {
+            panic!("sample_app should end on a reply");
+        };
+        *text = "different answer".to_string();
+
+        let after = render_with(&app, &mut cache, 60, 20);
+        assert!(after.contains("different answer"), "{after}");
+        assert!(
+            !after.contains("hi there"),
+            "stale rows survived the edit:\n{after}"
+        );
+    }
+
+    #[test]
+    fn a_resize_redraws_rather_than_reusing_rows_wrapped_for_the_old_width() {
+        let mut app = App::new("m".to_string(), None, "abcd1234".to_string());
+        app.transcript.push(TranscriptItem::Assistant {
+            text: "a ".repeat(60),
+            streaming: false,
+            label: None,
+        });
+        let mut cache = TranscriptCache::default();
+
+        let narrow = render_with(&app, &mut cache, 40, 20);
+        let wide = render_with(&app, &mut cache, 100, 20);
+        // Wrapped at 40 the text needs more rows than at 100, so a cache
+        // that ignored width would show the narrow shape in a wide pane.
+        let rows = |s: &str| s.lines().filter(|l| l.contains('a')).count();
+        assert!(
+            rows(&narrow) > rows(&wide),
+            "narrow={} wide={}",
+            rows(&narrow),
+            rows(&wide)
+        );
+    }
+
+    #[test]
+    fn toggling_verbose_redraws_the_blocks_it_changes() {
+        let mut app = sample_app();
+        app.transcript.push(TranscriptItem::ToolCall {
+            name: "read_file".into(),
+            arguments: r#"{"path":"src/main.rs"}"#.into(),
+            status: ToolStatus::Done {
+                result: r#"{"bytes":42}"#.into(),
+            },
+        });
+        let mut cache = TranscriptCache::default();
+
+        let quiet = render_with(&app, &mut cache, 80, 24);
+        app.verbose = true;
+        let loud = render_with(&app, &mut cache, 80, 24);
+        assert!(!quiet.contains("bytes"), "{quiet}");
+        assert!(loud.contains("bytes"), "{loud}");
+    }
+
+    #[test]
+    fn a_streamed_reply_does_not_leave_a_cache_entry_per_delta() {
+        let mut app = App::new("m".to_string(), None, "abcd1234".to_string());
+        app.transcript.push(TranscriptItem::Assistant {
+            text: String::new(),
+            streaming: true,
+            label: None,
+        });
+        let mut cache = TranscriptCache::default();
+
+        // Each delta gives the block new content and so a new key. Without
+        // the end-of-frame sweep every superseded version would be held for
+        // the rest of the session.
+        for _ in 0..25 {
+            let Some(TranscriptItem::Assistant { text, .. }) = app.transcript.last_mut() else {
+                unreachable!()
+            };
+            text.push_str("more ");
+            render_with(&app, &mut cache, 60, 20);
+        }
+        assert_eq!(
+            cache.rows.len(),
+            app.transcript.len(),
+            "cache grew past the transcript it is caching"
+        );
+    }
+
+
+/// Every item type, with content chosen to overflow, at several widths.
+    fn overflowing_transcript() -> Vec<TranscriptItem> {
+        // Long words, long prose, and double-width glyphs — the last of
+        // which `chars().count()` measures as half their real size.
+        let prose = "supercalifragilistic ".repeat(12);
+        let wide = "絵文字テスト🔥🚀😀 ".repeat(10);
+        vec![
+            TranscriptItem::User(format!("{prose}{wide}")),
+            TranscriptItem::Assistant {
+                text: format!("**bold** {prose}\n\n- {wide}\n\n```rust\nlet x = {prose};\n```"),
+                streaming: false,
+                label: Some("some/very-long-model-name".into()),
+            },
+            TranscriptItem::Assistant {
+                text: format!("{prose}{wide}"),
+                streaming: true,
+                label: None,
+            },
+            TranscriptItem::Thinking(format!("{prose}{wide}")),
+            TranscriptItem::ToolCall {
+                name: "run_terminal_command".into(),
+                arguments: format!(r#"{{"command":"{prose}","cwd":"{wide}"}}"#),
+                status: ToolStatus::Done {
+                    result: format!(r#"{{"stdout":"{prose}"}}"#),
+                },
+            },
+            TranscriptItem::Shell {
+                command: format!("echo {prose}"),
+                output: format!("{prose}\n{wide}"),
+                exit_code: 1,
+                sent: true,
+            },
+            TranscriptItem::Error(format!("{prose}{wide}")),
+            TranscriptItem::Notice(format!("{prose}{wide}")),
+            TranscriptItem::SessionStatus(vec![
+                ("Working dir".into(), format!("/very/long/path/{prose}")),
+                ("Model".into(), wide.clone()),
+            ]),
+            TranscriptItem::ApprovalStatus {
+                approval: crate::config::ApprovalSettings::default(),
+                changed: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn no_rendered_row_is_wider_than_the_pane() {
+        // The transcript is drawn without ratatui's `Wrap`, so a row wider
+        // than the pane is silently clipped rather than folded onto the next
+        // line. Nothing else catches that, which is what this is for.
+        let mut app = App::new("m".to_string(), None, "abcd1234".to_string());
+        app.verbose = true;
+        for width in [40u16, 60, 80, 100, 200] {
+            let content_width = width.saturating_sub(2).max(1) as usize;
+            for item in overflowing_transcript() {
+                for row in render_item(&item, &app, width, content_width) {
+                    // Measured with the unicode-width call directly rather
+                    // than through `display_width`, so that this still fails
+                    // if `display_width` itself goes back to counting chars.
+                    let drawn: usize = row
+                        .spans
+                        .iter()
+                        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                        .sum();
+                    assert!(
+                        drawn <= width as usize,
+                        "row of {drawn} cells in a {width}-cell pane: {:?}",
+                        row.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    );
+                }
+            }
+        }
+    }
+
+#[test]
+    fn scrolling_back_walks_the_window_up_the_transcript() {
+        // The pane no longer hands the whole transcript to ratatui and asks
+        // it to scroll; it slices the rows itself. That arithmetic is what
+        // decides which message you are looking at, so it gets checked
+        // directly rather than only through the "scrolled" flag.
+        let mut app = App::new("m".to_string(), None, "abcd1234".to_string());
+        for i in 0..60 {
+            app.transcript.push(TranscriptItem::User(format!("message {i:02}")));
+        }
+        let mut cache = TranscriptCache::default();
+
+        let shown = |app: &App, cache: &mut TranscriptCache| -> Vec<usize> {
+            let out = render_with(app, cache, 40, 20);
+            (0..60)
+                .filter(|i| out.contains(&format!("message {i:02}")))
+                .collect()
+        };
+
+        let pinned = shown(&app, &mut cache);
+        assert!(
+            pinned.contains(&59) && !pinned.contains(&0),
+            "pinned to the bottom should show the newest: {pinned:?}"
+        );
+
+        app.scroll_back = 20;
+        let back = shown(&app, &mut cache);
+        assert!(
+            back.iter().max() < pinned.iter().max(),
+            "scrolling back should move the window up: {back:?} vs {pinned:?}"
+        );
+        assert!(!back.is_empty(), "scrolled window drew nothing");
+
+        // Past the top it clamps rather than running off the front.
+        app.scroll_back = 10_000;
+        let top = shown(&app, &mut cache);
+        assert!(
+            top.contains(&0),
+            "scrolling past the top should rest on the first message: {top:?}"
+        );
+        assert!(!top.contains(&59), "{top:?}");
+    }
+
+    #[test]
+    fn a_transcript_shorter_than_the_pane_still_sits_on_the_bottom() {
+        let mut app = App::new("m".to_string(), None, "abcd1234".to_string());
+        app.transcript.push(TranscriptItem::User("only message".into()));
+        let out = render_to_string(&app, 40, 20);
+        let rows: Vec<&str> = out.lines().collect();
+        let found = rows
+            .iter()
+            .position(|r| r.contains("only message"))
+            .expect("message missing");
+        // Above the input box, not pinned under the title.
+        assert!(found > rows.len() / 2, "sat at row {found} of {}", rows.len());
+    }
+
+
+
+fn flat(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn a_wrapped_line_hangs_under_its_own_indentation() {
+        // A statement inside a code block: when it wraps, the rows it wraps
+        // onto have to stay at its nesting level. Resuming at column 0 reads
+        // as though the code had jumped out a block.
+        let code = "        let value = some_function(first_argument, second_argument, third);";
+        let rows = wrap_styled(Line::from(Span::raw(code)), 40);
+        assert!(rows.len() > 2, "needs a line that actually wraps");
+        for (index, row) in rows.iter().enumerate() {
+            assert!(
+                flat(row).starts_with("        "),
+                "row {index} lost the indent: {:?}",
+                flat(row)
+            );
+        }
+    }
+
+    #[test]
+    fn prose_is_not_given_an_indent_it_never_had() {
+        let rows = wrap_styled(Line::from(Span::raw("plain prose ".repeat(12))), 30);
+        assert!(rows.len() > 1);
+        for row in &rows {
+            assert!(!flat(row).starts_with(' '), "{:?}", flat(row));
+        }
+    }
+
+    #[test]
+    fn an_indent_with_no_room_left_to_hang_is_dropped() {
+        // 30 columns of indent in a 40-column pane would leave a 10-column
+        // strip down the right-hand side, which is worse than wrapping flush.
+        let code = format!("{}{}", " ".repeat(30), "a word list that has to wrap".repeat(2));
+        let rows = wrap_styled(Line::from(Span::raw(code)), 40);
+        assert!(rows.len() > 1);
+        assert!(
+            !flat(&rows[1]).starts_with(' '),
+            "hung anyway: {:?}",
+            flat(&rows[1])
+        );
+    }
+
 
     #[test]
     fn renders_conversation_and_status() {

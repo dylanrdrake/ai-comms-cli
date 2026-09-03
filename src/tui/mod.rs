@@ -88,6 +88,9 @@ enum Screen {
 struct Chat {
     app: App,
     conversation: Conversation,
+    /// Rendered transcript blocks, kept between frames. Lives here rather
+    /// than on `App`, which is deliberately free of rendering types.
+    transcript_cache: render::TranscriptCache,
 }
 
 /// Runs the TUI until the user quits. Always opens on the launch screen —
@@ -273,7 +276,11 @@ fn start_chat(
         context.effort_level.clone(),
         agentic,
     );
-    Chat { app, conversation }
+    Chat {
+        app,
+        conversation,
+        transcript_cache: render::TranscriptCache::default(),
+    }
 }
 
 /// Replays a resumed session into the transcript so the TUI opens showing
@@ -419,7 +426,7 @@ async fn next_conversation_event(screen: &mut Screen) -> Option<crate::conversat
     }
 }
 
-fn draw(terminal: &mut Tui, screen: &Screen, tick: usize, selection: bool) -> Result<()> {
+fn draw(terminal: &mut Tui, screen: &mut Screen, tick: usize, selection: bool) -> Result<()> {
     terminal.draw(|frame| match screen {
         Screen::Launch(p) => picker::draw(
             frame,
@@ -431,7 +438,7 @@ fn draw(terminal: &mut Tui, screen: &Screen, tick: usize, selection: bool) -> Re
             tick,
         ),
         Screen::NameSession { input } => picker::draw_naming(frame, input),
-        Screen::Chat(chat) => render::draw(frame, &chat.app, tick),
+        Screen::Chat(chat) => render::draw(frame, &chat.app, &mut chat.transcript_cache, tick),
     })?;
     Ok(())
 }
@@ -439,9 +446,19 @@ fn draw(terminal: &mut Tui, screen: &Screen, tick: usize, selection: bool) -> Re
 async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) -> Result<()> {
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
+    // A frame that overruns the tick must not queue up the ticks it missed:
+    // the default burst behaviour would fire them back to back, so a
+    // transcript slow enough to draw would spend all its time drawing.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_refresh = std::time::Instant::now();
     let mut tick = 0usize;
     let mut quit = false;
+    // Conversation events arrive per streamed token, and a redraw costs the
+    // whole transcript. Drawing on each one makes a reply cost the transcript
+    // times the number of tokens in it — so they only mark the screen stale
+    // and the ticker below decides when to spend a frame. Keystrokes are not
+    // coalesced: typing has to feel immediate.
+    let mut stale = false;
 
     draw(terminal, screen, tick, context.selection)?;
 
@@ -476,11 +493,16 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
                 if let Screen::Chat(chat) = screen {
                     chat.app.apply(event);
                 }
-                dirty = true;
+                stale = true;
             }
             // The worker stopped on its own; nothing more will arrive.
             Wake::Conversation(None) => {}
             Wake::Tick => {
+                // Whatever the deltas since the last frame added, drawn once.
+                if stale {
+                    stale = false;
+                    dirty = true;
+                }
                 // A `$` command run outside a turn leaves `busy` false, so
                 // without the second half its spinner sits on one frame.
                 if matches!(screen, Screen::Chat(chat)
@@ -511,6 +533,9 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
         }
 
         if dirty && !quit {
+            // This frame shows everything up to now, including deltas that
+            // were only marked stale — so they must not ask for another.
+            stale = false;
             draw(terminal, screen, tick, context.selection)?;
         }
     }
