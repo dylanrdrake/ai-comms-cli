@@ -1,6 +1,8 @@
-# Clanker Command Center
+# Clanker Command Center (WIP)
 
 An OpenAI-compatible CLI frontend for any LLM provider, with agentic tool capabilities, written in Rust. Defaults to OpenRouter, but works with any OpenAI-compatible service (OrcaRouter, Together, Groq, self-hosted gateways, etc) via `clank endpoint` — see [Using other providers](#using-other-providers).
+
+CCC is most stable on Linux at the moment!
 
 ## Features
 
