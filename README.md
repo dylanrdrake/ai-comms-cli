@@ -471,6 +471,7 @@ seconds so one you're running in another terminal stays current:
 | `?` yellow | Waiting on an approval nobody has answered |
 | `✗` red | The last turn ended in an error — worth resuming to see why |
 | `✓` green | The model answered; the turn ran to completion |
+| `⧉` grey | Held by another process — it can be seen but not opened. Only shown when nothing else already implies a live process: a working or waiting session says so with its own badge |
 | `⋯` cyan | Something was sent and nothing came back, and no process is saying otherwise |
 | `⚑` yellow | Stopped part-way — after a tool result with no answer, or on a tool call that never ran |
 | (blank) | Created, never used |
@@ -589,6 +590,26 @@ clank stream          # show the current setting
 clank stream off      # wait for complete replies
 clank stream on
 ```
+
+#### `timeout [name] [seconds]`
+How long the client waits, in four places. Bare `clank timeout` shows them all.
+
+```bash
+clank timeout                      # show all four
+clank timeout stream-idle          # show one
+clank timeout stream-idle 180      # set it
+```
+
+| | Default | Bounds |
+|---|---|---|
+| `connect` | 20s | Connecting: DNS, TCP and TLS. Independent of how long the provider then takes to answer |
+| `request` | 300s | A whole non-streaming reply. It has no partial progress to show, so it gets one generous ceiling |
+| `stream-idle` | 90s | The gap *between* streamed chunks. A long reply legitimately keeps sending, so there is no total ceiling — this catches a connection that has stalled rather than a model still thinking |
+| `command` | 30s | A terminal command the agent runs, when the model names no `timeout_secs` of its own |
+
+`stream-idle` is the one worth raising behind a slow provider: it is what
+ends a turn that was still coming. A timeout of `0` is refused, since it
+would fail every call before it started.
 
 #### `sessions`
 List, inspect, or delete saved `session`/`tui` sessions.

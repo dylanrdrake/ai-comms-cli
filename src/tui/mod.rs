@@ -259,10 +259,12 @@ fn start_chat(
     agentic: bool,
 ) -> Result<Chat> {
     let Some(claim) = crate::session::Heartbeat::claim(session.id().to_string())? else {
+        // One line, no paragraph breaks: this surfaces as the picker's
+        // notice, which is a single `Line`, and a `Line` renders `\n` as
+        // nothing at all rather than as a break — so a two-paragraph
+        // message arrives with its sentences run together.
         anyhow::bail!(
-            "Session {} is open in another terminal.\n\n\
-             Close it there, or wait — a claim left behind by a process that \
-             died expires on its own within half a minute.",
+            "Session {} is open in another terminal — a stale claim clears within half a minute",
             &session.id()[..8]
         );
     };
@@ -594,6 +596,15 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
     let Screen::Launch(p) = screen else {
         unreachable!("picker screen only")
     };
+
+    // Cleared before the key is acted on, not after: a notice reports what
+    // the *last* keypress did, and leaving it up makes a stale failure look
+    // like a fresh one. Anything below is free to set a new one, which is
+    // why this is the first thing rather than the last. Nothing used to
+    // clear it at all — survivable while the only way to get one was a
+    // session deleted from under the list, and much less so now that
+    // opening a session another terminal holds is a normal thing to hit.
+    p.notice = None;
 
     // A pending rename swallows everything until it's answered.
     if p.renaming.is_some() {

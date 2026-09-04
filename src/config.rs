@@ -136,6 +136,50 @@ pub struct Config {
     /// tool calls) badly, which falls back to waiting for the whole reply.
     #[serde(default = "default_true")]
     pub stream: bool,
+
+    /// How long connecting (DNS/TCP/TLS) may take before giving up —
+    /// independent of how long a slow-to-answer provider may then take once
+    /// connected, which the two below cover instead.
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout: u64,
+
+    /// The ceiling on a whole non-streaming round trip. It has no partial
+    /// progress to show, so it gets one generous bound: long enough for a
+    /// slow reasoning model, short enough that a stalled connection
+    /// eventually surfaces as an error instead of waiting forever.
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: u64,
+
+    /// The gap allowed *between* chunks of a streaming reply, which has no
+    /// meaningful total ceiling — a long answer legitimately keeps sending.
+    /// No new bytes within this window means the connection stalled, not
+    /// that the model is still thinking.
+    ///
+    /// The one most worth changing: 90s has cut real turns short more than
+    /// once behind a slow provider.
+    #[serde(default = "default_stream_idle_timeout")]
+    pub stream_idle_timeout: u64,
+
+    /// How long a terminal command the agent runs may take, when the model
+    /// does not name a timeout of its own in the call.
+    #[serde(default = "default_command_timeout")]
+    pub command_timeout: u64,
+}
+
+pub fn default_connect_timeout() -> u64 {
+    20
+}
+
+pub fn default_request_timeout() -> u64 {
+    300
+}
+
+pub fn default_stream_idle_timeout() -> u64 {
+    90
+}
+
+pub fn default_command_timeout() -> u64 {
+    30
 }
 
 pub fn default_base_url() -> String {
@@ -186,6 +230,10 @@ impl Default for Config {
             effort_style: default_effort_style(),
             extra_headers: HashMap::new(),
             stream: true,
+            connect_timeout: default_connect_timeout(),
+            request_timeout: default_request_timeout(),
+            stream_idle_timeout: default_stream_idle_timeout(),
+            command_timeout: default_command_timeout(),
         }
     }
 }
@@ -301,14 +349,24 @@ pub fn clear_api_key() -> Result<()> {
 pub struct SessionGates {
     approval: Arc<Mutex<ApprovalSettings>>,
     sandbox: Arc<AtomicBool>,
+    /// The fallback timeout for a terminal command, for calls where the
+    /// model names none. Fixed for the run, unlike the two above, which
+    /// `/approval` and `/sandbox` can change partway through a turn.
+    command_timeout: u64,
 }
 
 impl SessionGates {
-    pub fn new(approval: ApprovalSettings, sandbox: bool) -> Self {
+    pub fn new(approval: ApprovalSettings, sandbox: bool, command_timeout: u64) -> Self {
         Self {
             approval: Arc::new(Mutex::new(approval)),
             sandbox: Arc::new(AtomicBool::new(sandbox)),
+            command_timeout,
         }
+    }
+
+    /// How long a terminal command may run when the call does not say.
+    pub fn command_timeout(&self) -> u64 {
+        self.command_timeout
     }
 
     /// The approval gates as they stand. Cloned out rather than handing back
@@ -341,6 +399,42 @@ impl SessionGates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeouts_seed_themselves_in_a_config_that_predates_them() {
+        // Every existing config.json was written before these fields, so
+        // they have to read back as the values that were compiled in rather
+        // than as zero — which would fail every call instantly.
+        let old = r#"{"base_url":"https://example.test/v1"}"#;
+        let config: Config = serde_json::from_str(old).unwrap();
+        assert_eq!(config.connect_timeout, 20);
+        assert_eq!(config.request_timeout, 300);
+        assert_eq!(config.stream_idle_timeout, 90);
+        assert_eq!(config.command_timeout, 30);
+    }
+
+    #[test]
+    fn a_configured_timeout_survives_a_round_trip() {
+        let config = Config {
+            stream_idle_timeout: 240,
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Config>(&json)
+                .unwrap()
+                .stream_idle_timeout,
+            240
+        );
+    }
+
+    #[test]
+    fn the_gates_carry_the_command_timeout_to_the_tool() {
+        // `execute_tool` has no config; the gates are how the run's fallback
+        // reaches it.
+        let gates = SessionGates::new(ApprovalSettings::default(), true, 45);
+        assert_eq!(gates.command_timeout(), 45);
+    }
 
     #[test]
     fn a_partial_config_keeps_its_values_and_seeds_the_rest() {
@@ -396,7 +490,7 @@ mod tests {
         // that answers `/approval` or `/sandbox` holds the original. A write
         // through one has to be visible through the other, or the turn keeps
         // running on the gates it started with.
-        let worker = SessionGates::new(ApprovalSettings::default(), true);
+        let worker = SessionGates::new(ApprovalSettings::default(), true, 30);
         let running_turn = worker.clone();
         assert!(running_turn.approval().write_disk);
         assert!(running_turn.sandbox());
@@ -416,7 +510,7 @@ mod tests {
         // A panic somewhere else must not leave the gates unreadable — the
         // settings behind the lock are still perfectly good, and failing
         // here would turn an unrelated panic into a dead approval gate.
-        let gates = SessionGates::new(ApprovalSettings::default(), true);
+        let gates = SessionGates::new(ApprovalSettings::default(), true, 30);
         let poisoner = gates.clone();
         let _ = std::thread::spawn(move || {
             let _guard = poisoner.lock();

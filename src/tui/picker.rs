@@ -92,6 +92,13 @@ impl SessionRow {
     pub fn last_state(&self) -> LastState {
         crate::store::last_state(self.activity, self.heartbeat, self.last.as_ref())
     }
+
+    /// Whether a live process holds this session, and so whether opening it
+    /// will be refused. Distinct from being *busy*: a session sitting idle
+    /// at a prompt in another terminal is held but not working.
+    pub fn is_held(&self) -> bool {
+        crate::store::heartbeat_is_live(self.heartbeat)
+    }
 }
 
 impl SessionRow {
@@ -122,7 +129,20 @@ impl SessionRow {
 /// keeps the column aligned. The obvious circles — `●`, `◐`, `○`, `•` — are
 /// *Ambiguous*, and a terminal may draw those two cells wide while drawing
 /// the rest one, which pushed some rows a column right of the others.
-fn state_badge(state: LastState, tick: usize) -> (String, Style) {
+fn state_badge(state: LastState, held: bool, tick: usize) -> (String, Style) {
+    // Held by another process and not otherwise saying so. `Working` and
+    // `AwaitingApproval` are already gated on a live heartbeat, so those two
+    // only ever occur while someone holds the session and their own glyphs
+    // already imply it. Every other state can belong to a session sitting
+    // idle at a prompt in another terminal, which looks openable and isn't
+    // — so it gets a glyph of its own rather than a `✓` you can't act on.
+    if held && !matches!(state, LastState::Working | LastState::AwaitingApproval) {
+        return (
+            format!("{:<BADGE_WIDTH$}", "⧉"),
+            Style::new().dark_gray().bold(),
+        );
+    }
+
     let (glyph, style) = match state {
         LastState::New => (" ", Style::new()),
         // The conversation's own spinner, frame for frame and in the same
@@ -471,6 +491,10 @@ pub fn draw(
     let mut in_current_dir = false;
     // Whether this section has already named its directory on an earlier row.
     let mut here_dir_shown = false;
+    // Which built line the cursor is on, which is what the list has to keep
+    // on screen. Not the item index: headers push a blank line ahead of
+    // themselves, so the two drift apart as sections go by.
+    let mut selected_line = 0usize;
     let width = areas[2].width as usize;
     for (index, item) in picker.items.iter().enumerate() {
         let selected = index == picker.selected;
@@ -509,7 +533,7 @@ pub fn draw(
                 spans.push(Span::styled(mark, mark_style));
                 spans.push(Span::raw(" "));
 
-                let (glyph, style) = state_badge(row.last_state(), tick);
+                let (glyph, style) = state_badge(row.last_state(), row.is_held(), tick);
                 spans.push(Span::styled(format!("{glyph} "), style));
                 spans.push(Span::styled(
                     column(mode_label(row.is_agentic()), KIND_WIDTH),
@@ -565,6 +589,9 @@ pub fn draw(
             pad_to(&mut line, width);
             line.style = line.style.patch(band());
         }
+        if selected {
+            selected_line = lines.len();
+        }
         lines.push(line);
     }
 
@@ -619,9 +646,41 @@ pub fn draw(
             Style::new().dark_gray(),
         ));
     }
+    // Everything that doesn't fit used to be silently dropped: past a
+    // screenful, the extra sessions were neither drawn nor hinted at, and
+    // the cursor could be moved onto a row nobody could see. The offset is
+    // derived from the selection rather than remembered, so there is no
+    // scroll state to get out of step with a list that regroups under it
+    // when a session is deleted or moves between sections.
+    let visible = areas[2].height as usize;
+    let total = lines.len();
+    let offset = if total <= visible {
+        0
+    } else {
+        // Centred once scrolling starts, but only then: near the top the
+        // cursor should move down the screen rather than drag the list.
+        selected_line
+            .saturating_sub(visible / 2)
+            .min(total - visible)
+    };
+
+    // Counted, not just marked: "more below" says nothing about whether
+    // it's one session or forty.
+    let hidden_above = offset;
+    let hidden_below = total.saturating_sub(offset + visible);
+    let rule_hint = match (hidden_above, hidden_below) {
+        (0, 0) => None,
+        (0, below) => Some(format!("{below} more below ")),
+        (above, 0) => Some(format!("{above} more above ")),
+        (above, below) => Some(format!("{above} above · {below} below ")),
+    };
+
     frame.render_widget(Paragraph::new(Line::from(heading)), areas[0]);
-    draw_rule(frame, areas[1], None);
-    frame.render_widget(Paragraph::new(Text::from(lines)), areas[2]);
+    draw_rule(frame, areas[1], rule_hint.as_deref());
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((offset as u16, 0)),
+        areas[2],
+    );
     // A failed open replaces the key hints: it's the thing that just
     // happened, and the hints are still discoverable by pressing anything.
     match &picker.notice {
@@ -1007,7 +1066,7 @@ mod tests {
         // session looks the same from the list as from inside it — and every
         // frame still has to fit the column the other badges share.
         let frames: Vec<String> = (0..super::super::render::FRAMES.len())
-            .map(|tick| state_badge(LastState::Working, tick).0)
+            .map(|tick| state_badge(LastState::Working, false, tick).0)
             .collect();
 
         let mut distinct = frames.clone();
@@ -1035,6 +1094,124 @@ mod tests {
             Activity::Working,
         );
         assert!(picker_of(vec![busy_row]).has_working_session());
+    }
+
+    /// Renders the launch screen off-screen so the list can be asserted on.
+    fn picker_to_string(picker: &Picker, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, picker, "TITLE", Some(HERE), false, "hint", 0))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn many_sessions(count: usize) -> Picker {
+        let rows: Vec<SessionRow> = (0..count)
+            .map(|i| {
+                row_in(
+                    &format!("{i:08}"),
+                    "chat",
+                    &format!("session {i:02}"),
+                    Some(HERE),
+                )
+            })
+            .collect();
+        Picker::launch(rows, Some(HERE))
+    }
+
+    #[test]
+    fn a_list_taller_than_the_screen_scrolls_to_the_selection() {
+        // It used to render every row into a fixed area, so anything past
+        // the bottom was simply not drawn — and the cursor could be moved
+        // onto a row nobody could see.
+        let mut picker = many_sessions(40);
+        let shown = |p: &Picker| -> Vec<usize> {
+            let out = picker_to_string(p, 80, 12);
+            (0..40)
+                .filter(|i| out.contains(&format!("session {i:02}")))
+                .collect()
+        };
+
+        let top = shown(&picker);
+        assert!(top.contains(&0), "the first session should start visible");
+
+        // Walk the cursor to the last row.
+        for _ in 0..60 {
+            picker.move_down();
+        }
+        let bottom = shown(&picker);
+        assert!(
+            bottom.contains(&39),
+            "the last session should be reachable: {bottom:?}"
+        );
+        assert!(
+            !bottom.contains(&0),
+            "the list should have scrolled, not grown: {bottom:?}"
+        );
+    }
+
+    #[test]
+    fn the_rule_says_how_much_is_off_screen() {
+        // Without this the extra sessions are invisible *and* unannounced,
+        // which is the half of the bug that makes it a trap rather than an
+        // inconvenience.
+        let picker = many_sessions(40);
+        let out = picker_to_string(&picker, 80, 12);
+        assert!(out.contains("more below"), "{out}");
+
+        // A list that fits says nothing.
+        let small = picker_to_string(&many_sessions(2), 80, 24);
+        assert!(!small.contains("more below"), "{small}");
+        assert!(!small.contains("more above"), "{small}");
+    }
+
+    #[test]
+    fn a_session_another_process_holds_is_marked_as_such() {
+        // Held but idle looks exactly like free otherwise: the state comes
+        // off the messages, so it reads `✓ replied` and invites an open that
+        // will be refused.
+        let idle = with_last(
+            row_in("00000001", "chat", "t", Some(HERE)),
+            "assistant",
+            false,
+            "done",
+        );
+        assert_eq!(idle.last_state(), LastState::Replied);
+        assert!(!idle.is_held());
+
+        let held = running(idle.clone(), Activity::Working);
+        // `running` stamps a heartbeat; drop the activity so the state falls
+        // back to the messages while the claim stays live.
+        let mut held = held;
+        held.activity = None;
+        assert!(held.is_held());
+        assert_eq!(held.last_state(), LastState::Replied);
+
+        assert_ne!(
+            state_badge(idle.last_state(), idle.is_held(), 0).0,
+            state_badge(held.last_state(), held.is_held(), 0).0,
+            "held and free sessions must not draw the same badge"
+        );
+    }
+
+    #[test]
+    fn a_working_session_keeps_its_spinner_rather_than_the_held_mark() {
+        // `Working` is already gated on a live heartbeat, so it only happens
+        // while held — the spinner says someone is there, and replacing it
+        // would lose the more specific fact.
+        assert_eq!(
+            state_badge(LastState::Working, true, 3).0,
+            state_badge(LastState::Working, false, 3).0
+        );
     }
 
     #[test]
@@ -1090,7 +1267,7 @@ mod tests {
         ] {
             // The badge is padded to a fixed width; the character itself is
             // what has to be one cell.
-            let glyph = state_badge(state, 0).0;
+            let glyph = state_badge(state, false, 0).0;
             let ch = glyph.trim().chars().next().unwrap_or(' ');
             assert_eq!(
                 glyph.trim().chars().count().max(1),
@@ -1118,7 +1295,7 @@ mod tests {
             LastState::Failed,
         ]
         .into_iter()
-        .map(|state| state_badge(state, 0).0)
+        .map(|state| state_badge(state, false, 0).0)
         .collect();
         let mut unique = glyphs.clone();
         unique.sort_unstable();

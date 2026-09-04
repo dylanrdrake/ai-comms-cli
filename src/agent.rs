@@ -410,9 +410,13 @@ pub async fn run_agent_turn(
 
                 let result = if approved {
                     // Execute the tool
-                    let tool_result =
-                        execute_tool(tool_name, &tool_call.function.arguments, gates.sandbox())
-                            .await;
+                    let tool_result = execute_tool(
+                        tool_name,
+                        &tool_call.function.arguments,
+                        gates.sandbox(),
+                        gates.command_timeout(),
+                    )
+                    .await;
 
                     match tool_result {
                         Ok(result) => result,

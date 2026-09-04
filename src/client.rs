@@ -6,23 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-/// Bounds how long connecting (DNS/TCP/TLS) may take before giving up —
-/// independent of how long a slow-to-answer provider may then take once
-/// connected, which the per-call timeouts below cover instead.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// A non-streaming request has no partial progress to show, so it's given
-/// a single generous ceiling for the whole round trip — long enough for a
-/// slow reasoning model, but bounded so a stalled connection eventually
-/// surfaces as an error instead of leaving the caller waiting forever.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// A streaming request has no such ceiling on its *total* length — a long
-/// reply legitimately keeps sending chunks — so instead this bounds the gap
-/// between chunks: no new bytes within this window means the connection
-/// has stalled, not that the model is still thinking.
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
@@ -569,12 +552,25 @@ impl Client {
         }
     }
 
+    /// The fallback timeout for a terminal command the agent runs, so a
+    /// caller holding only a `Client` can build the gates without also
+    /// carrying the config it came from.
+    /// The gap allowed between streamed chunks before the connection is
+    /// treated as stalled.
+    fn stream_idle(&self) -> Duration {
+        Duration::from_secs(self.config.stream_idle_timeout)
+    }
+
+    pub fn command_timeout(&self) -> u64 {
+        self.config.command_timeout
+    }
+
     pub fn new(config: Config) -> Result<Self> {
         let api_key = crate::config::get_api_key()?
             .ok_or_else(|| anyhow!("API key not configured. Run: clank login"))?;
 
         let http_client = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
+            .connect_timeout(Duration::from_secs(config.connect_timeout))
             .build()?;
 
         Ok(Client {
@@ -671,7 +667,7 @@ impl Client {
         let response = self
             .apply_headers(req)
             .json(&request)
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(Duration::from_secs(self.config.request_timeout))
             .send()
             .await?;
 
@@ -727,12 +723,12 @@ impl Client {
             // stream below, which is exactly what the idle timeout further
             // down is meant to allow. This only bounds how long a first
             // response takes to start showing up at all.
-            let response = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, self.apply_headers(req).json(&request).send()).await {
+            let response = match tokio::time::timeout(self.stream_idle(), self.apply_headers(req).json(&request).send()).await {
                 Ok(response) => response?,
                 Err(_) => {
                     Err(anyhow!(
                         "No response from provider within {}s; the connection may have stalled",
-                        STREAM_IDLE_TIMEOUT.as_secs()
+                        self.config.stream_idle_timeout
                     ))?;
                     return;
                 }
@@ -749,13 +745,13 @@ impl Client {
             let mut accumulator = StreamAccumulator::default();
 
             'outer: loop {
-                let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, bytes.next()).await {
+                let chunk = match tokio::time::timeout(self.stream_idle(), bytes.next()).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break 'outer,
                     Err(_) => {
                         Err(anyhow!(
                             "No response from provider within {}s; the connection may have stalled",
-                            STREAM_IDLE_TIMEOUT.as_secs()
+                            self.config.stream_idle_timeout
                         ))?;
                         return;
                     }

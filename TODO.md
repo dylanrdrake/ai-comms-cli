@@ -1,7 +1,5 @@
 
 **TODOs**
-* rebrand: clank, Agent Command Center, Clanker Command Center
-* display intermediate actions whilte thinking
 * connect providers directly, like Anthropic, OpenAI, etc..
 
 * prompt caching
@@ -10,6 +8,20 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
+* need a model browser/search/picker
+* /effor should have the same bare behavior
+* $ command UI re-think
+  What exists: a box above the prompt showing the command and, once it exits,
+  its output, which you then send to the conversation or discard (Ctrl-S /
+  Ctrl-D, or /send and /discard). Three things wrong with it, worth designing
+  as one rather than patching separately: output is captured rather than
+  streamed, so the box sits empty and then fills all at once — fine for a
+  quick command, poor for anything long, and fixing it needs a different
+  execution path and an event per chunk. A command wanting input on stdin has
+  nowhere to type it. And the whole feature is TUI-only, because the CLI's
+  blocking prompt loop has no box to put it in, so `$` there would have to
+  mean something different — probably run-and-print with no send step.
+* change status and /status to config and /config or maybe settings and /settings. In the in-session print out of the session config/settings should say something about how the session config/settings override the global ones
 * running on windows resulted in some terminal freezes, especially when logging and launching
 * --headless: built, then taken back out again. The implementation is in
   51f4ef7 if it's wanted back — flag on `ask` and `agent`, a refusal when any
@@ -79,13 +91,6 @@ NEXT:
   `sudo apt install` hangs the same way. `.stdin(Stdio::null())` makes those
   fail in milliseconds with their own error instead (`sudo: a password is
   required`, exit 1).
-* $ commands are TUI-only. The CLI's blocking prompt loop has no box to show
-  output in and no decision to display, so `$` there would have to mean
-  something different — probably run-and-print with no send step at all.
-* $ output is captured, not streamed: `run_terminal_command` returns when the
-  process exits, so the box sits empty and then fills all at once. Fine for a
-  test run, poor for anything long. Streaming needs a different execution path
-  and its own event per chunk.
 * a steered message is lost if the turn it joined is cancelled. `absorb` runs
   only on the arm where a turn completes (conversation.rs), so cancelling
   discards everything the task accumulated — which is intended, except that a
@@ -179,7 +184,6 @@ NEXT:
   directories, while requiring `clank init` adds a new concept. The stored
   working_dir is the data you'd migrate from.
 * should messages table be expanded to include tool calls, errors, etc.. OR errors logged somewhere
-* need a model browser/search/picker
 * [agent/ask] [verbose]
  <current os user>: 
 * [model] [effort]

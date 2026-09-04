@@ -327,7 +327,15 @@ pub async fn run_shell_command(
 /// on, the tools that write are confined to the working directory. Reads are
 /// not bounded either way — they mutate nothing, and confining them would
 /// break ordinary work like reading a file under `/etc`.
-pub async fn execute_tool(name: &str, arguments: &str, sandbox: bool) -> Result<serde_json::Value> {
+/// `command_timeout` is the fallback for `run_terminal_command`: the model
+/// may name a `timeout_secs` of its own, and this is what applies when it
+/// doesn't.
+pub async fn execute_tool(
+    name: &str,
+    arguments: &str,
+    sandbox: bool,
+    command_timeout: u64,
+) -> Result<serde_json::Value> {
     let args: serde_json::Value = serde_json::from_str(arguments)?;
 
     match name {
@@ -382,7 +390,7 @@ pub async fn execute_tool(name: &str, arguments: &str, sandbox: bool) -> Result<
             let timeout_secs = args
                 .get("timeout_secs")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(30);
+                .unwrap_or(command_timeout);
 
             run_terminal_command(command, working_dir, timeout_secs).await
         }

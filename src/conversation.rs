@@ -297,6 +297,8 @@ impl Conversation {
 
         let mut session = session;
         session.writes_under_claim(claim.owner().to_string());
+        // Read before the client moves into the worker below.
+        let command_timeout = client.command_timeout();
         let worker = Worker {
             client,
             // Taken by the caller, before it committed to opening the
@@ -305,7 +307,11 @@ impl Conversation {
             _claim: claim,
             // Built before the session moves in, and shared with every turn
             // this worker spawns so a mid-turn `/approval` reaches it.
-            gates: SessionGates::new(session.approval().clone(), session.sandbox()),
+            gates: SessionGates::new(
+                session.approval().clone(),
+                session.sandbox(),
+                command_timeout,
+            ),
             steering: Steering::default(),
             session,
             max_iterations,

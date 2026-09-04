@@ -175,6 +175,16 @@ enum Commands {
         clear: bool,
     },
 
+    /// View or set how long the client waits — connecting, on a whole
+    /// reply, between streamed chunks, and on a command the agent runs
+    Timeout {
+        /// Which one: connect, request, stream-idle, or command. Omit to
+        /// show them all.
+        name: Option<String>,
+        /// Seconds. Omit to show just this one.
+        secs: Option<u64>,
+    },
+
     /// Send a prompt to the LLM
     Ask {
         /// Your prompt/question
@@ -435,6 +445,7 @@ async fn main() -> Result<()> {
         Some(Commands::Selection { value }) => cmd_selection(value).await?,
         Some(Commands::Verbose { value }) => cmd_verbose(value).await?,
         Some(Commands::EffortLevel { value, clear }) => cmd_effort_level(value, clear).await?,
+        Some(Commands::Timeout { name, secs }) => cmd_timeout(name, secs).await?,
         Some(Commands::Ask {
             prompt,
             model,
@@ -648,6 +659,81 @@ fn print_approval_status(approval: &ApprovalSettings) {
         "  Terminal commands: {}",
         format_approval(approval.terminal)
     );
+}
+
+/// Every configurable wait, with the field each one sets.
+///
+/// A table rather than a match per arm so that showing them all, naming
+/// them in an error, and setting one all read the same list — a timeout
+/// added to the config and forgotten here would be invisible to `clank
+/// timeout`, which is the only way to discover it exists.
+/// Name, the field it sets, and what it bounds.
+type TimeoutField = for<'a> fn(&'a mut config::Config) -> &'a mut u64;
+type TimeoutEntry = (&'static str, TimeoutField, &'static str);
+
+const TIMEOUTS: [TimeoutEntry; 4] = [
+    (
+        "connect",
+        |c| &mut c.connect_timeout,
+        "connecting: DNS, TCP and TLS",
+    ),
+    (
+        "request",
+        |c| &mut c.request_timeout,
+        "a whole non-streaming reply",
+    ),
+    (
+        "stream-idle",
+        |c| &mut c.stream_idle_timeout,
+        "the gap between streamed chunks",
+    ),
+    (
+        "command",
+        |c| &mut c.command_timeout,
+        "a terminal command, when the model names no timeout",
+    ),
+];
+
+async fn cmd_timeout(name: Option<String>, secs: Option<u64>) -> Result<()> {
+    let mut config = load_config()?;
+
+    let Some(name) = name else {
+        println!("\n{}", "Timeouts:".blue());
+        let width = TIMEOUTS.iter().map(|(n, ..)| n.len()).max().unwrap_or(0);
+        for (name, field, blurb) in TIMEOUTS {
+            let value = *field(&mut config);
+            println!(
+                "  {}  {:>4}s  {}",
+                format!("{name:<width$}").bright_black(),
+                value,
+                blurb.bright_black()
+            );
+        }
+        println!("\n{}", "  clank timeout <name> <seconds>".bright_black());
+        return Ok(());
+    };
+
+    let Some((_, field, blurb)) = TIMEOUTS.iter().find(|(n, ..)| *n == name) else {
+        let names: Vec<&str> = TIMEOUTS.iter().map(|(n, ..)| *n).collect();
+        anyhow::bail!("Unknown timeout '{name}'. One of: {}", names.join(", "));
+    };
+
+    let Some(secs) = secs else {
+        println!("{name}: {}s — {blurb}", field(&mut config));
+        return Ok(());
+    };
+
+    // Zero would mean "time out immediately", which is never what anyone
+    // wants and reads as a way to disable the bound rather than to make it
+    // absolute.
+    if secs == 0 {
+        anyhow::bail!("A timeout of 0 would fail every call before it started");
+    }
+
+    *field(&mut config) = secs;
+    save_config(&config)?;
+    println!("{} {name} timeout set to {secs}s", "✓".green());
+    Ok(())
 }
 
 async fn cmd_approval(action: Option<ApprovalCommands>) -> Result<()> {
@@ -1650,7 +1736,11 @@ async fn cmd_session(
                 session.set_activity(Some(store::Activity::Working), None);
                 let turn = if session.is_agentic() {
                     let max_iterations = session.max_iterations();
-                    let gates = SessionGates::new(session.approval().clone(), session.sandbox());
+                    let gates = SessionGates::new(
+                        session.approval().clone(),
+                        session.sandbox(),
+                        client.command_timeout(),
+                    );
                     agent::run_agent_turn(
                         &client,
                         &mut ui,
@@ -1828,7 +1918,7 @@ async fn cmd_agent(
     // model answered, so it keeps the label `session`/`tui` dropped.
     let mut ui = TerminalAgentUi::new(verbose, true);
 
-    let gates = SessionGates::new(approval, sandbox);
+    let gates = SessionGates::new(approval, sandbox, client.command_timeout());
 
     let Some((mut session, activity)) = stored else {
         agent::run_agent(
