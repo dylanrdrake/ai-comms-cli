@@ -231,6 +231,7 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         // answer reflects what the session actually holds, while the CLI
         // reads its own `ChatSession` directly.
         Submission::ShowHelp
+        | Submission::ShowEffort
         | Submission::ShowModel
         | Submission::ShowApproval
         | Submission::ShowSandbox
@@ -1026,6 +1027,7 @@ mod tests {
         // source of truth.
         for submission in [
             Submission::ShowHelp,
+            Submission::ShowEffort,
             Submission::ShowModel,
             Submission::ShowApproval,
             Submission::ShowSandbox,

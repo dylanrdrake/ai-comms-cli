@@ -1490,6 +1490,12 @@ fn apply_submission(
             }
             println!();
         }
+        ui::Submission::ShowEffort => {
+            println!(
+                "{}",
+                ui::effort_notice(session.effort_level(), false).blue()
+            );
+        }
         ui::Submission::ShowStatus => {
             let approval = session.approval().clone();
             let rows = ui::session_settings_rows(&ui::SessionSettings {

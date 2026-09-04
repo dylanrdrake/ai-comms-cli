@@ -329,6 +329,7 @@ exactly:
 | `/model` | Show the model currently in use |
 | `/agent` | Turn on tool-calling for the rest of the session |
 | `/ask` | Turn tool-calling back off |
+| `/effort` | Show the reasoning effort level currently in use |
 | `/effort <level>` | Switch reasoning effort for the rest of the session, and remember it |
 | `/effort clear` | Nullify it — no effort field is sent at all until set again |
 | `/effort default` | Read the *currently* configured default effort and save that to the session |
@@ -535,6 +536,7 @@ the current one instead, repointing the session there — the same thing
 | `/model` | Show the model currently in use |
 | `/agent` | Turn on tool-calling (read/write files, run commands) for the rest of the session |
 | `/ask` | Turn tool-calling back off |
+| `/effort` | Show the reasoning effort level currently in use |
 | `/effort <level>` | Switch reasoning effort for the rest of the session, and remember it |
 | `/effort clear` | Nullify it — no effort field is sent at all until set again |
 | `/effort default` | Read the *currently* configured default effort and save that to the session |

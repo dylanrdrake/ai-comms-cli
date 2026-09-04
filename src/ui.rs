@@ -154,6 +154,8 @@ pub enum Submission {
     ShowVerbose,
     /// Prints/shows this session's sampling temperature without changing it.
     ShowTemperature,
+    /// Prints/shows the reasoning effort level without changing it.
+    ShowEffort,
     /// Streams replies token-by-token for this session, or waits for the
     /// whole reply. The configured default seeds it; this changes the
     /// session, like `/verbose` and `/sandbox`.
@@ -361,6 +363,17 @@ pub fn temperature_notice(temperature: Option<f32>, changed: bool) -> String {
     }
 }
 
+/// How the effort level reads back to the user. Shaped like
+/// [`temperature_notice`]: both are optional, and both mean "send no field
+/// at all" when unset rather than "send some default".
+pub fn effort_notice(effort_level: Option<&str>, changed: bool) -> String {
+    let verb = if changed { "set to" } else { "is" };
+    match effort_level {
+        Some(level) => format!("Effort {verb} {level}"),
+        None => format!("Effort {verb} none sent — the provider uses its own default"),
+    }
+}
+
 /// How the sandbox setting reads back to the user. `changed` picks "set to"
 /// over "is", the same distinction every other setting's notice makes.
 pub fn sandbox_notice(sandbox: bool, changed: bool) -> String {
@@ -439,6 +452,12 @@ pub fn classify(text: &str) -> Submission {
     if let Some(value) = argument(trimmed, "/verbose") {
         if let Ok(enabled) = parse_bool(value) {
             return Submission::SetVerbose(enabled);
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("/effort") {
+        if rest.trim().is_empty() {
+            return Submission::ShowEffort;
         }
     }
 
@@ -1145,6 +1164,34 @@ mod tests {
     }
 
     #[test]
+    fn every_setting_command_answers_when_asked_bare() {
+        // The parity that `/effort` was missing: if a command sets a value,
+        // typing it alone should report that value rather than scolding you
+        // for not passing one.
+        for command in [
+            "/effort",
+            "/temperature",
+            "/temp",
+            "/model",
+            "/verbose",
+            "/highlight",
+            "/sandbox",
+            "/stream",
+            "/approval",
+            "/session",
+        ] {
+            let shown = classify(command);
+            assert!(
+                !matches!(
+                    shown,
+                    Submission::UnknownCommand(_) | Submission::Message(_)
+                ),
+                "bare {command} should report its value, got {shown:?}"
+            );
+        }
+    }
+
+    #[test]
     fn classify_recognizes_effort() {
         assert_eq!(
             classify("/effort high"),
@@ -1171,14 +1218,11 @@ mod tests {
             Submission::SetEffort(Some("minimal".to_string()))
         );
 
-        // Bare, with nothing to act on, is a failed command rather than
-        // being sent to the model as text.
-        assert_eq!(
-            classify("/effort"),
-            Submission::UnknownCommand(
-                "Unrecognized /effort usage. Usage: /effort <level> | clear | default".to_string()
-            )
-        );
+        // Bare shows the current value, the same as every other setting
+        // command. It used to be a usage error, which left `/effort` the
+        // only one of them you could not simply ask.
+        assert_eq!(classify("/effort"), Submission::ShowEffort);
+        assert_eq!(classify("  /effort  "), Submission::ShowEffort);
         // Not the command, just a word starting with it.
         assert_eq!(
             classify("/effortless"),

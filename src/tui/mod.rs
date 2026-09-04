@@ -883,6 +883,11 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                                 app.transcript
                                     .push(TranscriptItem::Help(crate::ui::help_rows()));
                             }
+                            app::Submission::ShowEffort => {
+                                app.transcript.push(TranscriptItem::Notice(
+                                    crate::ui::effort_notice(app.effort_level.as_deref(), false),
+                                ));
+                            }
                             app::Submission::ShowStatus => {
                                 let approval = app.approval.clone();
                                 let rows =
