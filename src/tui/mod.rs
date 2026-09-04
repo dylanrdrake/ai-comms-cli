@@ -16,7 +16,7 @@ mod app;
 mod picker;
 mod render;
 /// The session mark, so the CLI can draw the same one the TUI does.
-pub(crate) use render::identicon_mark;
+pub(crate) use render::{busy_frame, identicon_mark};
 
 use crate::agent::AGENT_CHAT_SYSTEM_PROMPT;
 use crate::client::{ChatMessage, Client};

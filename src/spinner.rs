@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-// Same frames and cadence as the TUI's busy indicator (`tui/render.rs`), so
-// the two front ends feel identical while waiting on a reply.
+// The frame itself comes from the TUI's renderer, so the two front ends are
+// not merely similar but the same animation at the same cadence.
+use crate::tui::busy_frame;
 const TICK: Duration = Duration::from_millis(100);
 
 /// An animated terminal spinner shown while waiting on a slow call (e.g. an
@@ -31,7 +31,7 @@ impl Spinner {
                 // busy segment rather than the CLI's old cyan/yellow split.
                 print!(
                     "\r{}",
-                    format!("{} {}", FRAMES[frame % FRAMES.len()], message).yellow()
+                    format!("{} {}", busy_frame(frame), message).yellow()
                 );
                 let _ = io::stdout().flush();
                 frame += 1;

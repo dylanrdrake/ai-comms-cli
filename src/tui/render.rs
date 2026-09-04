@@ -9,10 +9,31 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use unicode_width::UnicodeWidthStr;
 
-/// Spinner frames, reused from the CLI's so both front ends feel the same.
-/// Shared with the picker's working badge, so a busy session animates the
-/// same way wherever it's shown.
-pub(super) const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// One frame of the busy animation: two braille cells of scattered dots.
+///
+/// Replaces the ten-frame dot circle, which read as one thing rotating at a
+/// fixed rate — a clock, and a clock that always ticks at the same speed
+/// says nothing beyond "still going". Two cells of noise say the same thing
+/// with more of the screen and no implied progress.
+///
+/// Pseudo-random rather than random: the frame is a function of the tick, so
+/// every front end drawing the same tick draws the same thing, and a test
+/// can assert on it. Hashed rather than indexed in order, because stepping
+/// through the patterns in sequence is itself a visible pattern.
+///
+/// Uses the identicon's alphabet — three to seven dots — for the same reason
+/// it does: nothing blank, which reads as a rendering fault, and nothing
+/// solid, which reads as stalled.
+pub(crate) fn busy_frame(tick: usize) -> String {
+    let hash = (tick as u64)
+        .wrapping_add(1)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let cell = |bits: u64| {
+        let pattern = MARK_PATTERNS[bits as usize % MARK_PATTERNS.len()];
+        char::from_u32(0x2800 + u32::from(pattern)).unwrap_or('?')
+    };
+    format!("{}{}", cell(hash >> 8), cell(hash >> 40))
+}
 
 /// Most rows the message box will grow to before it scrolls internally,
 /// so a long paste can't squeeze the conversation off the screen.
@@ -242,10 +263,7 @@ fn draw_shell(frame: &mut Frame, area: Rect, shell: &ShellState, tick: usize) {
             vec![Line::from(vec![
                 Span::styled("$ ", green.bold()),
                 Span::styled(command.clone(), green),
-                Span::styled(
-                    format!(" {}", FRAMES[tick % FRAMES.len()]),
-                    Style::new().green(),
-                ),
+                Span::styled(format!(" {}", busy_frame(tick)), Style::new().green()),
             ])],
         ),
         ShellState::Finished {
@@ -668,7 +686,7 @@ fn draw_model_browser(
 
     let lines: Vec<Line> = match browser {
         ModelBrowser::Loading => vec![Line::from(Span::styled(
-            format!("{} Fetching models…", FRAMES[tick % FRAMES.len()]),
+            format!("{} Fetching models…", busy_frame(tick)),
             Style::new().yellow(),
         ))],
         ModelBrowser::Failed(why) => vec![Line::from(Span::styled(
@@ -1151,7 +1169,7 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
 
     if app.busy {
         spans.push(Span::styled(
-            format!(" {} working ", FRAMES[tick % FRAMES.len()]),
+            format!(" {} working ", busy_frame(tick)),
             Style::new().yellow(),
         ));
     } else {
@@ -2326,6 +2344,62 @@ mod tests {
             "expected a blank row above the box, found {:?}",
             rows[top - 1]
         );
+    }
+
+    #[test]
+    fn the_busy_frame_is_two_braille_cells() {
+        for tick in 0..64 {
+            let frame = busy_frame(tick);
+            assert_eq!(frame.chars().count(), 2, "{frame:?} at tick {tick}");
+            for ch in frame.chars() {
+                assert!(
+                    ('\u{2800}'..='\u{28FF}').contains(&ch),
+                    "{ch:?} is not braille"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_busy_frame_is_never_blank_and_never_solid() {
+        // Blank reads as a rendering fault and solid reads as stalled —
+        // which is the opposite of what an indicator that means "still
+        // going" should say.
+        for tick in 0..256 {
+            for ch in busy_frame(tick).chars() {
+                let dots = (ch as u32 - 0x2800).count_ones();
+                assert!((3..=7).contains(&dots), "{ch:?} has {dots} dots");
+            }
+        }
+    }
+
+    #[test]
+    fn the_busy_frame_looks_random_rather_than_cycling() {
+        // The old animation was ten frames in a fixed order, which reads as
+        // a clock. Consecutive ticks should not repeat, and a short run
+        // should not visibly loop.
+        let frames: Vec<String> = (0..40).map(busy_frame).collect();
+        assert!(
+            frames.windows(2).all(|w| w[0] != w[1]),
+            "consecutive frames repeat: {frames:?}"
+        );
+        let mut distinct = frames.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert!(
+            distinct.len() > 30,
+            "only {} distinct in 40",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn the_busy_frame_is_the_same_everywhere_for_a_given_tick() {
+        // Both front ends and the picker draw from this, and a spinner that
+        // disagreed with itself across panes would read as two things
+        // happening rather than one.
+        assert_eq!(busy_frame(9), busy_frame(9));
+        assert_eq!(busy_frame(1_000_000), busy_frame(1_000_000));
     }
 
     #[test]

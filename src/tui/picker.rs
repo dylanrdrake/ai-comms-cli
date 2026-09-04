@@ -154,20 +154,17 @@ fn state_badge(state: LastState, held: bool, tick: usize) -> (String, Style) {
         );
     }
 
-    let (glyph, style) = match state {
-        LastState::New => (" ", Style::new()),
+    let (glyph, style): (String, Style) = match state {
+        LastState::New => (" ".to_string(), Style::new()),
         // The conversation's own spinner, frame for frame and in the same
         // yellow, so a busy session animates identically whether you're
         // watching it from the list or sitting inside it.
-        LastState::Working => (
-            super::render::FRAMES[tick % super::render::FRAMES.len()],
-            Style::new().yellow(),
-        ),
-        LastState::AwaitingApproval => ("?", Style::new().yellow().bold()),
-        LastState::Failed => ("✗", Style::new().red().bold()),
-        LastState::Replied => ("✓", Style::new().green()),
-        LastState::NoReply => ("⋯", Style::new().cyan()),
-        LastState::Interrupted => ("⚑", Style::new().yellow()),
+        LastState::Working => (super::render::busy_frame(tick), Style::new().yellow()),
+        LastState::AwaitingApproval => ("?".to_string(), Style::new().yellow().bold()),
+        LastState::Failed => ("✗".to_string(), Style::new().red().bold()),
+        LastState::Replied => ("✓".to_string(), Style::new().green()),
+        LastState::NoReply => ("⋯".to_string(), Style::new().cyan()),
+        LastState::Interrupted => ("⚑".to_string(), Style::new().yellow()),
     };
     (format!("{glyph:<BADGE_WIDTH$}"), style)
 }
@@ -183,7 +180,7 @@ const WHEN_WIDTH: usize = 8;
 const MIN_PREVIEW: usize = 12;
 /// Every badge is a single cell — see `state_badge` — and padded to this so
 /// the column stays straight.
-const BADGE_WIDTH: usize = 1;
+const BADGE_WIDTH: usize = 2;
 
 /// The mark is two braille cells: 4 dots across by 4 down. One cell is 2
 /// dots wide by 4 tall in a character box about half as wide as it is tall,
@@ -932,23 +929,27 @@ mod tests {
     }
 
     #[test]
-    fn the_working_badge_animates_and_stays_one_cell() {
-        // It borrows the conversation's own spinner frames, so a busy
-        // session looks the same from the list as from inside it — and every
-        // frame still has to fit the column the other badges share.
-        let frames: Vec<String> = (0..super::super::render::FRAMES.len())
+    fn the_working_badge_animates_and_fills_its_column() {
+        // It draws the conversation's own busy frame, so a running session
+        // looks the same from the list as from inside it — and every frame
+        // still has to be exactly the width the other badges are padded to,
+        // or this row sits a column off from the rest.
+        let frames: Vec<String> = (0..24)
             .map(|tick| state_badge(LastState::Working, false, tick).0)
             .collect();
 
         let mut distinct = frames.clone();
         distinct.sort();
         distinct.dedup();
-        assert!(distinct.len() > 1, "it has to actually move: {frames:?}");
+        assert!(
+            distinct.len() > 8,
+            "it should look random, not cycle through a handful: {distinct:?}"
+        );
         for frame in &frames {
             assert_eq!(
                 frame.chars().count(),
                 BADGE_WIDTH,
-                "{frame:?} is not one cell"
+                "{frame:?} does not fill the badge column"
             );
         }
     }
@@ -1206,34 +1207,42 @@ mod tests {
     }
 
     #[test]
-    fn no_glyph_is_ambiguous_width() {
+    fn every_badge_fills_the_column_and_avoids_ambiguous_glyphs() {
         // What kept the column ragged: a terminal may draw an
         // East-Asian-Ambiguous character two cells wide while drawing the
-        // rest one. Every badge has to be a character that is one cell
-        // everywhere — which rules out the obvious circles.
+        // rest one. Measured in cells rather than characters, because the
+        // busy badge is deliberately two braille cells and the rest are one
+        // padded to match — char count would pass a glyph that draws wide.
+        use unicode_width::UnicodeWidthStr;
+
         const AMBIGUOUS: [char; 7] = ['●', '◐', '○', '•', '…', '→', '⊙'];
-        for state in [
-            LastState::New,
-            LastState::Replied,
-            LastState::NoReply,
-            LastState::Interrupted,
-            LastState::Working,
-            LastState::AwaitingApproval,
-            LastState::Failed,
-        ] {
-            // The badge is padded to a fixed width; the character itself is
-            // what has to be one cell.
-            let glyph = state_badge(state, false, 0).0;
-            let ch = glyph.trim().chars().next().unwrap_or(' ');
+        let checked = [
+            state_badge(LastState::New, false, 0).0,
+            state_badge(LastState::Replied, false, 0).0,
+            state_badge(LastState::NoReply, false, 0).0,
+            state_badge(LastState::Interrupted, false, 0).0,
+            state_badge(LastState::AwaitingApproval, false, 0).0,
+            state_badge(LastState::Failed, false, 0).0,
+            // Several ticks of the animation, since each is a fresh pair.
+            state_badge(LastState::Working, false, 0).0,
+            state_badge(LastState::Working, false, 7).0,
+            state_badge(LastState::Working, false, 31).0,
+            // And the held marker, which is not a state.
+            state_badge(LastState::Replied, true, 0).0,
+        ];
+
+        for badge in checked {
             assert_eq!(
-                glyph.trim().chars().count().max(1),
-                1,
-                "{state:?} is not a single char"
+                UnicodeWidthStr::width(badge.as_str()),
+                BADGE_WIDTH,
+                "{badge:?} does not fill the badge column"
             );
-            assert!(
-                !AMBIGUOUS.contains(&ch),
-                "{state:?} uses {ch:?}, which some terminals draw double-width"
-            );
+            for ch in badge.chars() {
+                assert!(
+                    !AMBIGUOUS.contains(&ch),
+                    "{ch:?} is drawn double-width by some terminals"
+                );
+            }
         }
     }
 
