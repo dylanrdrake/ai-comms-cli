@@ -308,14 +308,7 @@ clank ask "Explain quantum computing" -m anthropic/claude-opus-4.5
 # Override temperature or effort level for this call only
 clank ask "Write a haiku" --temperature 1.2
 clank ask "Design a lock-free queue" --effort-level high
-
-# Just the reply on stdout — no spinner, no model label — for piping
-clank ask --headless "Name this commit" > msg.txt
 ```
-
-`--headless` (`--h`) prints the reply and nothing else, unwrapped so whatever
-reads it picks its own width. Without it, a redirected `ask` captures the
-spinner's carriage returns and progress frames along with the answer.
 
 #### `session`
 Start an interactive, persistent conversation — the line-based counterpart to
@@ -410,11 +403,6 @@ clank agent "Generate project structure" --max-iterations 30
 clank agent "Generate project structure" --temperature 0.3
 clank agent "Design a lock-free queue" --effort-level high
 
-# Fire it off and walk away
-clank approval all off
-setsid clank agent --headless --session "Add doc comments to src/store.rs" \
-  > agent.log 2>&1 < /dev/null &
-
 # Continue an existing session instead of starting one
 clank agent --resume 1fb31f66 "Now add tests for it"
 ```
@@ -436,40 +424,10 @@ its relative paths mean. If that directory is gone the run stops rather than
 silently rebinding to wherever you launched it; `clank session --resume <id>
 --here` repoints it.
 
-Both work with or without `--headless`. They're independent flags: `--headless`
-is about having no terminal, `--session` is about leaving a record.
-
 Only one process may run a session at a time. `--resume` refuses a session
 whose heartbeat is still ticking, rather than interleaving two sets of turns
 into a history neither process wrote. The claim expires by itself, so a session
 whose runner died is available again with nothing to clean up.
-
-A headless run also refuses to start another headless run. It has `terminal`
-ungated by definition, so without that an agent could spawn detached copies of
-itself unboundedly, none of them watched. The marker is an environment variable,
-so it is inherited by every child process rather than only catching the first
-level.
-
-##### Running without a terminal
-
-`--headless` (`--h`) makes a run safe to detach: no spinner, and no approval
-prompt. It refuses to start while any approval gate is on, naming the gates and
-the way out — a gate is a question, and a detached run has nobody to ask. The
-alternative is worse than not starting: the run would be denied every tool it
-reached and you'd pay a whole task's tokens to find out.
-
-Turn the gates off with `clank approval all off` (`clank approval show` lists
-where they stand). The run then exits non-zero on failure, so a script can
-check it.
-
-Progress still goes to stdout — the tool notices are the record of what
-happened, and worth keeping in a log. It's the spinner that goes, because an
-animation redrawn in place is a line of overwritten frames in a file.
-
-`--headless` backgrounds a run; pair it with `--session` (below) to also leave
-a record. Even then the log is the live view — a detached run can't be attached
-to, so the picker shows its state and its messages, not its output as it
-happens.
 
 #### `tui`
 A full-screen terminal UI. Unlike the line-based `session`, it owns the

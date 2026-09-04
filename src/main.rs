@@ -13,7 +13,7 @@ mod tui;
 mod ui;
 mod wrap;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use colored::*;
 use rustyline::DefaultEditor;
@@ -193,11 +193,6 @@ enum Commands {
         /// model accepts.
         #[arg(long)]
         effort_level: Option<String>,
-
-        /// Print just the reply on stdout — no spinner, no model label —
-        /// for piping into another command or a file.
-        #[arg(long, alias = "h")]
-        headless: bool,
     },
 
     /// Interactive session — starts in plain ask mode; /agent turns on
@@ -268,11 +263,6 @@ enum Commands {
         /// model accepts.
         #[arg(long)]
         effort_level: Option<String>,
-
-        /// Run with no terminal attached: no spinner, and — for `agent` —
-        /// no approval prompts, since there is nobody to answer them.
-        #[arg(long, alias = "h")]
-        headless: bool,
 
         /// Save this run as a session, so it shows up in the picker and can
         /// be resumed later. Without it a task leaves nothing behind.
@@ -455,8 +445,7 @@ async fn main() -> Result<()> {
             model,
             temperature,
             effort_level,
-            headless,
-        }) => cmd_ask(&prompt, model, temperature, effort_level, headless).await?,
+        }) => cmd_ask(&prompt, model, temperature, effort_level).await?,
         Some(Commands::Session {
             model,
             max_iterations,
@@ -484,7 +473,6 @@ async fn main() -> Result<()> {
             max_iterations,
             temperature,
             effort_level,
-            headless,
             session,
             resume,
         }) => {
@@ -495,7 +483,6 @@ async fn main() -> Result<()> {
                 max_iterations,
                 temperature,
                 effort_level,
-                headless,
                 session,
                 resume,
             )
@@ -1143,7 +1130,6 @@ async fn cmd_ask(
     model: Option<String>,
     temperature: Option<f32>,
     effort_level: Option<String>,
-    headless: bool,
 ) -> Result<()> {
     let config = load_config()?;
     let model = resolve_model(&config, model);
@@ -1159,10 +1145,7 @@ async fn cmd_ask(
         ..Default::default()
     }];
 
-    // Nothing that only means something on a live terminal: the spinner
-    // animates in place with `\r`, which in a file is a line of overwritten
-    // frames rather than progress.
-    let spinner = (!headless).then(|| Spinner::start("Thinking..."));
+    let spinner = Spinner::start("Thinking...");
     let response = client
         .chat(
             model.clone(),
@@ -1172,22 +1155,9 @@ async fn cmd_ask(
             effort_level.clone(),
         )
         .await;
-    if let Some(spinner) = spinner {
-        spinner.stop().await;
-    }
+    spinner.stop().await;
     let response = response?;
     let choice = &response.choices[0];
-
-    // Just the reply, so `clank ask --headless ... | wc -w` measures the
-    // answer and not a ✓ and a model label. Unwrapped too — whatever reads
-    // this decides its own width; inheriting this terminal's would bake
-    // hard newlines into text being piped somewhere else entirely.
-    if headless {
-        if choice.message.has_visible_content() {
-            println!("{}", choice.message.content.as_deref().unwrap());
-        }
-        return Ok(());
-    }
 
     println!("{} ", "✓".green());
     println!("\n{}:", response_label(&model, &effort_level).cyan());
@@ -1740,71 +1710,6 @@ async fn cmd_session(
     Ok(())
 }
 
-/// Marks a process as being a headless run, so one can't launch another.
-///
-/// An environment variable rather than anything cleverer precisely because
-/// it is inherited: `run_terminal_command` spawns children from this process,
-/// so every descendant carries it without being told to.
-const HEADLESS_MARKER: &str = "CLANK_HEADLESS";
-
-/// Refuses a headless run that would stop at the first gated tool call.
-///
-/// A gate is a yes/no question, and `--headless` has nobody to ask. Denying
-/// every call instead would "work" — the run finishes, having been refused
-/// every tool it reached — which is worse than not starting, because it
-/// costs a full task's tokens to discover. Checked before the first request
-/// so the failure is free, and it names the exact way out rather than
-/// leaving you to find it.
-fn ensure_headless_can_run(approval: &ApprovalSettings) -> Result<()> {
-    headless_verdict(approval, std::env::var(HEADLESS_MARKER).is_ok())
-}
-
-/// The body of [`ensure_headless_can_run`], against an explicit answer to
-/// "are we already inside a headless run?".
-///
-/// Split out so it's testable without setting the variable for real: the
-/// environment is process-wide, and tests run in parallel, so one test
-/// setting it would decide the outcome of every other.
-fn headless_verdict(approval: &ApprovalSettings, inside_headless: bool) -> Result<()> {
-    // A headless run has `terminal` ungated by definition — that's the
-    // condition for starting one — so nothing stops the model from launching
-    // more of itself. Each is detached, so each is invisible, and the fan-out
-    // is unbounded and spending money. The marker is inherited by every child
-    // process, so this catches the third level as readily as the second.
-    if inside_headless {
-        return Err(anyhow!(
-            "Refusing to start a headless run from inside one.\n\n\
-             This process was launched by `--headless`, which leaves `terminal` \
-             ungated — so an agent spawning more headless agents would fan out \
-             with nobody watching and nothing to stop it. Do the work in this \
-             run, or queue the tasks from outside."
-        ));
-    }
-
-    let gated: Vec<&str> = [
-        ("read", approval.read_disk),
-        ("write", approval.write_disk),
-        ("terminal", approval.terminal),
-    ]
-    .into_iter()
-    .filter(|(_, on)| *on)
-    .map(|(name, _)| name)
-    .collect();
-
-    if gated.is_empty() {
-        return Ok(());
-    }
-
-    Err(anyhow!(
-        "--headless has nobody to answer an approval prompt, but these gates \
-         are still on: {}.\n\nTurn them off first:\n    clank approval all off\n\n\
-         Or one at a time, e.g. `clank approval {} off`. `clank approval show` \
-         lists where they stand.",
-        gated.join(", "),
-        gated[0],
-    ))
-}
-
 /// Opens the session a `--session`/`--resume` agent run writes to, or
 /// `None` for the default one-shot that leaves nothing behind.
 ///
@@ -1931,21 +1836,10 @@ async fn cmd_agent(
     max_iterations: Option<usize>,
     temperature: Option<f32>,
     effort_level: Option<String>,
-    headless: bool,
     session: bool,
     resume: Option<String>,
 ) -> Result<()> {
     let config = load_config()?;
-
-    // Read before the session is opened: a refusal should cost nothing, and
-    // creating a session first would leave an empty row behind for a run that
-    // never starts.
-    if headless {
-        ensure_headless_can_run(&config.approval)?;
-        // Set after the check, so this run doesn't refuse itself, and before
-        // any tool can run, so every child it spawns inherits it.
-        std::env::set_var(HEADLESS_MARKER, "1");
-    }
 
     let mut stored = open_agent_session(
         &config,
@@ -1988,9 +1882,6 @@ async fn cmd_agent(
     // Unlike `session`, a one-shot task has no other way to show which
     // model answered, so it keeps the label `session`/`tui` dropped.
     let mut ui = TerminalAgentUi::new(verbose, true);
-    if headless {
-        ui.go_headless();
-    }
 
     let gates = SessionGates::new(approval, sandbox);
 
@@ -2163,63 +2054,6 @@ mod tests {
             effort_level: effort_level.map(str::to_string),
             ..config::Config::default()
         }
-    }
-
-    fn gates(read_disk: bool, write_disk: bool, terminal: bool) -> ApprovalSettings {
-        ApprovalSettings {
-            read_disk,
-            write_disk,
-            terminal,
-        }
-    }
-
-    #[test]
-    fn a_headless_run_will_not_launch_another_headless_run() {
-        // Unbounded fan-out of detached processes, each spending money with
-        // nobody watching. Refused even with every gate off — which is the
-        // only state a headless run is ever in, so the check has to sit
-        // ahead of the gate check rather than beside it.
-        let error = headless_verdict(&gates(false, false, false), true)
-            .expect_err("a headless run may not start another")
-            .to_string();
-        assert!(error.contains("inside one"), "{error}");
-
-        // The same settings are fine from a process that isn't one.
-        assert!(headless_verdict(&gates(false, false, false), false).is_ok());
-    }
-
-    #[test]
-    fn headless_runs_only_when_nothing_would_stop_to_ask() {
-        // The whole point of the flag: fired off and left alone. A gate is a
-        // question, and there is nobody to answer it.
-        assert!(headless_verdict(&gates(false, false, false), false).is_ok());
-
-        for (read, write, terminal) in [
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
-            (true, true, true),
-        ] {
-            assert!(
-                headless_verdict(&gates(read, write, terminal), false).is_err(),
-                "{read} {write} {terminal} should refuse"
-            );
-        }
-    }
-
-    #[test]
-    fn the_refusal_names_every_gate_that_is_on_and_the_way_out() {
-        // Refusing is only useful if it says which gates and how to change
-        // them — the failure happens before any request, so this message is
-        // the entire output of the run.
-        let error = headless_verdict(&gates(true, false, true), false)
-            .expect_err("two gates on is a refusal")
-            .to_string();
-
-        assert!(error.contains("read"), "{error}");
-        assert!(error.contains("terminal"), "{error}");
-        assert!(!error.contains("write"), "an off gate is not a blocker: {error}");
-        assert!(error.contains("clank approval all off"), "{error}");
     }
 
     #[test]

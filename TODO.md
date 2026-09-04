@@ -10,7 +10,45 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
-* should --headless agents not be allowed to spawn more headless sessions?
+* --headless: built, then taken back out again. The implementation is in
+  51f4ef7 if it's wanted back — flag on `ask` and `agent`, a refusal when any
+  approval gate is on, and a `CLANK_HEADLESS` env marker stopping a headless
+  run from launching another. Removed because two of its three legs are built
+  wrong, not because the need isn't real:
+  - Most of what it does is detectable, not declarable. There is no TTY check
+    anywhere in the codebase — the spinner writes `\r` frames unconditionally
+    and `colored` does its own isatty internally — so the flag asks you to
+    declare something `std::io::IsTerminal` answers for free. Detection should
+    come first, with a flag to force either way.
+  - Its entry price is a global, persistent safety downgrade: `clank approval
+    all off` writes to config, so disabling gates for one detached run leaves
+    every later interactive run ungated too. There is no per-run alternative.
+    A `--yes` that ungates one invocation and touches nothing else is the
+    conventional shape, and is worth having on its own.
+  - What is genuinely not inferable, and worth keeping when this comes back:
+    refusing up front rather than being denied at every tool call, and the
+    nesting marker.
+  Also unresolved when it went: the startup check reads the global config
+  while a resumed run uses the session's own saved gates, so
+  `--headless --resume` could pass the check and then deny everything. And
+  the flag is named for its cause (no terminal) rather than its policy (run
+  unattended, never ask), which is why "should --headless also block X?" kept
+  being an awkward question.
+* ability to edit messages in the transcript?
+* nothing clank prints is machine-readable, which is what stops it being
+  driven by another program. `clank ask` is nearly there — one reply on
+  stdout, errors on stderr, non-zero exit, and `colored` drops ANSI when not
+  a TTY — but `clank agent` interleaves "Starting agent task...", every tool
+  call and its status, and the reply onto one stream with nothing separating
+  them, so a caller can check the exit code and nothing else. There is no
+  --json on any command. Two ways out, pulling against each other: a --json
+  mode emitting one object per run (reply, tool calls, stop reason, later
+  token counts), which is what a caller actually wants; or progress to stderr
+  and stdout for the result alone, which is the Unix convention and nearly
+  free, but contradicts the idea that progress is a record worth keeping in a
+  log — logging would become `> log 2>&1` and lose the separation again.
+  Probably both. This is a precondition for anything like --headless coming
+  back: safe to run unattended is not the same as usable as an API.
 * nothing bounds what gets sent to the model. Every turn ships the whole
   history: `truncate_output` (conversation.rs) only clips shell output, and no
   other trimming exists anywhere. Cost and latency grow with session length

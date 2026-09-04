@@ -341,75 +341,22 @@ clank session
 clank agent "List files in src/, then read src/main.rs, then create a refactored version"
 ```
 
-### Fire off a task and walk away
+### Save an agent run as a session
 
 ```bash
-# A gate is a question, and a detached run has nobody to ask — so
-# --headless refuses to start until they're off.
-clank approval all off
-
-setsid clank agent --headless --session \
-  "Add doc comments to every pub fn in src/store.rs" \
-  > agent.log 2>&1 < /dev/null &
-
-# Watch it, or don't
-tail -f agent.log
-
-# --session means it also shows up here, and in the picker
+# Without --session a task leaves nothing behind. With it, the run shows up
+# in the picker and in `clank sessions`, and reopens with its whole
+# transcript — tool calls included.
+clank agent --session "Add doc comments to every pub fn in src/store.rs"
 clank sessions
-#   c63337c2  [agent]  working   openrouter/auto  Add doc comments to every...
-```
 
-`setsid` and `< /dev/null` are what make it survive the terminal closing.
-`--headless` is what makes that safe: no spinner writing carriage returns into
-your log, and no prompt waiting on stdin that isn't there.
-
-Without `--session` the log is the whole record. With it the run is a real
-session: named after the task, showing `working` then `replied` or `failed`,
-and reopenable in the TUI afterwards with the full transcript — tool calls
-included. You still can't *attach* to it while it runs; the log is the live
-view.
-
-### Queue up several tasks and check them later
-
-```bash
-clank approval all off
-
-for task in \
-  "Add doc comments to src/store.rs" \
-  "Write unit tests for src/wrap.rs" \
-  "Find and fix any clippy warnings in src/tui/"
-do
-  setsid clank agent --headless --session "$task" \
-    > "logs/$(date +%s).log" 2>&1 < /dev/null &
-done
-
-# Later
-clank sessions
-clank session --resume c63337c2   # pick up wherever one got to
-```
-
-### Continue an unattended run once you've read it
-
-```bash
-# --resume takes any unique prefix of the id
+# Pick it up later; any unique prefix of the id works
 clank agent --resume c63337c2 "Now add tests for what you just wrote"
 ```
 
 A resumed session keeps its own saved model, temperature, iteration cap and
-effort level — passing those flags prints a note and changes nothing — and runs
-in the directory it was created in.
-
-### Use a reply in a script
-
-```bash
-# --headless prints the reply alone: no spinner, no model label, no wrapping
-msg=$(clank ask --headless "Write a commit message for this diff: $(git diff --cached)")
-git commit -m "$msg"
-
-# It exits non-zero on failure, so this is safe to gate on
-clank ask --headless "..." > out.txt || echo "that didn't work"
-```
+effort level — passing those flags prints a note and changes nothing — and
+runs in the directory it was created in.
 
 ## Workflow Examples
 
