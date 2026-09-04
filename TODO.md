@@ -10,6 +10,7 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
+* running on windows resulted in some terminal freezes, especially when logging and launching
 * --headless: built, then taken back out again. The implementation is in
   51f4ef7 if it's wanted back — flag on `ask` and `agent`, a refusal when any
   approval gate is on, and a `CLANK_HEADLESS` env marker stopping a headless
@@ -97,7 +98,38 @@ NEXT:
   accepts the message — collides with `absorb`, which reconciles by skipping
   the messages the session already has and taking the rest from the task's
   copy; pushing in both places double-counts. Needs thought, not a patch.
-* think about being able to access the same session from 2 different terminals/processes
+* two terminals on one session: the guard landed in b9c2499, the useful half
+  of it hasn't. A session is claimed by one process at a time — an atomic
+  conditional UPDATE, scoped to an owner token so a revived zombie can
+  neither renew nor release someone else's, expiring by itself so a crash
+  doesn't lock the session for good. A second process is refused. That was
+  the necessary part: without it both write colliding `seq` values and the
+  history reloads with its turns shuffled and tool results detached from
+  their calls, which providers reject, so the session stops opening at all.
+  What's left is being able to *do* something with a held session:
+  - Read-only viewing. Open a claimed session, scroll its transcript, no
+    input. Not free: `Chat` holds a non-optional `Conversation`, so this
+    means an optional worker plus guarding every command path through
+    `handle_key` and the event loop — call it 150-250 lines across the TUI,
+    the worker and the picker. The picker should badge held sessions too, so
+    you know before you open one.
+  - Answering an approval for a run you are not attached to. This is the
+    real goal, and it is the proper answer to the thing --headless was
+    solving badly: a detached run needs its gates off globally *because
+    nobody can answer it*. If another terminal can, it doesn't. Needs the
+    full `ApprovalRequest` persisted (only three fields — tool_name,
+    category, arguments), a response column, and a request id so an answer
+    to an earlier prompt can't land on a later one. The holder then has to
+    take an answer from either side: easy for the TUI worker, which already
+    awaits a oneshot and can select against a poll; awkward for the CLI,
+    whose approval blocks on a stdin read that would have to become
+    selectable. A pending answer should expire with the claim.
+  - UNIQUE(session_id, seq) on messages, so the collision is unpersistable
+    even if the claim is somehow bypassed — defence in depth rather than
+    prevention alone. Now that persist_pending is one transaction a
+    violation rolls the batch back cleanly. Costs a table rebuild (SQLite
+    can't add a constraint in place) and any database already holding
+    duplicates has to have them resolved before the index will build.
 * picker refresh decrypts every session title and every session's last message
   every 2s, regardless of how many rows are on screen. Fine now — it scales with
   how many sessions you've accumulated, not with the screen — but that's the
@@ -131,7 +163,6 @@ NEXT:
   shareable); and auto-creating .clank/ wherever you happen to run litters
   directories, while requiring `clank init` adds a new concept. The stored
   working_dir is the data you'd migrate from.
-* session claimed flag on session table in case 2 clank processes open the same session. What would that do? is that ok?
 * should messages table be expanded to include tool calls, errors, etc.. OR errors logged somewhere
 * need a model browser/search/picker
 * [agent/ask] [verbose]
