@@ -6,6 +6,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+/// Orders model ids the way someone reading a list of them expects.
+///
+/// The endpoint returns its own order — newest first, or however it feels —
+/// which is no help at four hundred entries when you are looking for one you
+/// can half remember. Sorted here rather than at each display so `clank
+/// models` and the TUI's `/models` cannot disagree about it.
+///
+/// Case-insensitive, because a stray capital would otherwise sort a model
+/// away from its siblings, with the raw comparison breaking ties so the
+/// order is total rather than merely consistent.
+pub(crate) fn sort_model_ids(ids: &mut [String]) {
+    ids.sort_by(|a, b| {
+        a.to_lowercase()
+            .cmp(&b.to_lowercase())
+            .then_with(|| a.cmp(b))
+    });
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct ChatMessage {
     pub role: String,
@@ -786,12 +804,55 @@ impl Client {
         }
 
         let model_list: ModelList = response.json().await?;
-        Ok(model_list.data.into_iter().map(|m| m.id).collect())
+        let mut ids: Vec<String> = model_list.data.into_iter().map(|m| m.id).collect();
+        sort_model_ids(&mut ids);
+        Ok(ids)
     }
 }
 
 #[cfg(test)]
 mod deser_tests {
+
+    #[test]
+    fn model_ids_sort_alphabetically_ignoring_case() {
+        // The endpoint returns its own order, which is no help at four
+        // hundred entries when you are hunting for one you half remember.
+        let mut ids: Vec<String> = [
+            "openai/gpt-5",
+            "Anthropic/Claude-Opus",
+            "anthropic/claude-haiku",
+            "~z-ai/glm-latest",
+            "google/gemini",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        sort_model_ids(&mut ids);
+
+        assert_eq!(
+            ids,
+            vec![
+                "anthropic/claude-haiku",
+                "Anthropic/Claude-Opus",
+                "google/gemini",
+                "openai/gpt-5",
+                "~z-ai/glm-latest",
+            ],
+            "a stray capital must not sort a model away from its siblings"
+        );
+    }
+
+    #[test]
+    fn ids_differing_only_in_case_still_get_a_stable_order() {
+        // Equal under the case-insensitive comparison, so without the
+        // tiebreak their order would depend on how they arrived.
+        let mut a: Vec<String> = ["Model", "model"].iter().map(|s| s.to_string()).collect();
+        let mut b: Vec<String> = ["model", "Model"].iter().map(|s| s.to_string()).collect();
+        sort_model_ids(&mut a);
+        sort_model_ids(&mut b);
+        assert_eq!(a, b);
+    }
+
     use super::*;
     use serde_json::Value;
 

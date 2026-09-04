@@ -120,7 +120,8 @@ pub enum ModelBrowser {
     /// the moment you ask for it.
     Loading,
     Ready {
-        /// Every model the endpoint offers, in the order it returned them.
+        /// Every model the endpoint offers, sorted — see
+        /// `client::sort_model_ids`, which does it once for both front ends.
         all: Vec<String>,
         /// What has been typed to narrow them.
         filter: String,

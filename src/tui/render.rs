@@ -611,8 +611,19 @@ fn browser_height(browser: &ModelBrowser) -> u16 {
         // "Fetching…" or the reason it failed.
         _ => 1,
     };
-    rows + 3
+    // Two borders and the hint line, plus the margin below.
+    rows + 3 + BROWSER_TOP_MARGIN
 }
+
+/// Blank rows left above the `/models` box, so it does not butt straight
+/// against the last line of the conversation — it is tall and it appears
+/// without warning, and flush against a reply it reads as part of the
+/// transcript rather than over it.
+///
+/// A constant because the height reserved and the offset drawn at have to
+/// agree: reserving without offsetting squeezes the box, offsetting without
+/// reserving clips it, and neither is obvious from looking at one of them.
+const BROWSER_TOP_MARGIN: u16 = 1;
 
 /// Most models shown at once. Past this the list scrolls under the cursor —
 /// an endpoint can offer four hundred, and the box is sharing the screen
@@ -626,6 +637,14 @@ fn draw_model_browser(
     current: &str,
     tick: usize,
 ) {
+    // The margin `browser_height` reserved. Given up here rather than in the
+    // layout so the box and its spacing stay one thing to reason about.
+    let area = Rect {
+        y: area.y + BROWSER_TOP_MARGIN,
+        height: area.height.saturating_sub(BROWSER_TOP_MARGIN),
+        ..area
+    };
+
     let matches = browser.matches();
     let (title, hint) = match browser {
         ModelBrowser::Loading => (" models ".to_string(), String::new()),
@@ -2278,6 +2297,34 @@ mod tests {
         assert!(
             starts.windows(2).all(|w| w[0] == w[1]),
             "descriptions are not in one column: {starts:?}"
+        );
+    }
+
+    #[test]
+    fn the_model_browser_does_not_butt_against_the_transcript() {
+        // It is a tall box that appears without warning; flush against the
+        // last reply it reads as part of the conversation rather than over
+        // it.
+        let mut app = App::new("m".to_string(), None, "abcd1234".to_string());
+        app.transcript
+            .push(TranscriptItem::User("what models?".into()));
+        app.model_browser = Some(crate::tui::app::ModelBrowser::Ready {
+            all: vec!["one/model".to_string()],
+            filter: String::new(),
+            selected: 0,
+        });
+        let out = render_to_string(&app, 60, 16);
+        let rows: Vec<&str> = out.lines().collect();
+
+        let top = rows
+            .iter()
+            .position(|r| r.contains("┌ models"))
+            .expect("the box should be drawn");
+        assert!(top > 0);
+        assert!(
+            rows[top - 1].trim().is_empty(),
+            "expected a blank row above the box, found {:?}",
+            rows[top - 1]
         );
     }
 
