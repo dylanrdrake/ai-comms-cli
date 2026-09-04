@@ -487,12 +487,6 @@ pub fn draw(
                 // common case and the one worth making shortest; otherwise
                 // `~`-relative, or absolute for anything above home.
                 let dir = match &row.working_dir {
-                    // Home is named even when it is also where you are.
-                    // `.` only says "here", which you already know; `~` says
-                    // which directory that is — and running from home would
-                    // otherwise collapse every session started there into a
-                    // column of dots.
-                    Some(d) if home_relative(d) == "~" => "~".to_string(),
                     Some(d) if Some(d.as_str()) == dir => ".".to_string(),
                     Some(d) => home_relative(d),
                     None => "dir not recorded".to_string(),
@@ -976,15 +970,10 @@ mod tests {
 
     /// Renders the launch screen off-screen so the list can be asserted on.
     fn picker_to_string(picker: &Picker, width: u16, height: u16) -> String {
-        picker_to_string_in(picker, HERE, width, height)
-    }
-
-    /// Renders as though the process were sitting in `cwd`.
-    fn picker_to_string_in(picker: &Picker, cwd: &str, width: u16, height: u16) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw(frame, picker, "TITLE", Some(cwd), false, "hint", 0))
+            .draw(|frame| draw(frame, picker, "TITLE", Some(HERE), false, "hint", 0))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
@@ -995,10 +984,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    fn picker_of_in(rows: Vec<SessionRow>, cwd: Option<&str>) -> Picker {
-        Picker::launch(rows, cwd)
     }
 
     fn many_sessions(count: usize) -> Picker {
@@ -1184,36 +1169,6 @@ mod tests {
             );
             picker.move_down();
         }
-    }
-
-    #[test]
-    fn home_is_shown_as_tilde_even_when_it_is_where_you_are() {
-        // `.` only says "here", which you already know from having typed the
-        // command. `~` says which directory that is — and launched from home
-        // the old rule collapsed every session started there into dots.
-        let Some(home) = home::home_dir() else {
-            return;
-        };
-        let home = home.display().to_string();
-        let picker = picker_of_in(
-            vec![row_in("00000001", "chat", "at home", Some(&home))],
-            Some(&home),
-        );
-        let out = picker_to_string_in(&picker, &home, 110, 10);
-        let row = out.lines().find(|l| l.contains("at home")).unwrap();
-
-        assert!(row.contains(" ~ "), "expected ~, got {row:?}");
-        assert!(!row.contains(" . "), "should not fall back to `.`: {row:?}");
-    }
-
-    #[test]
-    fn somewhere_else_you_happen_to_be_still_shows_as_dot() {
-        // Only home is special; every other current directory is still the
-        // shortest thing it can be.
-        let picker = picker_of(vec![row_in("00000001", "chat", "here", Some(HERE))]);
-        let out = picker_to_string(&picker, 110, 10);
-        let row = out.lines().find(|l| l.contains("here")).unwrap();
-        assert!(row.contains(" . "), "{row:?}");
     }
 
     #[test]
