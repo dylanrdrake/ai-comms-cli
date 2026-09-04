@@ -556,39 +556,49 @@ impl ChatSession {
     /// write doesn't silently drop the rest of a turn; the first error is
     /// returned once the rest have been tried.
     pub fn persist_pending(&mut self) -> Result<()> {
-        let mut first_error = None;
+        // All of the pending messages or none of them. Advancing
+        // `saved_len` past one that failed to save used to drop it for
+        // good, and saving the ones after it left a hole in `seq` — the
+        // transcript then loaded cleanly with a turn missing from the
+        // middle and nothing anywhere to say so. Silent gaps are worse
+        // than a loud failure.
+        //
+        // Leaving `saved_len` alone on failure is what makes a retry work:
+        // `cmd_agent` persists once before the turn and once after, so a
+        // user message that could not be written the first time is written
+        // by the second attempt, together with the reply it prompted,
+        // rather than leaving an answer to a question nobody can see.
+        let tx = self.conn.unchecked_transaction()?;
 
         for (seq, message) in self.messages.iter().enumerate().skip(self.saved_len) {
-            if let Err(e) = store::append_message(
-                &self.conn,
+            store::append_message(
+                &tx,
                 &self.id,
                 seq,
                 message,
                 &self.model,
                 self.effort_level.as_deref(),
-            ) {
-                first_error.get_or_insert(e);
-            }
+            )?;
         }
+
+        // Derived from the first user message, so it belongs in the same
+        // commit as the message that decides it.
+        let title = (!self.title_set && self.messages.iter().any(|m| m.role == "user"))
+            .then(|| store::derive_title(&self.messages));
+        if let Some(title) = &title {
+            store::set_session_title(&tx, &self.id, title)?;
+        }
+
+        tx.commit()?;
+
+        // Only once the write is durable does the in-memory copy agree that
+        // it happened.
         self.saved_len = self.messages.len();
-
-        if !self.title_set && self.messages.iter().any(|m| m.role == "user") {
-            let title = store::derive_title(&self.messages);
-            match store::set_session_title(&self.conn, &self.id, &title) {
-                Ok(()) => {
-                    self.title = title;
-                    self.title_set = true;
-                }
-                Err(e) => {
-                    first_error.get_or_insert(e);
-                }
-            }
+        if let Some(title) = title {
+            self.title = title;
+            self.title_set = true;
         }
-
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
     }
 
     /// Appends one message and writes it (plus anything else pending)
@@ -1005,6 +1015,77 @@ mod tests {
             summary.verbose,
             "it has to survive a reload, not just live in memory"
         );
+    }
+
+#[test]
+    fn a_failed_save_keeps_the_messages_pending_for_the_next_attempt() {
+        // `cmd_agent` persists once before the turn and once after, and
+        // carries on when the first one fails. That is only safe if the
+        // failure left the messages pending: otherwise the question is
+        // dropped and the transcript keeps the answer alone.
+        let mut session = memory_session();
+        session.push_user("the question".to_string());
+
+        // Fault injection: with the table gone the append cannot succeed.
+        session
+            .conn
+            .execute("ALTER TABLE messages RENAME TO messages_hidden", [])
+            .unwrap();
+        assert!(session.persist_pending().is_err(), "the save should fail");
+
+        session
+            .conn
+            .execute("ALTER TABLE messages_hidden RENAME TO messages", [])
+            .unwrap();
+        session.push_assistant("the answer".to_string());
+        session.persist_pending().expect("the retry should succeed");
+
+        let stored = store::load_messages(&session.conn, session.id()).unwrap();
+        let text: Vec<&str> = stored
+            .iter()
+            .filter_map(|m| m.message.content.as_deref())
+            .collect();
+        assert_eq!(
+            text,
+            vec!["the question", "the answer"],
+            "the retry must save what the failed attempt did not"
+        );
+    }
+
+    #[test]
+    fn a_failed_save_writes_nothing_at_all() {
+        // Partial success would leave a hole in `seq`, which reads back as a
+        // transcript that is simply missing a turn.
+        let mut session = memory_session();
+        session.push_user("first".to_string());
+        session.persist_pending().unwrap();
+
+        session.push_user("second".to_string());
+        session.push_assistant("third".to_string());
+        session
+            .conn
+            .execute("ALTER TABLE messages RENAME TO messages_hidden", [])
+            .unwrap();
+        assert!(session.persist_pending().is_err());
+        session
+            .conn
+            .execute("ALTER TABLE messages_hidden RENAME TO messages", [])
+            .unwrap();
+
+        let stored = store::load_messages(&session.conn, session.id()).unwrap();
+        assert_eq!(stored.len(), 1, "only the message saved before the fault");
+    }
+
+    #[test]
+    fn a_failed_save_does_not_claim_the_title_it_could_not_write() {
+        let mut session = memory_session();
+        session.push_user("name me from this".to_string());
+        session
+            .conn
+            .execute("ALTER TABLE messages RENAME TO messages_hidden", [])
+            .unwrap();
+        assert!(session.persist_pending().is_err());
+        assert_eq!(session.title(), "Untitled", "title followed a failed write");
     }
 
     #[test]
