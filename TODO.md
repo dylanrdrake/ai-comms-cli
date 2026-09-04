@@ -8,6 +8,7 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
+* list all sessions inthe same list. Not In this directory and elsewhere. Sessions in the current directory get . as their directory value. Sessions in other directories get their ~ relative path unless they are above ~  then they get their full path.
 * $ command UI re-think
   What exists: a box above the prompt showing the command and, once it exits,
   its output, which you then send to the conversation or discard (Ctrl-S /
