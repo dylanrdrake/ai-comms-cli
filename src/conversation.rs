@@ -230,7 +230,8 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         // bare is here too: the TUI round-trips it through the worker so the
         // answer reflects what the session actually holds, while the CLI
         // reads its own `ChatSession` directly.
-        Submission::ShowModel
+        Submission::ShowHelp
+        | Submission::ShowModel
         | Submission::ShowApproval
         | Submission::ShowSandbox
         | Submission::ShowStatus
@@ -1018,6 +1019,7 @@ mod tests {
         // they report, and a round trip would only add latency and a second
         // source of truth.
         for submission in [
+            Submission::ShowHelp,
             Submission::ShowModel,
             Submission::ShowApproval,
             Submission::ShowSandbox,

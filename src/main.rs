@@ -1393,6 +1393,17 @@ fn apply_submission(
         ui::Submission::ShowTitle => {
             println!("{}", ui::title_notice(session.title(), false).blue());
         }
+        ui::Submission::ShowHelp => {
+            let rows = ui::help_rows();
+            let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
+            println!("\n{}", "Commands:".blue());
+            for (name, blurb) in rows {
+                // Padded before colouring, since the escape codes count
+                // toward a format width and would misalign the column.
+                println!("  {}  {blurb}", format!("{name:<width$}").bright_black());
+            }
+            println!();
+        }
         ui::Submission::ShowStatus => {
             let approval = session.approval().clone();
             let rows = ui::session_settings_rows(&ui::SessionSettings {

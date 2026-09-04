@@ -868,6 +868,10 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                             app::Submission::ShowModel => {
                                 conversation.send(Command::SetModel(app.model.clone()))
                             }
+                            app::Submission::ShowHelp => {
+                                app.transcript
+                                    .push(TranscriptItem::Help(crate::ui::help_rows()));
+                            }
                             app::Submission::ShowStatus => {
                                 let approval = app.approval.clone();
                                 let rows =

@@ -324,6 +324,7 @@ exactly:
 
 | Command | Does |
 |---|---|
+| `/help` | List every in-session command and what it does. The same list in both front ends, generated from the one the parser uses, so it cannot drift from what actually works |
 | `/model <name>` | Switch the model for the rest of the session, and remember it |
 | `/model` | Show the model currently in use |
 | `/agent` | Turn on tool-calling for the rest of the session |
@@ -528,6 +529,7 @@ the current one instead, repointing the session there — the same thing
 
 | Command | Does |
 |---|---|
+| `/help` | List every in-session command and what it does. The same list in both front ends, generated from the one the parser uses, so it cannot drift from what actually works |
 | `/model <name>` | Switch the model for the rest of the session, and remember it |
 | `/model` | Show the model currently in use |
 | `/agent` | Turn on tool-calling (read/write files, run commands) for the rest of the session |

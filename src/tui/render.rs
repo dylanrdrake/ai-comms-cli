@@ -579,6 +579,7 @@ fn item_key(item: &TranscriptItem, app: &App, area_width: u16, content_width: us
         TranscriptItem::Error(message) => (5u8, message).hash(&mut hasher),
         TranscriptItem::Notice(message) => (6u8, message).hash(&mut hasher),
         TranscriptItem::SessionStatus(rows) => (7u8, rows).hash(&mut hasher),
+        TranscriptItem::Help(rows) => (9u8, rows).hash(&mut hasher),
         TranscriptItem::ApprovalStatus { approval, changed } => (
             8u8,
             approval.read_disk,
@@ -589,6 +590,37 @@ fn item_key(item: &TranscriptItem, app: &App, area_width: u16, content_width: us
             .hash(&mut hasher),
     }
     hasher.finish()
+}
+
+/// A titled block of label/value rows, as `/status` and `/help` both show.
+///
+/// The labels are padded to a common width so the values line up in a
+/// column, and each value goes through `push_labeled`, which hangs a long
+/// one under its label rather than letting it run off the pane — a working
+/// directory for `/status`, a wordy description for `/help`.
+fn push_row_block(
+    lines: &mut Vec<Line<'static>>,
+    heading: &str,
+    rows: &[(String, String)],
+    content_width: usize,
+) {
+    lines.push(Line::from(vec![
+        Span::styled("— ", Style::new().dark_gray().italic()),
+        Span::styled(heading.to_string(), Style::new().dark_gray().italic()),
+    ]));
+    let width = rows
+        .iter()
+        .map(|(label, _)| display_width(label))
+        .max()
+        .unwrap_or(0);
+    for (label, value) in rows {
+        push_labeled(
+            lines,
+            format!("      {label:<width$}  "),
+            value.clone(),
+            content_width,
+        );
+    }
 }
 
 /// One transcript block's rows: everything the cache stores against an item.
@@ -809,28 +841,11 @@ fn render_item(
             lines.push(Line::raw(""));
         }
         TranscriptItem::SessionStatus(rows) => {
-            lines.push(Line::from(vec![
-                Span::styled("— ", Style::new().dark_gray().italic()),
-                Span::styled("Session:", Style::new().dark_gray().italic()),
-            ]));
-            // Values line up under each other, so the column of labels
-            // reads as a list rather than as ragged prose.
-            let width = rows
-                .iter()
-                .map(|(label, _)| display_width(label))
-                .max()
-                .unwrap_or(0);
-            for (label, value) in rows {
-                // Through `push_labeled` so a long value — a working
-                // directory, usually — wraps under its label rather than
-                // running off the pane.
-                push_labeled(
-                    &mut lines,
-                    format!("      {label:<width$}  "),
-                    value.clone(),
-                    content_width,
-                );
-            }
+            push_row_block(&mut lines, "Session:", rows, content_width);
+            lines.push(Line::raw(""));
+        }
+        TranscriptItem::Help(rows) => {
+            push_row_block(&mut lines, "Commands:", rows, content_width);
             lines.push(Line::raw(""));
         }
         TranscriptItem::ApprovalStatus { approval, changed } => {
@@ -2099,6 +2114,35 @@ mod tests {
             per_frame < BUDGET,
             "a frame over {bytes} bytes of transcript took {per_frame:?}, \
              budget {BUDGET:?} — the transcript is being rebuilt per frame again"
+        );
+    }
+
+    #[test]
+    fn help_draws_as_a_titled_column() {
+        // Tall and wide enough for the whole list to fit unwrapped: the pane
+        // scrolls to the newest content, so a short one would cut the
+        // heading off the top and prove nothing.
+        let mut app = App::new("m".to_string(), None, "abcd1234".to_string());
+        app.transcript
+            .push(TranscriptItem::Help(crate::ui::help_rows()));
+        let out = render_to_string(&app, 120, 60);
+
+        assert!(out.contains("Commands:"), "{out}");
+        assert!(out.contains("Show this list"), "{out}");
+
+        // The same block shape `/status` uses: labels padded to a common
+        // width, so every description starts in the same column.
+        let starts: Vec<usize> = crate::ui::help_rows()
+            .iter()
+            .map(|(_, blurb)| {
+                out.lines()
+                    .find_map(|line| line.find(blurb.as_str()))
+                    .unwrap_or_else(|| panic!("{blurb} missing from:\n{out}"))
+            })
+            .collect();
+        assert!(
+            starts.windows(2).all(|w| w[0] == w[1]),
+            "descriptions are not in one column: {starts:?}"
         );
     }
 

@@ -197,6 +197,8 @@ pub enum Submission {
     SetTitle(String),
     /// Prints/shows this session's name without changing it.
     ShowTitle,
+    /// Prints/shows every in-session command and what it does.
+    ShowHelp,
     /// A line that named a known command (`/effort`, `/max-iterations`,
     /// `/temperature`/`/temp`, `/approval`, `/sandbox`) but wasn't a valid
     /// invocation of
@@ -549,6 +551,12 @@ pub fn classify(text: &str) -> Submission {
         }
     }
 
+    if let Some(rest) = trimmed.strip_prefix("/help") {
+        if rest.trim().is_empty() {
+            return Submission::ShowHelp;
+        }
+    }
+
     if let Some(rest) = trimmed.strip_prefix("/status") {
         if rest.trim().is_empty() {
             return Submission::ShowStatus;
@@ -612,30 +620,165 @@ fn command_word(trimmed: &str) -> Option<&str> {
     Some(rest.split_whitespace().next().unwrap_or(rest))
 }
 
-/// Every command word [`classify`] knows, for spotting a near miss. The four
-/// that always parse are here too: `/mdoel` should still be caught as a
-/// typo for `/model` even though `/model` itself can't be invoked wrongly.
-const KNOWN_COMMANDS: [&str; 19] = [
-    "model",
-    "agent",
-    "ask",
-    "effort",
-    "max-iterations",
-    "temperature",
-    "temp",
-    "approval",
-    "sandbox",
-    "session",
-    "status",
-    "stream",
-    "send",
-    "discard",
-    "allow",
-    "deny",
-    "back",
-    "highlight",
-    "verbose",
+/// Every in-session command: the word, how it is invoked, what it does, and
+/// whether invoking it wrongly is an error.
+///
+/// The single place this list lives. `/help` renders it, [`command_usage`]
+/// reads the syntax out of it for the "you invoked this wrongly" message,
+/// and [`nearest_command`] scans the words to spot a typo. Keeping them on
+/// one table is the point: a command added to `classify` and forgotten here
+/// is invisible to `/help`, and one described here but never parsed is a
+/// promise the session does not keep.
+///
+/// Every command is listed, including the ones that cannot be invoked
+/// wrongly, because typo-spotting scans the same words: `/mdoel` is caught
+/// as a near miss even though `/model` itself never fails to parse.
+struct Command {
+    word: &'static str,
+    /// How `/help` lists it. Brackets mark an argument that can be left off,
+    /// which for most of these means "show the current setting".
+    syntax: &'static str,
+    blurb: &'static str,
+    /// The form quoted back when the command is named but not validly
+    /// invoked. `None` for the bare commands, which are never read as
+    /// malformed — a line starting `/back` with other words after it is
+    /// likelier prose than a mistake, and swallowing a message costs more
+    /// than missing one. Separate from `syntax` because an error should
+    /// state the form that was wanted, not advertise that the argument was
+    /// optional all along.
+    usage: Option<&'static str>,
+}
+
+const COMMANDS: [Command; 20] = [
+    Command {
+        word: "help",
+        syntax: "/help",
+        blurb: "Show this list",
+        usage: Some("/help"),
+    },
+    Command {
+        word: "model",
+        syntax: "/model [name]",
+        blurb: "Show the model, or switch it for this session",
+        usage: None,
+    },
+    Command {
+        word: "agent",
+        syntax: "/agent",
+        blurb: "Turn tools on — read and write files, run commands",
+        usage: None,
+    },
+    Command {
+        word: "ask",
+        syntax: "/ask",
+        blurb: "Turn tools off, back to plain chat",
+        usage: None,
+    },
+    Command {
+        word: "effort",
+        syntax: "/effort <level> | clear | default",
+        blurb: "Set the reasoning effort level",
+        usage: Some("/effort <level> | clear | default"),
+    },
+    Command {
+        word: "max-iterations",
+        syntax: "/max-iterations <n> | clear | default",
+        blurb: "Cap the tool-calling loop per turn (agent mode)",
+        usage: Some("/max-iterations <n> | clear | default (n must be a positive integer)"),
+    },
+    Command {
+        word: "temperature",
+        syntax: "/temperature [<n> | clear | default]",
+        blurb: "Show or set the sampling temperature",
+        usage: Some("/temperature <n> | clear | default (n must be 0 or greater)"),
+    },
+    Command {
+        word: "temp",
+        syntax: "/temp [<n> | clear | default]",
+        blurb: "Short for /temperature",
+        usage: Some("/temp <n> | clear | default (n must be 0 or greater)"),
+    },
+    Command {
+        word: "approval",
+        syntax: "/approval [<read|write|terminal|all> <on|off>]",
+        blurb: "Show or switch the tool-approval gates",
+        usage: Some("/approval <read|write|terminal|all> <on|off>"),
+    },
+    Command {
+        word: "sandbox",
+        syntax: "/sandbox [on|off]",
+        blurb: "Confine the agent's writes to the working directory",
+        usage: Some("/sandbox <on|off>"),
+    },
+    Command {
+        word: "verbose",
+        syntax: "/verbose [on|off]",
+        blurb: "Show tool arguments and results, not just the call",
+        usage: Some("/verbose <on|off>"),
+    },
+    Command {
+        word: "highlight",
+        syntax: "/highlight [on|off]",
+        blurb: "Band your own messages in the transcript",
+        usage: Some("/highlight <on|off>"),
+    },
+    Command {
+        word: "stream",
+        syntax: "/stream [on|off]",
+        blurb: "Stream replies token-by-token, or wait for the whole one",
+        usage: Some("/stream <on|off>"),
+    },
+    Command {
+        word: "status",
+        syntax: "/status",
+        blurb: "Show every setting this session runs with",
+        usage: Some("/status"),
+    },
+    Command {
+        word: "session",
+        syntax: "/session [title <new title>]",
+        blurb: "Show or change this session's name",
+        usage: Some("/session title <new title>"),
+    },
+    Command {
+        word: "send",
+        syntax: "/send",
+        blurb: "Send a $ command's output to the conversation (Ctrl-S)",
+        usage: None,
+    },
+    Command {
+        word: "discard",
+        syntax: "/discard",
+        blurb: "Throw a $ command's output away (Ctrl-D)",
+        usage: None,
+    },
+    Command {
+        word: "allow",
+        syntax: "/allow",
+        blurb: "Approve the waiting tool call (Ctrl-Y)",
+        usage: None,
+    },
+    Command {
+        word: "deny",
+        syntax: "/deny",
+        blurb: "Refuse the waiting tool call (Ctrl-N)",
+        usage: None,
+    },
+    Command {
+        word: "back",
+        syntax: "/back",
+        blurb: "Return to the launch screen (Ctrl-B) — TUI only",
+        usage: None,
+    },
 ];
+
+/// The commands as `/help` shows them: how to type it, and what it does.
+pub fn help_rows() -> Vec<(String, String)> {
+    COMMANDS
+        .iter()
+        .map(|c| (c.syntax.to_string(), c.blurb.to_string()))
+        .collect()
+}
 
 /// How far a word may stray from a command name and still be read as a
 /// misspelling of it, given its length. Two edits covers the ordinary slips
@@ -674,9 +817,9 @@ fn nearest_command(word: &str) -> Option<&'static str> {
         return None;
     }
     let max_distance = max_distance_for(length);
-    let (_, nearest) = KNOWN_COMMANDS
+    let (_, nearest) = COMMANDS
         .iter()
-        .map(|name| (edit_distance(word, name), *name))
+        .map(|c| (edit_distance(word, c.word), c.word))
         // 0 would mean an exact match, which every caller above has already
         // handled — suggesting a word to itself would be nonsense.
         .filter(|(distance, _)| (1..=max_distance).contains(distance))
@@ -719,22 +862,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// pointed at: `/temp` is answered about `/temp`, never about
 /// `/temperature`.
 fn command_usage(word: &str) -> Option<String> {
-    Some(match word {
-        "effort" => format!("/{word} <level> | clear | default"),
-        "max-iterations" => {
-            format!("/{word} <n> | clear | default (n must be a positive integer)")
-        }
-        "temperature" | "temp" => {
-            format!("/{word} <n> | clear | default (n must be 0 or greater)")
-        }
-        "highlight" => format!("/{word} <on|off>"),
-        "approval" => format!("/{word} <read|write|terminal|all> <on|off>"),
-        "sandbox" | "verbose" | "stream" => format!("/{word} <on|off>"),
-        // Takes no argument at all, so anything after it is a mistake.
-        "status" => format!("/{word}"),
-        "session" => format!("/{word} title <new title>"),
-        _ => return None,
-    })
+    COMMANDS
+        .iter()
+        .find(|c| c.word == word)
+        .and_then(|c| c.usage)
+        .map(str::to_string)
 }
 
 /// "clear" (case-insensitive) resets an override; anything else is the new
@@ -1488,6 +1620,61 @@ mod tests {
             sandbox_notice(false, false),
             "Sandbox is off — writes allowed anywhere"
         );
+    }
+
+    #[test]
+    fn classify_recognizes_help() {
+        assert_eq!(classify("/help"), Submission::ShowHelp);
+        assert_eq!(classify("  /help  "), Submission::ShowHelp);
+        // Takes no argument, so anything after it is a mistake rather than
+        // a message — the same rule `/status` follows.
+        assert!(matches!(
+            classify("/help model"),
+            Submission::UnknownCommand(_)
+        ));
+        // And a word that merely starts with it is prose.
+        assert_eq!(
+            classify("/helpful hints please"),
+            Submission::Message("/helpful hints please".to_string())
+        );
+    }
+
+    #[test]
+    fn help_lists_every_command_the_classifier_knows() {
+        // The table is the single source for `/help`, the usage quoted in an
+        // error, and typo-spotting. A command parsed by `classify` but left
+        // out of it is invisible to all three, so this walks the table and
+        // checks each entry actually is a command.
+        for (syntax, blurb) in help_rows() {
+            assert!(syntax.starts_with('/'), "{syntax} is not a command");
+            assert!(!blurb.is_empty(), "{syntax} has no description");
+
+            let word = syntax
+                .trim_start_matches('/')
+                .split([' ', '<', '['])
+                .next()
+                .unwrap()
+                .to_string();
+            assert!(
+                !matches!(classify(&format!("/{word}")), Submission::Message(_)),
+                "/{word} is listed by /help but reaches the model as a message"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelling_of_help_is_caught_like_any_other() {
+        // Only worth asserting because `/help` was added to the table after
+        // the near-miss machinery already existed; being in the table is
+        // what puts it in scope.
+        assert!(matches!(
+            classify("/halp"),
+            Submission::UnknownCommand(message) if message.contains("/help")
+        ));
+        // Not `/hlep`, though: a transposition is two edits, and a
+        // four-letter word is allowed only one before the guess is refused
+        // as too likely to swallow a real message.
+        assert_eq!(classify("/hlep"), Submission::Message("/hlep".to_string()));
     }
 
     #[test]

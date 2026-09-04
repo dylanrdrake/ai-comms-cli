@@ -59,6 +59,10 @@ pub enum TranscriptItem {
     /// a snapshot of the moment it was asked for, and shouldn't quietly
     /// change under the reader when a later `/effort` scrolls past.
     SessionStatus(Vec<(String, String)>),
+    /// Every in-session command and what it does, from `/help`. Held as
+    /// rendered rows for the same reason `SessionStatus` is: the list is
+    /// what it was when you asked for it.
+    Help(Vec<(String, String)>),
     /// This session's approval gates, pretty-printed the same way `clank
     /// approval` shows them in the CLI rather than packed into one
     /// `Notice` line. Shown both after `/approval <category> <on|off>`
