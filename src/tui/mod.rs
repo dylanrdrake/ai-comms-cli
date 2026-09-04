@@ -765,25 +765,194 @@ fn is_typed_char(key: &KeyEvent) -> bool {
 /// Answers a pending approval. Shared by the chord and by `/allow`, `/deny` —
 /// the typed forms exist because a terminal that claims `Ctrl-Y` would
 /// otherwise leave a turn waiting on a decision with no way to give it.
-fn answer_approval(app: &mut App, conversation: &Conversation, allowed: bool) {
+fn answer_approval(app: &mut App, send: &mut impl FnMut(Command), allowed: bool) {
     if app.pending_approval.is_none() {
         return;
     }
-    conversation.send(Command::Approve(allowed));
+    send(Command::Approve(allowed));
     app.approval_answered(allowed);
 }
 
 /// Settles a finished `$` command, sending its output to the model or not.
 /// Does nothing when no command is waiting, so the keys and the commands are
 /// both inert the rest of the time.
-fn settle_shell(app: &mut App, conversation: &Conversation, sent: bool) {
+fn settle_shell(app: &mut App, send: &mut impl FnMut(Command), sent: bool) {
     if let Some(text) = app.settle_shell(sent) {
-        conversation.send(Command::Include(text));
+        send(Command::Include(text));
     }
 }
 
 /// Handles a keypress in the conversation. Returns whether to leave it and
 /// go back to the launch screen.
+/// Acts on one submitted line: what the worker must be told, and what
+/// this side shows for itself.
+///
+/// Split out of the key handler and given a `send` sink rather than the
+/// `Conversation` so it can be driven from a test. It was not, and the
+/// first thing that went wrong here was invisible to every test in the
+/// suite: `/models` was routed to the worker *and* needed to open a box,
+/// and the dispatch below treats those as alternatives, so the box never
+/// opened and the fetched list arrived with nowhere to land.
+/// Returns whether the chat screen should be left (`/back`).
+fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)) -> bool {
+    let submission = app::classify(text);
+
+    // One box, one command. Two in flight would race on the same
+    // slot — whichever finished last would land on top of the
+    // other's output, and the first would be lost with no record
+    // that it ran.
+    if matches!(submission, app::Submission::Shell(_))
+        && matches!(app.pending_shell, Some(ShellState::Running { .. }))
+    {
+        app.transcript.push(TranscriptItem::Notice(
+            "A command is still running — wait for it to finish".to_string(),
+        ));
+        return false;
+    }
+
+    // The one submission that is both. Everything else either
+    // goes to the worker or is answered locally, so the dispatch
+    // below treats those as alternatives — which silently
+    // swallowed this: the fetch was sent, the box was never
+    // opened, and the list arrived with nowhere to land.
+    if matches!(submission, app::Submission::BrowseModels) {
+        app.model_browser = Some(app::ModelBrowser::Loading);
+    }
+
+    match command_for(&submission) {
+        // Everything that changes session state is the worker's
+        // to apply; it replies with the event that updates the
+        // view, so the two can't disagree.
+        Some(command) => send(command),
+        // The rest are read-only, answered from state this side
+        // already holds. `command_for` is the exhaustive match,
+        // so a new submission variant is classified there first.
+        None => {
+            match submission {
+                // Round-tripped rather than read locally, so the
+                // answer reflects what the session actually holds.
+                app::Submission::ShowModel => send(Command::SetModel(app.model.clone())),
+                app::Submission::ShowHelp => {
+                    app.transcript
+                        .push(TranscriptItem::Help(crate::ui::help_rows()));
+                }
+                // Opened above, then dispatched to the worker
+                // by `command_for` — so this arm never runs. It
+                // exists because the match is exhaustive, which
+                // is what will make the next person adding a
+                // submission think about which side it belongs
+                // on.
+                app::Submission::BrowseModels => {}
+                app::Submission::ShowEffort => {
+                    app.transcript
+                        .push(TranscriptItem::Notice(crate::ui::effort_notice(
+                            app.effort_level.as_deref(),
+                            false,
+                        )));
+                }
+                app::Submission::ShowStatus => {
+                    let approval = app.approval.clone();
+                    let rows = crate::ui::session_settings_rows(&crate::ui::SessionSettings {
+                        id: app.short_id(),
+                        title: &app.title,
+                        model: &app.model,
+                        agentic: app.agentic,
+                        effort_level: app.effort_level.as_deref(),
+                        temperature: app.temperature,
+                        max_iterations: app.max_iterations,
+                        verbose: app.verbose,
+                        highlight: app.highlight,
+                        sandbox: app.sandbox,
+                        stream: app.stream,
+                        working_dir: app.working_dir.as_deref(),
+                        approval: &approval,
+                    });
+                    app.transcript.push(TranscriptItem::SessionStatus(rows));
+                }
+                app::Submission::ShowHighlight => {
+                    app.transcript
+                        .push(TranscriptItem::Notice(crate::ui::highlight_notice(
+                            app.highlight,
+                            false,
+                        )));
+                }
+                app::Submission::ShowVerbose => {
+                    app.transcript
+                        .push(TranscriptItem::Notice(crate::ui::verbose_notice(
+                            app.verbose,
+                            false,
+                        )));
+                }
+                app::Submission::ShowTemperature => {
+                    app.transcript
+                        .push(TranscriptItem::Notice(crate::ui::temperature_notice(
+                            app.temperature,
+                            false,
+                        )));
+                }
+                app::Submission::ShowTitle => {
+                    app.transcript
+                        .push(TranscriptItem::Notice(crate::ui::title_notice(
+                            &app.title, false,
+                        )));
+                }
+                app::Submission::ShowStream => {
+                    app.transcript
+                        .push(TranscriptItem::Notice(crate::ui::stream_notice(
+                            app.stream, false,
+                        )));
+                }
+                app::Submission::ShowSandbox => {
+                    app.transcript
+                        .push(TranscriptItem::Notice(crate::ui::sandbox_notice(
+                            app.sandbox,
+                            false,
+                        )));
+                }
+                app::Submission::ShowApproval => {
+                    app.transcript.push(TranscriptItem::ApprovalStatus {
+                        approval: app.approval.clone(),
+                        changed: false,
+                    });
+                }
+                // Typed equivalents of the box's chords, for a
+                // terminal or multiplexer that has claimed them.
+                app::Submission::SendShell => settle_shell(app, send, true),
+                app::Submission::DiscardShell => settle_shell(app, send, false),
+                app::Submission::AllowTool => answer_approval(app, send, true),
+                app::Submission::DenyTool => answer_approval(app, send, false),
+                app::Submission::Back => return true,
+                app::Submission::UnknownCommand(message) => {
+                    app.transcript.push(TranscriptItem::Error(message));
+                }
+                // Listed rather than caught by `_`, so adding
+                // a submission has to be considered on this side
+                // too — a catch-all here would silently ignore a
+                // new read-only one.
+                app::Submission::Message(_)
+                | app::Submission::SetModel(_)
+                | app::Submission::SetAgentic(_)
+                | app::Submission::SetEffort(_)
+                | app::Submission::ResetEffort
+                | app::Submission::SetVerbose(_)
+                | app::Submission::SetHighlight(_)
+                | app::Submission::SetStream(_)
+                | app::Submission::SetTitle(_)
+                | app::Submission::SetSandbox(_)
+                | app::Submission::SetMaxIterations(_)
+                | app::Submission::ResetMaxIterations
+                | app::Submission::SetTemperature(_)
+                | app::Submission::ResetTemperature
+                | app::Submission::Shell(_)
+                | app::Submission::SetApproval { .. } => {
+                    unreachable!("command_for routes these to the worker")
+                }
+            }
+        }
+    }
+    false
+}
+
 fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) -> bool {
     // The browser holds the keyboard while it is open. Unlike an approval —
     // which arrives unbidden, and so was deliberately kept out of the input
@@ -823,11 +992,11 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
         if let KeyCode::Char(c) = key.code {
             match c {
                 'y' => {
-                    answer_approval(app, conversation, true);
+                    answer_approval(app, &mut |c| conversation.send(c), true);
                     return false;
                 }
                 'n' => {
-                    answer_approval(app, conversation, false);
+                    answer_approval(app, &mut |c| conversation.send(c), false);
                     return false;
                 }
                 _ => {}
@@ -848,11 +1017,11 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
         if let KeyCode::Char(c) = key.code {
             match c {
                 's' => {
-                    settle_shell(app, conversation, true);
+                    settle_shell(app, &mut |c| conversation.send(c), true);
                     return false;
                 }
                 'd' => {
-                    settle_shell(app, conversation, false);
+                    settle_shell(app, &mut |c| conversation.send(c), false);
                     return false;
                 }
                 _ => {}
@@ -873,142 +1042,8 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
         }
         KeyCode::Enter => {
             if let Some(text) = app.take_input() {
-                let submission = app::classify(&text);
-
-                // One box, one command. Two in flight would race on the same
-                // slot — whichever finished last would land on top of the
-                // other's output, and the first would be lost with no record
-                // that it ran.
-                if matches!(submission, app::Submission::Shell(_))
-                    && matches!(app.pending_shell, Some(ShellState::Running { .. }))
-                {
-                    app.transcript.push(TranscriptItem::Notice(
-                        "A command is still running — wait for it to finish".to_string(),
-                    ));
-                    return false;
-                }
-
-                match command_for(&submission) {
-                    // Everything that changes session state is the worker's
-                    // to apply; it replies with the event that updates the
-                    // view, so the two can't disagree.
-                    Some(command) => conversation.send(command),
-                    // The rest are read-only, answered from state this side
-                    // already holds. `command_for` is the exhaustive match,
-                    // so a new submission variant is classified there first.
-                    None => {
-                        match submission {
-                            // Round-tripped rather than read locally, so the
-                            // answer reflects what the session actually holds.
-                            app::Submission::ShowModel => {
-                                conversation.send(Command::SetModel(app.model.clone()))
-                            }
-                            app::Submission::ShowHelp => {
-                                app.transcript
-                                    .push(TranscriptItem::Help(crate::ui::help_rows()));
-                            }
-                            app::Submission::BrowseModels => {
-                                // Opened straight away rather than when the
-                                // list lands, so asking for it does
-                                // something visible immediately. The worker
-                                // is already fetching; the box says so.
-                                app.model_browser = Some(app::ModelBrowser::Loading);
-                            }
-                            app::Submission::ShowEffort => {
-                                app.transcript.push(TranscriptItem::Notice(
-                                    crate::ui::effort_notice(app.effort_level.as_deref(), false),
-                                ));
-                            }
-                            app::Submission::ShowStatus => {
-                                let approval = app.approval.clone();
-                                let rows =
-                                    crate::ui::session_settings_rows(&crate::ui::SessionSettings {
-                                        id: app.short_id(),
-                                        title: &app.title,
-                                        model: &app.model,
-                                        agentic: app.agentic,
-                                        effort_level: app.effort_level.as_deref(),
-                                        temperature: app.temperature,
-                                        max_iterations: app.max_iterations,
-                                        verbose: app.verbose,
-                                        highlight: app.highlight,
-                                        sandbox: app.sandbox,
-                                        stream: app.stream,
-                                        working_dir: app.working_dir.as_deref(),
-                                        approval: &approval,
-                                    });
-                                app.transcript.push(TranscriptItem::SessionStatus(rows));
-                            }
-                            app::Submission::ShowHighlight => {
-                                app.transcript.push(TranscriptItem::Notice(
-                                    crate::ui::highlight_notice(app.highlight, false),
-                                ));
-                            }
-                            app::Submission::ShowVerbose => {
-                                app.transcript.push(TranscriptItem::Notice(
-                                    crate::ui::verbose_notice(app.verbose, false),
-                                ));
-                            }
-                            app::Submission::ShowTemperature => {
-                                app.transcript.push(TranscriptItem::Notice(
-                                    crate::ui::temperature_notice(app.temperature, false),
-                                ));
-                            }
-                            app::Submission::ShowTitle => {
-                                app.transcript.push(TranscriptItem::Notice(
-                                    crate::ui::title_notice(&app.title, false),
-                                ));
-                            }
-                            app::Submission::ShowStream => {
-                                app.transcript.push(TranscriptItem::Notice(
-                                    crate::ui::stream_notice(app.stream, false),
-                                ));
-                            }
-                            app::Submission::ShowSandbox => {
-                                app.transcript.push(TranscriptItem::Notice(
-                                    crate::ui::sandbox_notice(app.sandbox, false),
-                                ));
-                            }
-                            app::Submission::ShowApproval => {
-                                app.transcript.push(TranscriptItem::ApprovalStatus {
-                                    approval: app.approval.clone(),
-                                    changed: false,
-                                });
-                            }
-                            // Typed equivalents of the box's chords, for a
-                            // terminal or multiplexer that has claimed them.
-                            app::Submission::SendShell => settle_shell(app, conversation, true),
-                            app::Submission::DiscardShell => settle_shell(app, conversation, false),
-                            app::Submission::AllowTool => answer_approval(app, conversation, true),
-                            app::Submission::DenyTool => answer_approval(app, conversation, false),
-                            app::Submission::Back => return true,
-                            app::Submission::UnknownCommand(message) => {
-                                app.transcript.push(TranscriptItem::Error(message));
-                            }
-                            // Listed rather than caught by `_`, so adding
-                            // a submission has to be considered on this side
-                            // too — a catch-all here would silently ignore a
-                            // new read-only one.
-                            app::Submission::Message(_)
-                            | app::Submission::SetModel(_)
-                            | app::Submission::SetAgentic(_)
-                            | app::Submission::SetEffort(_)
-                            | app::Submission::ResetEffort
-                            | app::Submission::SetVerbose(_)
-                            | app::Submission::SetHighlight(_)
-                            | app::Submission::SetStream(_)
-                            | app::Submission::SetTitle(_)
-                            | app::Submission::SetSandbox(_)
-                            | app::Submission::SetMaxIterations(_)
-                            | app::Submission::ResetMaxIterations
-                            | app::Submission::SetTemperature(_)
-                            | app::Submission::ResetTemperature
-                            | app::Submission::Shell(_)
-                            | app::Submission::SetApproval { .. } => {
-                                unreachable!("command_for routes these to the worker")
-                            }
-                        }
-                    }
+                if dispatch_submission(app, &text, &mut |c| conversation.send(c)) {
+                    return true;
                 }
             }
         }
@@ -1139,5 +1174,81 @@ mod tests {
             mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left)),
         );
         assert_eq!(app.scroll_back, 0);
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use crate::tui::app::{App, ModelBrowser};
+
+    /// Runs one submitted line and reports what the worker was told.
+    fn dispatch(app: &mut App, text: &str) -> Vec<Command> {
+        let mut sent = Vec::new();
+        dispatch_submission(app, text, &mut |command| sent.push(command));
+        sent
+    }
+
+    fn app() -> App {
+        App::new("m".to_string(), None, "abcd1234".to_string())
+    }
+
+    #[test]
+    fn asking_for_models_both_fetches_and_opens_the_box() {
+        // The bug this exists for: `/models` needs the worker to fetch *and*
+        // this side to open the browser, but the dispatch treats those as
+        // alternatives. It was routed to the worker, the box never opened,
+        // and the list arrived with nowhere to land — so `/models` displayed
+        // nothing at all. Every unit test passed, because none of them ran
+        // the wiring.
+        let mut app = app();
+        let sent = dispatch(&mut app, "/models");
+
+        assert!(
+            matches!(app.model_browser, Some(ModelBrowser::Loading)),
+            "the box should open at once, not when the list lands"
+        );
+        assert!(
+            matches!(sent[..], [Command::ListModels]),
+            "and the fetch should be on its way: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_message_goes_to_the_worker_untouched() {
+        let mut app = app();
+        let sent = dispatch(&mut app, "hello there");
+        assert!(matches!(sent[..], [Command::Send(_)]), "{sent:?}");
+        assert!(app.model_browser.is_none());
+    }
+
+    #[test]
+    fn a_read_only_command_is_answered_here_and_not_sent() {
+        let mut app = app();
+        let sent = dispatch(&mut app, "/help");
+        assert!(sent.is_empty(), "nothing to ask the worker: {sent:?}");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Help(_))
+        ));
+    }
+
+    #[test]
+    fn back_reports_that_the_screen_should_be_left() {
+        let mut app = app();
+        let mut sent = Vec::new();
+        assert!(dispatch_submission(&mut app, "/back", &mut |c| sent.push(c)));
+        assert!(!dispatch_submission(&mut app, "/help", &mut |c| sent.push(c)));
+    }
+
+    #[test]
+    fn a_misspelled_command_is_reported_rather_than_sent() {
+        let mut app = app();
+        let sent = dispatch(&mut app, "/mdoel gpt-5");
+        assert!(sent.is_empty(), "{sent:?}");
+        assert!(matches!(
+            app.transcript.last(),
+            Some(TranscriptItem::Error(_))
+        ));
     }
 }
