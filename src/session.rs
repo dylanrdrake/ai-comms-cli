@@ -1037,7 +1037,7 @@ mod tests {
         );
     }
 
-#[test]
+    #[test]
     fn a_failed_save_keeps_the_messages_pending_for_the_next_attempt() {
         // `cmd_agent` persists once before the turn and once after, and
         // carries on when the first one fails. That is only safe if the

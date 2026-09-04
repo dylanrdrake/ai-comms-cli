@@ -774,7 +774,10 @@ fn render_item(
             push_rendered(
                 &mut lines,
                 Span::styled("✗ ", Style::new().red().bold()),
-                vec![Line::from(Span::styled(message.clone(), Style::new().red()))],
+                vec![Line::from(Span::styled(
+                    message.clone(),
+                    Style::new().red(),
+                ))],
                 None,
                 content_width,
                 "  ",
@@ -1249,7 +1252,11 @@ fn display_width(text: &str) -> usize {
 }
 
 pub(super) fn pad_to(line: &mut Line<'static>, width: usize) {
-    let used: usize = line.spans.iter().map(|span| display_width(&span.content)).sum();
+    let used: usize = line
+        .spans
+        .iter()
+        .map(|span| display_width(&span.content))
+        .sum();
     if used < width {
         line.spans.push(Span::raw(" ".repeat(width - used)));
     }
@@ -1399,8 +1406,14 @@ fn wrap_styled(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         .iter()
         .take_while(|(_, _, is_space)| *is_space)
         .count();
-    let indent: String = tokens[..leading].iter().map(|(text, ..)| text.as_str()).collect();
-    let indent_style = tokens.first().map(|(_, style, _)| *style).unwrap_or_default();
+    let indent: String = tokens[..leading]
+        .iter()
+        .map(|(text, ..)| text.as_str())
+        .collect();
+    let indent_style = tokens
+        .first()
+        .map(|(_, style, _)| *style)
+        .unwrap_or_default();
     let indent_width = display_width(&indent);
 
     // Only worth hanging while it leaves more room than it takes. A deeply
@@ -1816,8 +1829,7 @@ mod tests {
         );
     }
 
-
-/// Every item type, with content chosen to overflow, at several widths.
+    /// Every item type, with content chosen to overflow, at several widths.
     fn overflowing_transcript() -> Vec<TranscriptItem> {
         // Long words, long prose, and double-width glyphs — the last of
         // which `chars().count()` measures as half their real size.
@@ -1894,7 +1906,7 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn scrolling_back_walks_the_window_up_the_transcript() {
         // The pane no longer hands the whole transcript to ratatui and asks
         // it to scroll; it slices the rows itself. That arithmetic is what
@@ -1902,7 +1914,8 @@ mod tests {
         // directly rather than only through the "scrolled" flag.
         let mut app = App::new("m".to_string(), None, "abcd1234".to_string());
         for i in 0..60 {
-            app.transcript.push(TranscriptItem::User(format!("message {i:02}")));
+            app.transcript
+                .push(TranscriptItem::User(format!("message {i:02}")));
         }
         let mut cache = TranscriptCache::default();
 
@@ -1940,7 +1953,8 @@ mod tests {
     #[test]
     fn a_transcript_shorter_than_the_pane_still_sits_on_the_bottom() {
         let mut app = App::new("m".to_string(), None, "abcd1234".to_string());
-        app.transcript.push(TranscriptItem::User("only message".into()));
+        app.transcript
+            .push(TranscriptItem::User("only message".into()));
         let out = render_to_string(&app, 40, 20);
         let rows: Vec<&str> = out.lines().collect();
         let found = rows
@@ -1948,12 +1962,14 @@ mod tests {
             .position(|r| r.contains("only message"))
             .expect("message missing");
         // Above the input box, not pinned under the title.
-        assert!(found > rows.len() / 2, "sat at row {found} of {}", rows.len());
+        assert!(
+            found > rows.len() / 2,
+            "sat at row {found} of {}",
+            rows.len()
+        );
     }
 
-
-
-fn flat(line: &Line) -> String {
+    fn flat(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
@@ -1987,7 +2003,11 @@ fn flat(line: &Line) -> String {
     fn an_indent_with_no_room_left_to_hang_is_dropped() {
         // 30 columns of indent in a 40-column pane would leave a 10-column
         // strip down the right-hand side, which is worse than wrapping flush.
-        let code = format!("{}{}", " ".repeat(30), "a word list that has to wrap".repeat(2));
+        let code = format!(
+            "{}{}",
+            " ".repeat(30),
+            "a word list that has to wrap".repeat(2)
+        );
         let rows = wrap_styled(Line::from(Span::raw(code)), 40);
         assert!(rows.len() > 1);
         assert!(
@@ -1996,7 +2016,6 @@ fn flat(line: &Line) -> String {
             flat(&rows[1])
         );
     }
-
 
     #[test]
     fn renders_conversation_and_status() {

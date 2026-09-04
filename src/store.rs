@@ -854,7 +854,8 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
 /// An exact id always wins, even when it is also a prefix of a longer one,
 /// so a session can never be made unreachable by the existence of another.
 pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<SessionSummary>> {
-    let mut stmt = conn.prepare("SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ORDER BY id")?;
+    let mut stmt =
+        conn.prepare("SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ORDER BY id")?;
     let pattern = format!("{}%", id_or_prefix);
     let ids: Vec<String> = stmt
         .query_map(params![id_or_prefix, pattern], |row| row.get(0))?
@@ -890,7 +891,6 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
 
 /// Reads one session's row by exact id.
 fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
-
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
          approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat \
@@ -1606,13 +1606,23 @@ mod tests {
         assert_eq!(found.unwrap().id, id);
     }
 
-/// Two sessions whose ids share `prefix`, titled so they can be told apart.
+    /// Two sessions whose ids share `prefix`, titled so they can be told apart.
     fn two_sharing_a_prefix(conn: &Connection) {
         let made: Vec<String> = (0..2)
             .map(|_| {
                 create_session(
-                    conn, "model-a", KIND_CHAT, None, Some(20), Some(0.7),
-                    &ApprovalSettings::default(), true, false, true, true, None,
+                    conn,
+                    "model-a",
+                    KIND_CHAT,
+                    None,
+                    Some(20),
+                    Some(0.7),
+                    &ApprovalSettings::default(),
+                    true,
+                    false,
+                    true,
+                    true,
+                    None,
                 )
                 .unwrap()
             })
@@ -1621,8 +1631,11 @@ mod tests {
             .iter()
             .zip([("abcd1111zzzz", "FIRST"), ("abcd2222zzzz", "SECOND")])
         {
-            conn.execute("UPDATE sessions SET id = ?1 WHERE id = ?2", params![new, old])
-                .unwrap();
+            conn.execute(
+                "UPDATE sessions SET id = ?1 WHERE id = ?2",
+                params![new, old],
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE sessions SET title = ?1 WHERE id = ?2",
                 params![crypto::encrypt(title).unwrap(), new],
@@ -1642,7 +1655,10 @@ mod tests {
             .expect_err("two matches is not a lookup")
             .to_string();
         assert!(error.contains("matches 2 sessions"), "{error}");
-        assert!(error.contains("FIRST") && error.contains("SECOND"), "{error}");
+        assert!(
+            error.contains("FIRST") && error.contains("SECOND"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1659,8 +1675,11 @@ mod tests {
         // starts with it — the one case where refusing would be the bug.
         let conn = memory_db();
         two_sharing_a_prefix(&conn);
-        conn.execute("UPDATE sessions SET id = 'abcd' WHERE id = 'abcd1111zzzz'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE sessions SET id = 'abcd' WHERE id = 'abcd1111zzzz'",
+            [],
+        )
+        .unwrap();
 
         let found = find_session(&conn, "abcd").unwrap().unwrap();
         assert_eq!(found.id, "abcd");
@@ -1673,10 +1692,20 @@ mod tests {
         assert!(find_session(&conn, "ffff").unwrap().is_none());
     }
 
-fn claimable_session(conn: &Connection) -> String {
+    fn claimable_session(conn: &Connection) -> String {
         create_session(
-            conn, "m", KIND_AGENT_CHAT, None, Some(20), Some(0.7),
-            &ApprovalSettings::default(), true, false, true, true, None,
+            conn,
+            "m",
+            KIND_AGENT_CHAT,
+            None,
+            Some(20),
+            Some(0.7),
+            &ApprovalSettings::default(),
+            true,
+            false,
+            true,
+            true,
+            None,
         )
         .unwrap()
     }
