@@ -350,13 +350,12 @@ clank agent "List files in src/, then read src/main.rs, then create a refactored
 clank agent --session "Add doc comments to every pub fn in src/store.rs"
 clank sessions
 
-# Pick it up later; any unique prefix of the id works
-clank agent --resume c63337c2 "Now add tests for what you just wrote"
+# Pick it up later, in the line-based session or the TUI
+clank session --resume c63337c2
 ```
 
 A resumed session keeps its own saved model, temperature, iteration cap and
-effort level — passing those flags prints a note and changes nothing — and
-runs in the directory it was created in.
+effort level, and runs in the directory it was created in.
 
 ## Workflow Examples
 

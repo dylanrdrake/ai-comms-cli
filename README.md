@@ -402,9 +402,6 @@ clank agent "Generate project structure" --max-iterations 30
 # Override temperature or effort level for this call only
 clank agent "Generate project structure" --temperature 0.3
 clank agent "Design a lock-free queue" --effort-level high
-
-# Continue an existing session instead of starting one
-clank agent --resume 1fb31f66 "Now add tests for it"
 ```
 
 ##### Saving a run as a session
@@ -415,19 +412,11 @@ sessions`, reports `working`/`failed`/`replied` while it runs, and can be
 reopened later with `clank session --resume <id>` or `tui`. The session is
 named after the task, and the id is printed when it starts.
 
-`--resume <id>` runs the task inside a session you already have, appending to
-it. Any unique id prefix works. A resumed session keeps its own saved settings
-— `--model`, `--temperature`, `--max-iterations` and `--effort-level` are
-ignored with a note, the same rule `clank session --resume` follows — and runs
-in the directory it was created in, since that is its sandbox boundary and what
-its relative paths mean. If that directory is gone the run stops rather than
-silently rebinding to wherever you launched it; `clank session --resume <id>
---here` repoints it.
-
-Only one process may run a session at a time. `--resume` refuses a session
-whose heartbeat is still ticking, rather than interleaving two sets of turns
-into a history neither process wrote. The claim expires by itself, so a session
-whose runner died is available again with nothing to clean up.
+Only one process may run a session at a time. A run claims the session before
+it reads its history, and a second process is refused rather than interleaving
+two sets of turns into a history neither of them wrote. The claim expires by
+itself, so a session whose runner died is available again with nothing to
+clean up.
 
 #### `tui`
 A full-screen terminal UI. Unlike the line-based `session`, it owns the

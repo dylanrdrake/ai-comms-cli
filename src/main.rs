@@ -268,11 +268,6 @@ enum Commands {
         /// be resumed later. Without it a task leaves nothing behind.
         #[arg(long)]
         session: bool,
-
-        /// Run the task inside an existing session, appending to it. Takes a
-        /// session id or any unique prefix of one.
-        #[arg(long, value_name = "ID", conflicts_with = "session")]
-        resume: Option<String>,
     },
 
     /// Manage saved chat sessions
@@ -474,7 +469,6 @@ async fn main() -> Result<()> {
             temperature,
             effort_level,
             session,
-            resume,
         }) => {
             cmd_agent(
                 &task,
@@ -484,7 +478,6 @@ async fn main() -> Result<()> {
                 temperature,
                 effort_level,
                 session,
-                resume,
             )
             .await?
         }
@@ -1717,14 +1710,13 @@ async fn cmd_session(
     Ok(())
 }
 
-/// Opens the session a `--session`/`--resume` agent run writes to, or
-/// `None` for the default one-shot that leaves nothing behind.
+/// Opens the session a `--session` agent run writes to, or `None` for the
+/// default one-shot that leaves nothing behind.
 ///
-/// Split from [`cmd_agent`] because the two branches share almost nothing:
-/// a new session snapshots the config-plus-flags defaults the same way
-/// `clank session` does, while a resumed one takes every setting off the
-/// stored row and ignores the flags entirely — the same rule the interactive
-/// resume follows, so a session behaves the same however it's reopened.
+/// Split from [`cmd_agent`] because it does a job of its own: snapshotting
+/// the config-plus-flags defaults onto a new row the same way `clank
+/// session` does, and taking the claim before anything else touches the
+/// session.
 fn open_agent_session(
     config: &config::Config,
     model: Option<String>,
@@ -1732,82 +1724,12 @@ fn open_agent_session(
     temperature: Option<f32>,
     effort_level: Option<String>,
     session: bool,
-    resume: Option<String>,
 ) -> Result<Option<(ChatSession, terminal_ui::ActivityWriter)>> {
-    if !session && resume.is_none() {
+    if !session {
         return Ok(None);
     }
 
     let conn = store::open_db()?;
-
-    if let Some(id_or_prefix) = resume {
-        let summary = resolve_resume_target(&conn, &id_or_prefix)?;
-
-        // Claimed before the history is read, not after: the claim is one
-        // conditional write, so nothing can slip between deciding the
-        // session is free and taking it. Two processes appending to one
-        // history write colliding `seq` values, and the result reloads as a
-        // conversation with its turns shuffled and its tool results detached
-        // from the calls they answer — unrepairable, and silent.
-        let Some(activity) = terminal_ui::ActivityWriter::claim(summary.id.clone())? else {
-            anyhow::bail!(
-                "Session {} is already being run by another process.\n\n\
-                 Wait for it to finish, or start a separate run with \
-                 `--session` instead of appending to this one. A claim left \
-                 behind by a process that died expires within half a minute.",
-                summary.id
-            );
-        };
-        for (flag, given) in [
-            ("--model", model.is_some()),
-            ("--max-iterations", max_iterations.is_some()),
-            ("--temperature", temperature.is_some()),
-            ("--effort-level", effort_level.is_some()),
-        ] {
-            if given {
-                println!(
-                    "{} Ignoring {flag}: resumed sessions keep their saved settings",
-                    "note:".bright_black()
-                );
-            }
-        }
-
-        let (mut session, _history) = ChatSession::resume(conn, &summary, summary.model.clone())?;
-
-        // The session's directory is its sandbox boundary and what its
-        // relative paths mean. `clank session` offers `--here` to repoint it;
-        // there's no such escape hatch here, because the run that would use
-        // it is the one nobody is watching — so a moved directory is an
-        // error rather than a silent rebind to wherever this was launched.
-        match session::enter_working_dir(&session)? {
-            session::EnteredDir::Moved(dir) => {
-                println!("{} Working directory: {}", "↳".blue(), dir);
-            }
-            session::EnteredDir::Unchanged => {}
-            session::EnteredDir::Missing(dir) => {
-                anyhow::bail!(
-                    "Session {} was started in {dir}, which no longer exists.\n\n\
-                     Its sandbox and relative paths are anchored there, so running \
-                     here would quietly rebind both to the current directory. Resume \
-                     it with `clank session --resume {} --here` to repoint it first.",
-                    summary.id,
-                    summary.id,
-                );
-            }
-        }
-
-        // Running a task in it makes it an agent session, so reopening it in
-        // the TUI or `clank session` comes back with tools already on rather
-        // than needing `/agent` again.
-        session.set_agentic(true)?;
-        println!(
-            "{} Resuming session {} ({})\n",
-            "✓".green(),
-            session.short_id(),
-            session.title()
-        );
-        return Ok(Some((session, activity)));
-    }
 
     let session = ChatSession::create(
         conn,
@@ -1851,7 +1773,6 @@ async fn cmd_agent(
     temperature: Option<f32>,
     effort_level: Option<String>,
     session: bool,
-    resume: Option<String>,
 ) -> Result<()> {
     let config = load_config()?;
 
@@ -1862,7 +1783,6 @@ async fn cmd_agent(
         temperature,
         effort_level.clone(),
         session,
-        resume,
     )?;
 
     // A session's own settings are the ones it runs with; the flag-plus-config

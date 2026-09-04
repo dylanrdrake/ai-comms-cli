@@ -98,6 +98,20 @@ NEXT:
   accepts the message — collides with `absorb`, which reconciles by skipping
   the messages the session already has and taking the rest from the task's
   copy; pushing in both places double-counts. Needs thought, not a patch.
+* `clank agent --resume` removed for now; `--session` stays. The
+  implementation is in 771f556~1 if it comes back. Two things to carry over
+  with it rather than reintroduce:
+  - The "Ignoring --model: resumed sessions keep their saved settings" notes
+    printed *before* the working-directory check that can abort the run, so
+    a resume whose directory had been deleted told you about a flag on a run
+    that never happened. Print them after the checks.
+  - It could not do the interactive pick that `clank session --resume` can:
+    `resolve_resume_target` handles the "pick" sentinel for both, but agent's
+    flag was declared without `num_args = 0..=1`, so bare `--resume` was a
+    clap error and the picker branch was unreachable.
+  Also worth deciding when it returns: it called `set_agentic(true)` before
+  running anything, so resuming an ask-kind session converted it permanently
+  even if the run failed immediately.
 * two terminals on one session: the guard landed in b9c2499, the useful half
   of it hasn't. A session is claimed by one process at a time — an atomic
   conditional UPDATE, scoped to an owner token so a revived zombie can
