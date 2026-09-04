@@ -1310,6 +1310,9 @@ fn apply_submission(
         // launch screen to go back to.
         | ui::Submission::AllowTool
         | ui::Submission::DenyTool
+        // A cursor moving through a list of 400 names, which a blocking
+        // prompt has nowhere to draw. `clank models` lists them here.
+        | ui::Submission::BrowseModels
         | ui::Submission::Back => {
             println!(
                 "{} that's a TUI command (`clank tui`), not available here",

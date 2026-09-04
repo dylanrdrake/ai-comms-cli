@@ -109,8 +109,58 @@ pub enum ShellState {
     },
 }
 
+/// The `/models` browser, while it is open.
+///
+/// Its own text buffer rather than the input box's: `/models` was submitted
+/// to get here, so the draft is already gone, and keeping the filter
+/// separate means closing the browser cannot eat anything you were writing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelBrowser {
+    /// The fetch is in flight. Shown rather than delayed, so the box appears
+    /// the moment you ask for it.
+    Loading,
+    Ready {
+        /// Every model the endpoint offers, in the order it returned them.
+        all: Vec<String>,
+        /// What has been typed to narrow them.
+        filter: String,
+        /// Which of the *matching* models the cursor is on.
+        selected: usize,
+    },
+    Failed(String),
+}
+
+impl ModelBrowser {
+    /// The models the filter admits, in order. Case-insensitive substring:
+    /// model names are long and hyphenated, and nobody wants to get the
+    /// case of `Claude` right to find it.
+    pub fn matches(&self) -> Vec<&str> {
+        match self {
+            ModelBrowser::Ready { all, filter, .. } => {
+                let needle = filter.to_lowercase();
+                all.iter()
+                    .filter(|name| name.to_lowercase().contains(&needle))
+                    .map(String::as_str)
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The model the cursor is on, if any.
+    pub fn highlighted(&self) -> Option<String> {
+        let ModelBrowser::Ready { selected, .. } = self else {
+            return None;
+        };
+        self.matches().get(*selected).map(|name| name.to_string())
+    }
+}
+
 pub struct App {
     pub transcript: Vec<TranscriptItem>,
+    /// Open while `/models` is being browsed. Takes the keyboard while it
+    /// is: it is a cursor in a list, and there is nothing else to type.
+    pub model_browser: Option<ModelBrowser>,
     pub input: String,
     /// Byte index of the cursor within `input`. Kept on a char boundary.
     pub cursor: usize,
@@ -186,6 +236,7 @@ impl App {
     pub fn new(model: String, effort_level: Option<String>, session_id: String) -> Self {
         App {
             transcript: Vec::new(),
+            model_browser: None,
             input: String::new(),
             cursor: 0,
             busy: false,
@@ -224,6 +275,22 @@ impl App {
     /// Folds one worker event into the view.
     pub fn apply(&mut self, event: Event) {
         match event {
+            // Dropped if the browser was closed while the fetch was in
+            // flight: the answer to a question nobody is asking any more.
+            Event::ModelsListed(all) => {
+                if matches!(self.model_browser, Some(ModelBrowser::Loading)) {
+                    self.model_browser = Some(ModelBrowser::Ready {
+                        all,
+                        filter: String::new(),
+                        selected: 0,
+                    });
+                }
+            }
+            Event::ModelsUnavailable(why) => {
+                if matches!(self.model_browser, Some(ModelBrowser::Loading)) {
+                    self.model_browser = Some(ModelBrowser::Failed(why));
+                }
+            }
             Event::UserMessage(text) => {
                 // A message that was waiting has started its own turn. Does
                 // nothing for one sent while idle, which never waited.
@@ -584,6 +651,44 @@ impl App {
 
     // --- input editing ---------------------------------------------------
 
+    /// Narrows the list, and puts the cursor back at the top of what is
+    /// left — the old position meant nothing once the list changed under it.
+    pub fn browser_filter_push(&mut self, c: char) {
+        if let Some(ModelBrowser::Ready {
+            filter, selected, ..
+        }) = &mut self.model_browser
+        {
+            filter.push(c);
+            *selected = 0;
+        }
+    }
+
+    pub fn browser_filter_pop(&mut self) {
+        if let Some(ModelBrowser::Ready {
+            filter, selected, ..
+        }) = &mut self.model_browser
+        {
+            filter.pop();
+            *selected = 0;
+        }
+    }
+
+    /// Moves the cursor by one, stopping at either end rather than wrapping:
+    /// a list this long is easier to keep your place in when the ends hold.
+    pub fn browser_move(&mut self, down: bool) {
+        let last = self.model_browser.as_ref().map(|b| b.matches().len());
+        let Some(last) = last.map(|n| n.saturating_sub(1)) else {
+            return;
+        };
+        if let Some(ModelBrowser::Ready { selected, .. }) = &mut self.model_browser {
+            *selected = if down {
+                (*selected + 1).min(last)
+            } else {
+                selected.saturating_sub(1)
+            };
+        }
+    }
+
     pub fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
@@ -689,6 +794,111 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+
+    fn browser(filter: &str, selected: usize) -> ModelBrowser {
+        ModelBrowser::Ready {
+            all: [
+                "anthropic/claude-opus-4.5",
+                "anthropic/claude-sonnet-4.5",
+                "google/gemini-3.8-flash",
+                "openai/gpt-5",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            filter: filter.to_string(),
+            selected,
+        }
+    }
+
+    #[test]
+    fn the_filter_matches_anywhere_in_the_name_and_ignores_case() {
+        // Model names are long and hyphenated and the interesting part is
+        // usually in the middle, so a prefix match would be useless.
+        assert_eq!(browser("CLAUDE", 0).matches().len(), 2);
+        assert_eq!(browser("gpt", 0).matches(), vec!["openai/gpt-5"]);
+        assert_eq!(browser("", 0).matches().len(), 4);
+        assert!(browser("nothing-like-this", 0).matches().is_empty());
+    }
+
+    #[test]
+    fn typing_narrows_the_list_and_sends_the_cursor_back_to_the_top() {
+        // The old position meant something about a list that no longer
+        // exists; keeping it would leave the cursor on an unrelated row.
+        let mut app = App::new("m".into(), None, "abcd1234".into());
+        app.model_browser = Some(browser("", 3));
+        app.browser_filter_push('c');
+        let Some(ModelBrowser::Ready {
+            filter, selected, ..
+        }) = &app.model_browser
+        else {
+            panic!("browser closed")
+        };
+        assert_eq!(filter, "c");
+        assert_eq!(*selected, 0);
+    }
+
+    #[test]
+    fn the_cursor_stops_at_both_ends_rather_than_wrapping() {
+        let mut app = App::new("m".into(), None, "abcd1234".into());
+        app.model_browser = Some(browser("", 0));
+
+        app.browser_move(false);
+        assert_eq!(
+            app.model_browser.as_ref().unwrap().highlighted().unwrap(),
+            "anthropic/claude-opus-4.5"
+        );
+
+        for _ in 0..10 {
+            app.browser_move(true);
+        }
+        assert_eq!(
+            app.model_browser.as_ref().unwrap().highlighted().unwrap(),
+            "openai/gpt-5",
+            "it should rest on the last match, not wrap or run off"
+        );
+    }
+
+    #[test]
+    fn the_cursor_stays_in_range_when_the_filter_shrinks_the_list() {
+        // Selected 3 of 4, then filtered to 2. Nothing should be able to
+        // read past the end of what is showing.
+        let mut app = App::new("m".into(), None, "abcd1234".into());
+        app.model_browser = Some(browser("", 3));
+        for c in "claude".chars() {
+            app.browser_filter_push(c);
+        }
+        let browser = app.model_browser.as_ref().unwrap();
+        assert_eq!(browser.matches().len(), 2);
+        assert!(browser.highlighted().is_some());
+    }
+
+    #[test]
+    fn the_list_only_lands_in_a_browser_that_is_still_open() {
+        // Closed while the fetch was in flight: the answer is to a question
+        // nobody is asking any more, and must not reopen the box.
+        let mut app = App::new("m".into(), None, "abcd1234".into());
+        app.apply(Event::ModelsListed(vec!["a".to_string()]));
+        assert!(app.model_browser.is_none());
+
+        app.model_browser = Some(ModelBrowser::Loading);
+        app.apply(Event::ModelsListed(vec!["a".to_string()]));
+        assert!(matches!(
+            app.model_browser,
+            Some(ModelBrowser::Ready { .. })
+        ));
+    }
+
+    #[test]
+    fn a_failed_fetch_says_why_rather_than_showing_an_empty_list() {
+        let mut app = App::new("m".into(), None, "abcd1234".into());
+        app.model_browser = Some(ModelBrowser::Loading);
+        app.apply(Event::ModelsUnavailable("401 Unauthorized".to_string()));
+        let Some(ModelBrowser::Failed(why)) = &app.model_browser else {
+            panic!("expected a failure")
+        };
+        assert!(why.contains("401"));
+    }
 
     #[test]
     fn the_app_holds_the_full_id_so_its_mark_matches_the_picker() {

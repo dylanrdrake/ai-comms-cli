@@ -42,6 +42,10 @@ pub enum Command {
     Approve(bool),
     /// Abort the in-flight turn and drop anything queued behind it.
     Cancel,
+    /// Fetch the endpoint's model list, for the browser. Spawned rather than
+    /// awaited in place: it is a network round trip, and the worker has to
+    /// stay responsive — including to `Cancel` — while it happens.
+    ListModels,
     /// Switch the model for subsequent turns. A turn already running keeps
     /// the model it started with.
     SetModel(String),
@@ -102,6 +106,10 @@ pub enum Event {
     Agent(AgentEvent),
     /// A tool needs a decision; reply with [`Command::Approve`].
     ApprovalRequested(ApprovalRequest),
+    /// The endpoint's models, for the browser opened by `/models`.
+    ModelsListed(Vec<String>),
+    /// The fetch behind `/models` failed, with why.
+    ModelsUnavailable(String),
     /// A turn began or ended. Front ends use this to show busy state and to
     /// decide whether a new message sends immediately or queues.
     Busy(bool),
@@ -219,6 +227,7 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         }
         Submission::ResetMaxIterations => Some(Command::ResetMaxIterations),
         Submission::Shell(command) => Some(Command::Shell(command.clone())),
+        Submission::BrowseModels => Some(Command::ListModels),
         Submission::SetTemperature(temperature) => Some(Command::SetTemperature(*temperature)),
         Submission::ResetTemperature => Some(Command::ResetTemperature),
         Submission::SetApproval { category, enabled } => Some(Command::SetApproval {
@@ -413,6 +422,7 @@ impl Worker {
                     }
                 }
                 Command::Shell(command) => self.run_shell(command),
+                Command::ListModels => self.list_models(),
                 Command::Include(text) => self.include(text),
                 Command::SetModel(model) => self.set_model(model),
                 Command::SetAgentic(agentic) => self.set_agentic(agentic),
@@ -599,6 +609,10 @@ impl Worker {
                         }
                         // These apply from the next turn on; the running
                         // one already captured its model/mode/effort.
+                        // Answerable mid-turn: it reads nothing the turn is
+                        // using, and browsing models while a reply streams
+                        // is a reasonable thing to want.
+                        Some(Command::ListModels) => self.list_models(),
                         Some(Command::SetModel(model)) => self.set_model(model),
                         Some(Command::SetAgentic(agentic)) => self.set_agentic(agentic),
                         Some(Command::SetEffort(effort_level)) => self.set_effort(effort_level),
@@ -676,6 +690,20 @@ impl Worker {
     /// Spawned rather than awaited: the worker is in a `select!` loop, and
     /// blocking it for the length of a command would stall everything else
     /// the user can do — cancelling a turn included.
+    /// Fetches the endpoint's model list on its own task, reporting the
+    /// outcome as an event. Both arms are reported: a browser that opened on
+    /// a failed fetch has to say why rather than sit empty.
+    fn list_models(&mut self) {
+        let client = Arc::clone(&self.client);
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let _ = events.send(match client.list_models().await {
+                Ok(models) => Event::ModelsListed(models),
+                Err(e) => Event::ModelsUnavailable(e.to_string()),
+            });
+        });
+    }
+
     fn run_shell(&mut self, command: String) {
         let _ = self.events.send(Event::ShellStarted {
             command: command.clone(),

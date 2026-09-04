@@ -785,6 +785,30 @@ fn settle_shell(app: &mut App, conversation: &Conversation, sent: bool) {
 /// Handles a keypress in the conversation. Returns whether to leave it and
 /// go back to the launch screen.
 fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) -> bool {
+    // The browser holds the keyboard while it is open. Unlike an approval —
+    // which arrives unbidden, and so was deliberately kept out of the input
+    // box — this is something you asked for a keystroke ago, and there is
+    // nothing else to be typing at it.
+    if app.model_browser.is_some() {
+        match key.code {
+            KeyCode::Esc => app.model_browser = None,
+            KeyCode::Up => app.browser_move(false),
+            KeyCode::Down => app.browser_move(true),
+            KeyCode::Backspace => app.browser_filter_pop(),
+            KeyCode::Enter => {
+                if let Some(model) = app.model_browser.as_ref().and_then(|b| b.highlighted()) {
+                    conversation.send(Command::SetModel(model));
+                }
+                app.model_browser = None;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.browser_filter_push(c)
+            }
+            _ => {}
+        }
+        return false;
+    }
+
     // Ctrl-B backs out to the launch screen; plain Esc stays reserved for
     // cancelling a turn, which is needed far more often.
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('b')) {
@@ -882,6 +906,13 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                             app::Submission::ShowHelp => {
                                 app.transcript
                                     .push(TranscriptItem::Help(crate::ui::help_rows()));
+                            }
+                            app::Submission::BrowseModels => {
+                                // Opened straight away rather than when the
+                                // list lands, so asking for it does
+                                // something visible immediately. The worker
+                                // is already fetching; the box says so.
+                                app.model_browser = Some(app::ModelBrowser::Loading);
                             }
                             app::Submission::ShowEffort => {
                                 app.transcript.push(TranscriptItem::Notice(

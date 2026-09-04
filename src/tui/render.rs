@@ -1,6 +1,6 @@
 //! Drawing the TUI. Pure presentation over [`App`] — no state changes here.
 
-use super::app::{App, ShellState, ToolStatus, TranscriptItem};
+use super::app::{App, ModelBrowser, ShellState, ToolStatus, TranscriptItem};
 use crate::ui::{json_fields, summarize, tool_call_fields, ApprovalRequest};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -116,6 +116,10 @@ pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usi
         Some(shell) => shell_height(shell, frame.area().width),
         None => 0,
     };
+    let browser_rows = match &app.model_browser {
+        Some(browser) => browser_height(browser),
+        None => 0,
+    };
 
     let input_rows = content_rows
         .clamp(1, MAX_INPUT_ROWS)
@@ -127,7 +131,7 @@ pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usi
             frame
                 .area()
                 .height
-                .saturating_sub(7 + pending_rows + approval_rows + shell_rows)
+                .saturating_sub(7 + pending_rows + approval_rows + shell_rows + browser_rows)
                 .max(1),
         );
 
@@ -137,6 +141,7 @@ pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usi
         Constraint::Min(1),                 // chat history
         Constraint::Length(approval_rows),  // a tool waiting on a decision
         Constraint::Length(shell_rows),     // a $ command, running or waiting
+        Constraint::Length(browser_rows),   // the /models browser, if open
         Constraint::Length(pending_rows),   // messages waiting, if any
         Constraint::Length(input_rows + 2), // message prompt, bordered, plus its borders
         Constraint::Length(1),              // settings: ask/agent, model, effort, temp, verbose
@@ -153,12 +158,15 @@ pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usi
     if let Some(shell) = &app.pending_shell {
         draw_shell(frame, areas[4], shell, tick);
     }
-    if pending_rows > 0 {
-        draw_pending(frame, areas[5], app);
+    if let Some(browser) = &app.model_browser {
+        draw_model_browser(frame, areas[5], browser, &app.model, tick);
     }
-    draw_input(frame, areas[6], app, scrolled);
-    draw_settings(frame, areas[7], app, tick);
-    draw_keybindings(frame, areas[8], app);
+    if pending_rows > 0 {
+        draw_pending(frame, areas[6], app);
+    }
+    draw_input(frame, areas[7], app, scrolled);
+    draw_settings(frame, areas[8], app, tick);
+    draw_keybindings(frame, areas[9], app);
 }
 
 /// The blank row between the transcript and the approval box, matching the
@@ -592,6 +600,109 @@ fn item_key(item: &TranscriptItem, app: &App, area_width: u16, content_width: us
     hasher.finish()
 }
 
+/// Rows the `/models` box needs: its borders, a hint line, and up to
+/// [`MAX_BROWSER_ROWS`] models.
+///
+/// Sized to its contents like every other box above the prompt, so a filter
+/// that narrows to two models does not leave eight blank rows behind.
+fn browser_height(browser: &ModelBrowser) -> u16 {
+    let rows = match browser {
+        ModelBrowser::Ready { .. } => (browser.matches().len() as u16).clamp(1, MAX_BROWSER_ROWS),
+        // "Fetching…" or the reason it failed.
+        _ => 1,
+    };
+    rows + 3
+}
+
+/// Most models shown at once. Past this the list scrolls under the cursor —
+/// an endpoint can offer four hundred, and the box is sharing the screen
+/// with the conversation it was opened from.
+const MAX_BROWSER_ROWS: u16 = 8;
+
+fn draw_model_browser(
+    frame: &mut Frame,
+    area: Rect,
+    browser: &ModelBrowser,
+    current: &str,
+    tick: usize,
+) {
+    let matches = browser.matches();
+    let (title, hint) = match browser {
+        ModelBrowser::Loading => (" models ".to_string(), String::new()),
+        ModelBrowser::Failed(_) => (" models ".to_string(), String::new()),
+        ModelBrowser::Ready { all, .. } => (
+            format!(" models  {} of {} ", matches.len(), all.len()),
+            " ↑↓ move · Enter set · Esc cancel ".to_string(),
+        ),
+    };
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().dark_gray())
+        .title(Span::styled(title, Style::new().cyan()));
+    if !hint.is_empty() {
+        block = block
+            .title_bottom(Span::styled(hint, Style::new().dark_gray()).into_right_aligned_line());
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines: Vec<Line> = match browser {
+        ModelBrowser::Loading => vec![Line::from(Span::styled(
+            format!("{} Fetching models…", FRAMES[tick % FRAMES.len()]),
+            Style::new().yellow(),
+        ))],
+        ModelBrowser::Failed(why) => vec![Line::from(Span::styled(
+            format!("✗ {why}"),
+            Style::new().red(),
+        ))],
+        ModelBrowser::Ready { selected, .. } if matches.is_empty() => {
+            let _ = selected;
+            vec![Line::from(Span::styled(
+                "nothing matches",
+                Style::new().dark_gray().italic(),
+            ))]
+        }
+        ModelBrowser::Ready { selected, .. } => {
+            // Windowed on the cursor the same way the launch screen's list
+            // is, so the selection is always on screen without the box
+            // growing to fit four hundred rows.
+            let visible = inner.height as usize;
+            let offset = selected
+                .saturating_sub(visible / 2)
+                .min(matches.len().saturating_sub(visible));
+            matches
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(visible)
+                .map(|(index, name)| {
+                    let picked = index == *selected;
+                    let mut spans = vec![
+                        Span::styled(if picked { "❯ " } else { "  " }, Style::new().cyan().bold()),
+                        Span::styled(
+                            (*name).to_string(),
+                            if picked {
+                                Style::new().bold()
+                            } else {
+                                Style::new()
+                            },
+                        ),
+                    ];
+                    // Marked rather than reordered: the one you are on now
+                    // is easier to find if the list does not shuffle.
+                    if *name == current {
+                        spans.push(Span::styled("  current", Style::new().dark_gray().italic()));
+                    }
+                    Line::from(spans)
+                })
+                .collect()
+        }
+    };
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
 /// A titled block of label/value rows, as `/status` and `/help` both show.
 ///
 /// The labels are padded to a common width so the values line up in a
@@ -881,6 +992,30 @@ fn render_item(
 /// top border, right-aligned — the same edge the transcript's own border
 /// used to show it on, back when it had one.
 fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
+    // While the browser is open the prompt is the filter. Nothing is lost by
+    // borrowing it: `/models` was submitted to get here, so the draft was
+    // already taken — which is exactly what is *not* true of an approval,
+    // and why that one has a box of its own instead.
+    if let Some(ModelBrowser::Ready { filter, .. }) = &app.model_browser {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::new().cyan());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("filter: ", Style::new().dark_gray()),
+                Span::raw(filter.clone()),
+            ])),
+            inner,
+        );
+        frame.set_cursor_position((
+            inner.x + "filter: ".len() as u16 + display_width(filter) as u16,
+            inner.y,
+        ));
+        return;
+    }
+
     let width = area.width.saturating_sub(2).max(1);
     let rows = input_lines(&app.input, width);
     let (cursor_row, cursor_col) = input_cursor(&app.input, app.cursor, width);

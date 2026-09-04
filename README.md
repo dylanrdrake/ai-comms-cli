@@ -325,6 +325,7 @@ exactly:
 | Command | Does |
 |---|---|
 | `/help` | List every in-session command and what it does. The same list in both front ends, generated from the one the parser uses, so it cannot drift from what actually works |
+| `/models` | Browse the models the endpoint offers and pick one. **TUI only** — it is a cursor moving through a list, which the line-based prompt has nowhere to draw. `clank models` lists them here instead |
 | `/model <name>` | Switch the model for the rest of the session, and remember it |
 | `/model` | Show the model currently in use |
 | `/agent` | Turn on tool-calling for the rest of the session |
@@ -533,6 +534,7 @@ the current one instead, repointing the session there — the same thing
 | Command | Does |
 |---|---|
 | `/help` | List every in-session command and what it does. The same list in both front ends, generated from the one the parser uses, so it cannot drift from what actually works |
+| `/models` | Browse the models the endpoint offers and pick one. Type to filter, arrows to move, Enter to set, Esc to cancel. The list is fetched when you ask for it, so it reflects what the endpoint has now |
 | `/model <name>` | Switch the model for the rest of the session, and remember it |
 | `/model` | Show the model currently in use |
 | `/agent` | Turn on tool-calling (read/write files, run commands) for the rest of the session |

@@ -156,6 +156,9 @@ pub enum Submission {
     ShowTemperature,
     /// Prints/shows the reasoning effort level without changing it.
     ShowEffort,
+    /// Opens the model browser. TUI only: it is a list you move a cursor
+    /// through, which the CLI's blocking prompt has nowhere to put.
+    BrowseModels,
     /// Streams replies token-by-token for this session, or waits for the
     /// whole reply. The configured default seeds it; this changes the
     /// session, like `/verbose` and `/sandbox`.
@@ -422,6 +425,12 @@ pub fn classify(text: &str) -> Submission {
             return Submission::SetHighlight(enabled);
         }
     }
+    if let Some(rest) = trimmed.strip_prefix("/models") {
+        if rest.trim().is_empty() {
+            return Submission::BrowseModels;
+        }
+    }
+
     if bare_command(trimmed, "/allow") {
         return Submission::AllowTool;
     }
@@ -668,12 +677,18 @@ struct Command {
     usage: Option<&'static str>,
 }
 
-const COMMANDS: [Command; 20] = [
+const COMMANDS: [Command; 21] = [
     Command {
         word: "help",
         syntax: "/help",
         blurb: "Show this list",
         usage: Some("/help"),
+    },
+    Command {
+        word: "models",
+        syntax: "/models",
+        blurb: "Browse and pick from the models the endpoint offers",
+        usage: Some("/models"),
     },
     Command {
         word: "model",
