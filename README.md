@@ -430,10 +430,11 @@ saved sessions, interchangeably resumable from either.
 
 It's not a subcommand — there are no flags. Run `clank` with nothing else on
 the command line, and it opens on a **launch screen**: start a new session,
-or pick up any saved one. Sessions are grouped by where they live — the ones
-started in your current directory first, then everything else — and each row
-shows its directory, since that's where it will resume and what its sandbox
-will be bounded to.
+or pick up any saved one. Every session is in one list, newest first, and
+each row shows the directory it will resume in — `.` for the one you are
+already in, a `~`-relative path for anything under home, and a full path for
+anything above it. That directory matters because it is where the session
+resumes and what its sandbox is bounded to.
 
 ```bash
 clank

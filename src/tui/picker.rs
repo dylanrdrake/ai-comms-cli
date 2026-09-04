@@ -63,11 +63,16 @@ impl SessionRow {
 }
 
 /// A row on the launch screen.
+///
+/// `NewSession` carries nothing and `Resume` carries a whole row, which
+/// clippy reads as a size imbalance worth boxing. It isn't: there is exactly
+/// one `NewSession` in the list and one `Resume` per session, so boxing
+/// would trade a single row's worth of unused space for an allocation and a
+/// pointer chase on every session there is.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchItem {
     NewSession,
-    /// A section label. Not selectable — the cursor steps over it.
-    Header(&'static str),
     Resume(SessionRow),
 }
 
@@ -167,10 +172,6 @@ fn state_badge(state: LastState, held: bool, tick: usize) -> (String, Style) {
     (format!("{glyph:<BADGE_WIDTH$}"), style)
 }
 
-/// The label whose rows share the directory the process is in, so they
-/// needn't each repeat it.
-const HERE_SECTION: &str = "In this directory";
-
 // Fixed columns, so the preview can be given whatever the line has left.
 const MARKER_WIDTH: usize = 2 + ICON_WIDTH + 1 + BADGE_WIDTH + 1; // marker, mark, badge, gaps
 const KIND_WIDTH: usize = 7;
@@ -205,10 +206,6 @@ pub struct Picker {
     /// Set while a repoint is awaiting y/n: the row, and the directory it
     /// was recorded in and can no longer be opened from.
     pub confirming_repoint: Option<(SessionRow, String)>,
-    /// Which session ids fall in each section, so a delete can regroup what
-    /// remains without re-reading the database.
-    here: Vec<String>,
-    elsewhere: Vec<String>,
     /// Why the last attempt to open a session failed, shown in place of the
     /// key hints. Opening can fail for reasons the user needs to act on —
     /// a session whose directory is gone, or one deleted from under the
@@ -217,29 +214,16 @@ pub struct Picker {
 }
 
 impl Picker {
-    /// Every session, grouped by whether it belongs to `cwd`.
+    /// Every session, newest first, in one list.
     ///
-    /// The split is the useful one: a session's directory is its sandbox
-    /// boundary, so the ones started here are the ones that will resume
-    /// without moving you anywhere. A session with no recorded directory
-    /// (written before that was tracked) sorts with the others, since it
-    /// can't be claimed by this one.
-    pub fn launch(all: Vec<SessionRow>, cwd: Option<&str>) -> Self {
-        let (here, elsewhere): (Vec<_>, Vec<_>) = all
-            .into_iter()
-            .partition(|row| cwd.is_some_and(|cwd| row.working_dir.as_deref() == Some(cwd)));
-
-        let here_ids: Vec<String> = here.iter().map(|row| row.id.clone()).collect();
-        let elsewhere_ids: Vec<String> = elsewhere.iter().map(|row| row.id.clone()).collect();
-
+    /// Not split by directory. The split put the sessions you were most
+    /// likely to want under a heading and the rest under another, which
+    /// reads well until you are looking for one and have to decide which
+    /// half it is in. The directory each session belongs to is a column on
+    /// its own row instead, where it can be read without being grouped by.
+    pub fn launch(all: Vec<SessionRow>, _cwd: Option<&str>) -> Self {
         let mut items = vec![LaunchItem::NewSession];
-        for (label, rows) in [(HERE_SECTION, here), ("Elsewhere", elsewhere)] {
-            if rows.is_empty() {
-                continue;
-            }
-            items.push(LaunchItem::Header(label));
-            items.extend(rows.into_iter().map(LaunchItem::Resume));
-        }
+        items.extend(all.into_iter().map(LaunchItem::Resume));
 
         Picker {
             items,
@@ -248,8 +232,6 @@ impl Picker {
             renaming: None,
             confirming_repoint: None,
             notice: None,
-            here: here_ids,
-            elsewhere: elsewhere_ids,
         }
     }
 
@@ -276,8 +258,6 @@ impl Picker {
         let selected = self.selected_session().map(|row| row.id.clone());
         let previous = self.selected;
         self.items = rebuilt.items;
-        self.here = rebuilt.here;
-        self.elsewhere = rebuilt.elsewhere;
 
         self.selected = selected
             .and_then(|id| {
@@ -302,9 +282,10 @@ impl Picker {
         })
     }
 
-    /// Whether a row can hold the cursor. Headers can't.
+    /// Whether a row can hold the cursor. Only an index past the end can't,
+    /// now that every row is a choice.
     fn selectable(&self, index: usize) -> bool {
-        !matches!(self.items.get(index), Some(LaunchItem::Header(_)) | None)
+        self.items.get(index).is_some()
     }
 
     pub fn move_up(&mut self) {
@@ -341,7 +322,6 @@ impl Picker {
         match self.items.get(self.selected)? {
             LaunchItem::NewSession => Some(Activation::NewSession),
             LaunchItem::Resume(row) => Some(Activation::Resume(row.clone())),
-            LaunchItem::Header(_) => None,
         }
     }
 
@@ -378,35 +358,6 @@ impl Picker {
     pub fn remove_session(&mut self, id: &str) {
         self.items
             .retain(|item| !matches!(item, LaunchItem::Resume(row) if row.id == id));
-        self.items
-            .retain(|item| !matches!(item, LaunchItem::Header(_)));
-
-        // Rebuilt rather than patched: the rows that are left already know
-        // which section they belong to, so regrouping them can't drift from
-        // what `launch` would have produced.
-        let rows: Vec<SessionRow> = self
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                LaunchItem::Resume(row) => Some(row.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut items = vec![LaunchItem::NewSession];
-        for (label, section) in [(HERE_SECTION, &self.here), ("Elsewhere", &self.elsewhere)] {
-            let section: Vec<SessionRow> = rows
-                .iter()
-                .filter(|row| section.contains(&row.id))
-                .cloned()
-                .collect();
-            if section.is_empty() {
-                continue;
-            }
-            items.push(LaunchItem::Header(label));
-            items.extend(section.into_iter().map(LaunchItem::Resume));
-        }
-        self.items = items;
-
         if self.selected >= self.items.len() {
             self.selected = self.items.len().saturating_sub(1);
         }
@@ -490,13 +441,9 @@ pub fn draw(
     .split(frame.area());
 
     let mut lines: Vec<Line> = Vec::new();
-    // Tracks which section the rows being drawn belong to. Under "In this
-    // directory" every row has the same path, so repeating it on each is
-    // noise — and it's the column that was squeezing the preview off the
-    // end of the line.
-    let mut in_current_dir = false;
-    // Whether this section has already named its directory on an earlier row.
-    let mut here_dir_shown = false;
+    // Set by a row that wants a blank line after it. Only "New session"
+    // does, to keep it off the top of the list proper.
+    let mut trailing_blank = false;
     // Which built line the cursor is on, which is what the list has to keep
     // on screen. Not the item index: headers push a blank line ahead of
     // themselves, so the two drift apart as sections go by.
@@ -515,22 +462,9 @@ pub fn draw(
         match item {
             LaunchItem::NewSession => {
                 spans.push(Span::styled("New session", base.green()));
-            }
-            LaunchItem::Header(label) => {
-                in_current_dir = *label == HERE_SECTION;
-                here_dir_shown = false;
-                // A blank line before every section label, which puts one
-                // under "New session" and one between the two groups —
-                // enough to read the screen as three lists rather than one
-                // long one.
-                lines.push(Line::raw(""));
-                // Replaces its own marker: a section label isn't a choice,
-                // so it shouldn't look like one the cursor skipped.
-                spans.clear();
-                spans.push(Span::styled(
-                    format!("  {label}"),
-                    Style::new().dark_gray().italic(),
-                ));
+                // Still set apart from the sessions below it, now that no
+                // heading does that: it is the one row that isn't one.
+                trailing_blank = true;
             }
             LaunchItem::Resume(row) => {
                 // Identity first, then state: what the session is, then what
@@ -551,16 +485,15 @@ pub fn draw(
                 ));
                 spans.push(Span::styled(column(&row.title, TITLE_WIDTH), base));
 
-                // Under "In this directory" every row shares one path, so it
-                // is spelled out on the first row and stood in for below.
-                // The column keeps its slot either way, so what follows it
-                // stays aligned down the whole section.
-                let dir = match (&row.working_dir, in_current_dir && here_dir_shown) {
-                    (_, true) => "…".to_string(),
-                    (Some(dir), false) => home_relative(dir),
-                    (None, false) => "dir not recorded".to_string(),
+                // Now that the list isn't grouped by directory, every row
+                // carries its own. `.` for the one you are in, which is the
+                // common case and the one worth making shortest; otherwise
+                // `~`-relative, or absolute for anything above home.
+                let dir = match &row.working_dir {
+                    Some(d) if Some(d.as_str()) == dir => ".".to_string(),
+                    Some(d) => home_relative(d),
+                    None => "dir not recorded".to_string(),
                 };
-                here_dir_shown |= in_current_dir;
                 spans.push(Span::styled(
                     column(&dir, DIR_WIDTH),
                     Style::new().dark_gray(),
@@ -599,6 +532,9 @@ pub fn draw(
             selected_line = lines.len();
         }
         lines.push(line);
+        if std::mem::take(&mut trailing_blank) {
+            lines.push(Line::raw(""));
+        }
     }
 
     if picker.items.is_empty() {
@@ -890,77 +826,6 @@ mod tests {
     }
 
     #[test]
-    fn sessions_are_grouped_by_whether_they_belong_here() {
-        let picker = picker_of(vec![
-            row_in("00000001", "chat", "here", Some(HERE)),
-            row_in("00000002", "chat", "away", Some("/somewhere/else")),
-            row_in("00000003", "chat", "unrecorded", None),
-        ]);
-
-        let shape: Vec<String> = picker
-            .items
-            .iter()
-            .map(|item| match item {
-                LaunchItem::NewSession => "new".to_string(),
-                LaunchItem::Header(label) => format!("[{label}]"),
-                LaunchItem::Resume(row) => row.title.clone(),
-            })
-            .collect();
-        assert_eq!(
-            shape,
-            vec![
-                "new",
-                "[In this directory]",
-                "here",
-                "[Elsewhere]",
-                "away",
-                // No recorded directory can't be claimed by this one.
-                "unrecorded",
-            ]
-        );
-    }
-
-    #[test]
-    fn with_no_current_directory_nothing_is_claimed_as_here() {
-        // `current_dir` can fail — a deleted cwd, a permissions problem — and
-        // the list still has to render. Claiming sessions as "here" on a
-        // directory we couldn't read would be worse than grouping them all
-        // as elsewhere.
-        let picker = Picker::launch(
-            vec![row_in(
-                "00000001",
-                "chat",
-                "somewhere",
-                Some("/work/project"),
-            )],
-            None,
-        );
-        let headers: Vec<&str> = picker
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                LaunchItem::Header(label) => Some(*label),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(headers, vec!["Elsewhere"]);
-    }
-
-    #[test]
-    fn a_section_with_nothing_in_it_gets_no_header() {
-        let picker = picker_of(vec![row_in("00000001", "chat", "away", Some("/elsewhere"))]);
-        let headers: Vec<&str> = picker
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                LaunchItem::Header(label) => Some(*label),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(headers, vec!["Elsewhere"]);
-    }
-
-    #[test]
     fn the_cursor_steps_over_headers() {
         let mut picker = picker_of(vec![
             row_in("00000001", "chat", "here", Some(HERE)),
@@ -1221,6 +1086,91 @@ mod tests {
     }
 
     #[test]
+    fn every_session_lands_in_one_list_whatever_its_directory() {
+        // The list used to be split into "In this directory" and
+        // "Elsewhere", which reads well right up until you are looking for a
+        // session and have to work out which half it is in.
+        let picker = picker_of(vec![
+            row_in("00000001", "chat", "here one", Some(HERE)),
+            row_in("00000002", "chat", "away", Some("/elsewhere")),
+            row_in("00000003", "chat", "here two", Some(HERE)),
+            row_in("00000004", "chat", "unrecorded", None),
+        ]);
+
+        let shape: Vec<String> = picker
+            .items
+            .iter()
+            .map(|item| match item {
+                LaunchItem::NewSession => "new".to_string(),
+                LaunchItem::Resume(row) => row.title.clone(),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec!["new", "here one", "away", "here two", "unrecorded"],
+            "the order rows arrived in should survive, ungrouped"
+        );
+    }
+
+    #[test]
+    fn the_directory_column_says_dot_for_the_one_you_are_in() {
+        let picker = picker_of(vec![
+            row_in("00000001", "chat", "here", Some(HERE)),
+            row_in("00000002", "chat", "away", Some("/elsewhere")),
+        ]);
+        let out = picker_to_string(&picker, 110, 12);
+
+        let row = |title: &str| {
+            out.lines()
+                .find(|l| l.contains(title))
+                .unwrap_or_else(|| panic!("{title} missing from:\n{out}"))
+        };
+        assert!(
+            row("here").contains(" . "),
+            "the current directory should read as `.`: {:?}",
+            row("here")
+        );
+        assert!(
+            row("away").contains("/elsewhere"),
+            "another directory should be spelled out: {:?}",
+            row("away")
+        );
+    }
+
+    #[test]
+    fn a_directory_under_home_is_shown_relative_to_it() {
+        let Some(home) = home::home_dir() else {
+            return;
+        };
+        let under = format!("{}/projects/thing", home.display());
+        let picker = picker_of(vec![row_in("00000001", "chat", "mine", Some(&under))]);
+        let out = picker_to_string(&picker, 110, 12);
+        let row = out.lines().find(|l| l.contains("mine")).unwrap();
+
+        assert!(row.contains("~/projects"), "{row:?}");
+        assert!(
+            !row.contains(&home.display().to_string()),
+            "home should be abbreviated, not spelled out: {row:?}"
+        );
+    }
+
+    #[test]
+    fn every_row_can_hold_the_cursor_now_that_none_are_labels() {
+        let mut picker = picker_of(vec![
+            row_in("00000001", "chat", "one", Some(HERE)),
+            row_in("00000002", "chat", "two", Some("/elsewhere")),
+        ]);
+        for _ in 0..picker.items.len() + 2 {
+            assert!(
+                picker.activate().is_some(),
+                "row {} is not selectable",
+                picker.selected
+            );
+            picker.move_down();
+        }
+    }
+
+    #[test]
     fn a_pending_approval_displaces_the_conversation_preview() {
         // What the session last said matters far less than what it is stuck
         // asking — that's the row someone watching this list has to act on.
@@ -1423,10 +1373,7 @@ mod tests {
         );
 
         assert!(picker.selected < picker.items.len());
-        assert!(
-            !matches!(picker.items[picker.selected], LaunchItem::Header(_)),
-            "never left resting on a label"
-        );
+        assert!(picker.activate().is_some(), "never left resting on a label");
     }
 
     #[test]
@@ -1591,41 +1538,8 @@ mod tests {
             .collect();
         assert_eq!(remaining.len(), 1);
         assert!(picker.selected < picker.items.len());
-        // Never left sitting on a label.
-        assert!(!matches!(
-            picker.items[picker.selected],
-            LaunchItem::Header(_)
-        ));
-    }
-
-    #[test]
-    fn deleting_the_last_row_of_a_section_takes_its_header_too() {
-        // A header with nothing under it reads as a section that failed to
-        // load, not one that's empty.
-        let mut picker = picker_of(vec![
-            row_in("00000001", "chat", "here", Some(HERE)),
-            row_in("00000002", "chat", "away", Some("/elsewhere")),
-        ]);
-        let away = picker
-            .items
-            .iter()
-            .find_map(|item| match item {
-                LaunchItem::Resume(row) if row.title == "away" => Some(row.id.clone()),
-                _ => None,
-            })
-            .unwrap();
-
-        picker.remove_session(&away);
-
-        let headers: Vec<&str> = picker
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                LaunchItem::Header(label) => Some(*label),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(headers, vec!["In this directory"]);
+        // And on a row that can actually be chosen.
+        assert!(picker.activate().is_some());
     }
 
     #[test]
