@@ -283,6 +283,12 @@ fn truncate_output(output: &str) -> String {
     format!("[earlier output truncated]\n{}", &output[start..])
 }
 
+/// How long [`Conversation::leave`] waits for a worker to finish before
+/// deciding it has a turn to run and leaving it to it. Long enough for the
+/// handful of writes a worker with nothing to do makes on its way out,
+/// short enough not to read as a frozen screen if it is wrong.
+const LEAVE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub struct Conversation {
     commands: mpsc::UnboundedSender<Command>,
     events: mpsc::UnboundedReceiver<Event>,
@@ -348,11 +354,53 @@ impl Conversation {
         self.events.recv().await
     }
 
+    /// Whatever has arrived and not been taken yet, without waiting.
+    ///
+    /// For a conversation nothing is drawing: its events still have to be
+    /// applied — a transcript with a hole in it is worse than a late one —
+    /// but there is no frame waiting on them, so they are swept up on a
+    /// timer rather than selected against.
+    pub fn try_next_event(&mut self) -> Option<Event> {
+        self.events.try_recv().ok()
+    }
+
     /// Stops the worker and waits for it to finish, so the session's final
     /// writes land before the process exits.
+    ///
+    /// A turn still in flight is *not* stopped by this — see
+    /// [`Self::detach`] — so send [`Command::Cancel`] first where the wait
+    /// has to be bounded, as quitting does.
     pub async fn shutdown(self) {
         drop(self.commands);
         let _ = self.task.await;
+    }
+
+    /// Leaves the conversation: waits for the worker to finish if it has
+    /// nothing to do, and leaves it running if it has.
+    ///
+    /// For backing out to the launch screen. An idle worker takes
+    /// microseconds — it clears the session's activity, discards the session
+    /// if it was never used, and exits — and waiting for that is what lets
+    /// the list be rebuilt from settled state. A worker mid-turn takes as
+    /// long as the turn does, which is not something to hold the screen for,
+    /// so the wait gives up and the turn carries on without anyone watching:
+    /// it absorbs and persists exactly as it would have, because its tool
+    /// calls have already touched the disk and abandoning it would leave a
+    /// session whose history disagrees with what was done.
+    ///
+    /// The giving up *is* the detaching: dropping the wait drops the task
+    /// handle, and a dropped `JoinHandle` detaches its task rather than
+    /// stopping it. Deciding it here rather than from a "busy" flag the
+    /// front end keeps is what makes it safe — that flag lags the worker by
+    /// an event, and reading it a moment early would hold the whole screen
+    /// for the length of a turn.
+    ///
+    /// Only outlives the screen, not the process: the worker is a task, so
+    /// quitting still ends it wherever it has got to. The session it was
+    /// running stays claimed until it finishes, so it cannot be reopened
+    /// before then; the launch screen shows it working in the meantime.
+    pub async fn leave(self) {
+        let _ = tokio::time::timeout(LEAVE_GRACE, self.shutdown()).await;
     }
 }
 
@@ -417,7 +465,13 @@ impl Worker {
                                 let _ = self.events.send(Event::Cancelled);
                                 break;
                             }
-                            TurnOutcome::Disconnected => return,
+                            // The turn finished after the front end had
+                            // gone. Anything still queued was never sent to
+                            // the model and has nowhere to go now.
+                            TurnOutcome::Disconnected => {
+                                queue.clear();
+                                break;
+                            }
                         }
                     }
                 }
@@ -524,6 +578,10 @@ impl Worker {
         // Outlives the turn as an activity, so a session that broke can be
         // found from the list rather than only from its transcript.
         let mut failed = false;
+        // Set once the front end stops listening — you backed out to the
+        // launch screen, or the process is quitting. The turn carries on
+        // either way; what changes is that there is nobody left to ask.
+        let mut detached = false;
 
         let outcome = loop {
             tokio::select! {
@@ -551,22 +609,42 @@ impl Worker {
 
                 request = approval_rx.recv() => {
                     if let Some((request, responder)) = request {
-                        // Recorded with the request itself: a list of
-                        // sessions is far more useful saying *what* is being
-                        // asked than merely that something is.
-                        self.session.set_activity(
-                            Some(Activity::AwaitingApproval),
-                            Some(&crate::ui::approval_summary(&request)),
-                        );
-                        pending_approval = Some(responder);
+                        if detached {
+                            // Nobody is left to ask, and a gate that nothing
+                            // can answer is a gate that never opens: refuse
+                            // it, and let the turn end saying so. Waiting
+                            // instead would hold the session — and its claim
+                            // — until the process exits.
+                            let _ = responder.send(false);
+                        } else {
+                            // Recorded with the request itself: a list of
+                            // sessions is far more useful saying *what* is
+                            // being asked than merely that something is.
+                            self.session.set_activity(
+                                Some(Activity::AwaitingApproval),
+                                Some(&crate::ui::approval_summary(&request)),
+                            );
+                            pending_approval = Some(responder);
+                        }
                     }
                 }
 
-                command = commands.recv() => {
+                // Nothing more will arrive once the sender is gone, and a
+                // closed channel reports that instantly — left in the
+                // select, it would spin.
+                command = commands.recv(), if !detached => {
                     match command {
+                        // The front end has gone. The turn keeps running:
+                        // its tool calls have already touched the disk, and
+                        // a turn's messages are only written when it ends,
+                        // so stopping here would leave a session whose
+                        // history disagrees with what was actually done.
                         None => {
-                            turn.abort();
-                            break TurnOutcome::Disconnected;
+                            detached = true;
+                            if let Some(responder) = pending_approval.take() {
+                                self.session.set_activity(Some(Activity::Working), None);
+                                let _ = responder.send(false);
+                            }
                         }
                         Some(Command::Approve(allowed)) => {
                             if let Some(responder) = pending_approval.take() {
@@ -662,7 +740,13 @@ impl Worker {
         self.session
             .set_activity(failed.then_some(Activity::Failed), None);
         let _ = self.events.send(Event::Busy(false));
-        outcome
+        // A turn that ended with nobody watching ends the worker with it,
+        // however it ended: whatever else was queued was never sent to the
+        // model, and nothing can arrive to be sent now.
+        match outcome {
+            TurnOutcome::Completed if detached => TurnOutcome::Disconnected,
+            outcome => outcome,
+        }
     }
 
     /// Folds a finished turn's messages back into the session and persists

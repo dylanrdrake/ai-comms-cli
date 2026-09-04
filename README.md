@@ -471,7 +471,7 @@ seconds so one you're running in another terminal stays current:
 | | Meaning |
 |---|---|
 | spinner, yellow | Working — a request is in flight right now. The same animation and colour a conversation shows for itself |
-| `?` yellow | Waiting on an approval nobody has answered |
+| `?` yellow | Waiting on an approval nobody has answered. A session you are *inside* says the same thing in its settings row — `? waiting` in place of the working spinner, since a turn stopped at a gate is not moving |
 | `✗` red | The last turn ended in an error — worth resuming to see why |
 | `✓` green | The model answered; the turn ran to completion |
 | `⎚` grey | Held by another process — it can be seen but not opened. Only shown when nothing else already implies a live process: a working or waiting session says so with its own badge |
@@ -527,8 +527,35 @@ the current one instead, repointing the session there — the same thing
 | `PgUp` / `PgDn` / `End` | Scroll the transcript; `End` re-pins to the newest |
 | Mouse wheel | Also scrolls the transcript — `↑`/`↓` stay dedicated to prompt history |
 | `Ctrl-Shift-V` / `Shift-Insert` / middle-click | Paste, using your terminal's own paste binding. Multi-line pastes land in the input box as text rather than sending a message per line. `Ctrl-V` is **not** a paste key in most terminals — it never reaches your clipboard |
-| `Ctrl-B` | Back to the launch screen (the session is saved). `/back` does the same — tmux takes `Ctrl-B` as its own prefix |
-| `Ctrl-C` | Quit |
+| `Ctrl-B` | Back to the launch screen (the session is saved). A turn still running is **not** cancelled — it keeps working, shows as `working` in the list, and Enter on its row puts you back in it where it got to. Use `Esc` first if you meant to stop it. `/back` does the same — tmux takes `Ctrl-B` as its own prefix |
+| `Ctrl-C` | Quit. This ends a running turn: the work happens inside this process, so nothing survives it leaving |
+
+**Backing out of a running turn.** `Ctrl-B` leaves the screen, not the turn.
+The session keeps working — and keeps its place in `clank`, transcript and
+all — so the launch screen becomes a monitor for it: its row animates as
+`working` with the tool it is running on the line beneath, and `?` when it
+wants a decision from you. Press Enter on that row and you are back in the
+session exactly where it got to, mid-turn, with the approval box waiting and
+the input box live. Answer it, steer it, or back out again.
+
+That is why the turn is not cancelled on the way out: its tool calls have
+already touched your files, and a turn is only recorded once it ends, so
+stopping it halfway would leave a session whose history disagrees with what
+was done. Several sessions can be working at once this way — back out of one,
+start or resume another, and both keep going.
+
+Three things worth knowing:
+
+- **It is still claimed while it works.** Your `clank` is holding it, so
+  another terminal cannot open it, exactly as before. What changed is that
+  *this* `clank` can hand the screen back, because it never let go.
+- **A session that finishes while you are away is let go of** — its claim is
+  released, so it opens the ordinary way (and can be opened from anywhere)
+  once its row says `✓`.
+- **Quitting is not backing out.** All of this lives inside `clank`, so
+  `Ctrl-C` — and closing the terminal — ends every turn wherever it has got
+  to, and what they had done is lost from the record. Sessions that outlive
+  the process are a different feature and do not exist yet.
 
 **Commands.** Type these in the message box instead of a message:
 
@@ -758,7 +785,10 @@ turn, the same as any message.
 
 Running a second command before answering the first drops that output from the
 conversation, but it stays in the transcript marked `not sent` — nothing you
-were deciding about disappears without a trace. A second command *while* one is
+were deciding about disappears without a trace. Output the model never saw is
+also **dimmed**, the same grey an unset setting wears, so scrolling back you
+can see which results the conversation is actually working from without
+reading the label on every one. A second command *while* one is
 still running is refused: there is one box, and two results would land on top
 of each other.
 

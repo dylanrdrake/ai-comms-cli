@@ -2,6 +2,10 @@
 **TODOs**
 * connect providers directly, like Anthropic, OpenAI, etc..
 
+* create clankers (sessions behind the scenes), can give the clanker tools or not (ask/agent).
+* Spawn clanker instead of New session. Naming screen lets you randomly generate the session id and also the identicon until you see one you like.
+* tutorial option on picker screen
+
 * prompt caching
 * what else could be added to verbose mode?
 * Live raw request/response screen?

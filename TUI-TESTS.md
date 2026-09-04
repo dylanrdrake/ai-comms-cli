@@ -171,7 +171,64 @@ hello                 no row at all
   keyboard; the box is its filter).
 - The line-based `clank session` does none of this, by design.
 
-## 8. From the round before, worth a glance
+## 8. Backing out of a working session, and going back in
+
+New, and the part with no automated coverage — it needs a live model call,
+and there is no fake client to run a worker against, so this section is the
+test.
+
+Start an **agent** session (`/agent`) with a task that takes a while and
+writes something, then:
+
+1. `Ctrl-B` while it is working.
+2. The launch screen should show that session `working`, animating, with the
+   tool it is running on the line beneath.
+3. Watch it change on its own — the detail line should follow what it is
+   doing, without you touching anything.
+4. When it wants to write or run something, the badge should become `?` with
+   what it is asking about. It must **wait** there, not deny itself.
+5. Press Enter on that row. You should land back in the session — the whole
+   transcript, including everything it did while you were away — with the
+   approval box up and answerable (`Ctrl-Y` / `Ctrl-N`).
+6. Answer it. The turn should carry on from where it paused.
+7. Back out again mid-turn, let it finish this time. The row should go to
+   `✓ replied` on its own, and opening it then should work the ordinary way.
+
+Then the things that must not have broken:
+
+- **Two at once.** Back out of a working session, start a second one, set it
+  working, back out of that too. Both should show as working and both should
+  be resumable. A third, opened and left idle, should not disturb them.
+- **Another terminal still cannot touch them.** With a session parked here,
+  open `clank` in a second terminal: that session must be refused, saying it
+  is in use. This is the point — parking does not make a claimed session
+  shareable, it makes *this* clank able to hand its own screen back.
+- **Renaming a parked session** from the picker (`r`) should stick. Go back
+  into it afterwards and the header should show the new name, not the old.
+- **Deleting a parked session** (`d`) should be refused while it works, and
+  allowed once it has finished.
+- **Type at it after resuming.** Steering a resumed turn should work exactly
+  as it does in one you never left.
+- `Esc` mid-turn still cancels. `Ctrl-C` still quits promptly — it must not
+  hang waiting for parked sessions, and a tool subprocess (`sleep 60`) must
+  not be left behind. Check with `ps` after.
+- Back out of an *idle* session — instant, and an empty unnamed one is still
+  discarded rather than left in the list.
+
+## 9. Two smaller ones
+
+- **`? waiting` in the settings row.** In a session, get an approval to come
+  up (agent mode, ask it to write a file). The row above the key hints should
+  stop animating `working` and read `? waiting` for as long as the box is up,
+  then go back to `working` when you answer. The launch screen's badge for
+  the same session should agree.
+- **Discarded output is dimmed.** Run `$ ls`, press `Ctrl-D` to discard. The
+  output should stay in the transcript, dimmed to the same grey as a `default`
+  value in `/status`. Then run `$ ls` again and press `Ctrl-S` — that one
+  should stay at full brightness. Scroll back and forth: the two should be
+  distinguishable at a glance, without reading `sent` / `not sent`.
+
+## 10. From the round before, worth a glance
 
 - **Picker scrolls.** Accumulate more sessions than fit, or shrink the
   terminal. The list should follow the cursor, and the rule above it should

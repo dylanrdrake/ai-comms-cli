@@ -805,6 +805,7 @@ fn render_item(
                 text,
                 None,
                 content_width,
+                Style::new(),
             );
             // A band behind what you said, so your own messages are
             // findable while scrolling back through a long turn without
@@ -855,6 +856,16 @@ fn render_item(
                     output.trim_end(),
                     None,
                     content_width,
+                    // Output the model never saw is dimmed to the colour
+                    // every other "this is not in play" value wears, so
+                    // scrolling back you can tell at a glance which command
+                    // results the conversation is actually working from
+                    // without reading the label on each one.
+                    if *sent {
+                        Style::new()
+                    } else {
+                        Style::new().dark_gray()
+                    },
                 );
             }
             lines.push(Line::raw(""));
@@ -877,7 +888,14 @@ fn render_item(
                 // Mid-stream the text is usually mid-construct — an
                 // unclosed fence or a half-written list — so render it
                 // plainly and let the finished message reformat once.
-                push_block(&mut lines, prefix, text, cursor, content_width - 1);
+                push_block(
+                    &mut lines,
+                    prefix,
+                    text,
+                    cursor,
+                    content_width - 1,
+                    Style::new(),
+                );
             } else {
                 push_rendered(
                     &mut lines,
@@ -1323,7 +1341,14 @@ fn temperature_style(temperature: Option<f32>) -> Style {
 fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
     let mut spans = Vec::new();
 
-    if app.busy {
+    if app.pending_approval.is_some() {
+        // A turn stopped at a gate is still `busy`, and animating it as
+        // working says the opposite of what is true: nothing is moving, and
+        // the thing that would move it is you. Marked with the same `?` the
+        // launch screen puts on the row, so the two agree on what waiting
+        // looks like.
+        spans.push(Span::styled(" ? waiting ", Style::new().yellow().bold()));
+    } else if app.busy {
         spans.push(Span::styled(
             format!(" {} working ", busy_frame(tick)),
             Style::new().yellow(),
@@ -1701,11 +1726,12 @@ fn push_block(
     text: &str,
     trailing: Option<Span<'static>>,
     width: usize,
+    body: Style,
 ) {
     let segments: Vec<&str> = text.split('\n').collect();
     let last_segment = segments.len() - 1;
     for (seg_index, segment) in segments.into_iter().enumerate() {
-        let wrapped = wrap_styled(Line::from(Span::raw(segment.to_string())), width);
+        let wrapped = wrap_styled(Line::from(Span::styled(segment.to_string(), body)), width);
         let last_row = wrapped.len() - 1;
         for (row_index, mut row) in wrapped.into_iter().enumerate() {
             if seg_index == 0 && row_index == 0 {
@@ -2107,6 +2133,68 @@ mod tests {
                 vec![("/help".to_string(), true), (" me".to_string(), false)],
             ]
         );
+    }
+
+    /// The colour the text `needle` is drawn in, found by rendering and
+    /// looking at the cells it actually occupies.
+    fn colour_of(app: &App, width: u16, height: u16, needle: &str) -> Color {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, &mut TranscriptCache::default(), 0))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        for y in 0..buffer.area.height {
+            let cells: Vec<String> = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(x) = (0..cells.len()).find(|x| cells[*x..].concat().starts_with(needle)) {
+                return buffer[(x as u16, y)].fg;
+            }
+        }
+        panic!("{needle} was never drawn");
+    }
+
+    fn ran(sent: bool) -> TranscriptItem {
+        TranscriptItem::Shell {
+            command: "ls".to_string(),
+            output: "onlyinthisone".to_string(),
+            exit_code: 0,
+            sent,
+        }
+    }
+
+    #[test]
+    fn output_the_model_never_saw_is_dimmed() {
+        // The label already says "not sent", but reading a label per command
+        // is not how you scan a transcript. The colour is the difference you
+        // can see without stopping.
+        let mut app = sample_app();
+        app.transcript.push(ran(false));
+        assert_eq!(colour_of(&app, 74, 20, "onlyinthisone"), Color::DarkGray);
+
+        let mut app = sample_app();
+        app.transcript.push(ran(true));
+        assert_eq!(colour_of(&app, 74, 20, "onlyinthisone"), Color::Reset);
+    }
+
+    #[test]
+    fn a_turn_stopped_at_a_gate_says_it_is_waiting_not_working() {
+        // `busy` stays true through an approval — the turn has not ended, it
+        // is standing still. Animating it as working says the opposite.
+        let mut app = sample_app();
+        app.busy = true;
+        let out = render_to_string(&app, 74, 16);
+        assert!(out.contains(" working "), "{out}");
+        assert!(!out.contains("? waiting"), "{out}");
+
+        app.pending_approval = Some(ApprovalRequest {
+            tool_name: "write_file".into(),
+            category: "write",
+            arguments: "{}".into(),
+        });
+        let out = render_to_string(&app, 74, 16);
+        assert!(out.contains("? waiting"), "{out}");
+        assert!(!out.contains(" working "), "{out}");
     }
 
     /// The symbols on the first rendered row containing `needle` that are

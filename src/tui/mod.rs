@@ -8,9 +8,17 @@
 //! never calls the agent loop itself. A GUI would attach at the same place.
 //!
 //! Three screens: a launch list, a sessions browser, and the conversation
-//! itself. Only the conversation owns a worker, and it's shut down cleanly
-//! whenever you navigate away, so switching sessions can't leave a turn
-//! running against a screen nobody is looking at.
+//! itself. Only the conversation owns a worker. Navigating away from an idle
+//! one shuts it down and waits for its last writes; navigating away from one
+//! mid-turn *parks* it — the whole `Chat`, worker and transcript included,
+//! moves to the event loop's parked list and keeps running, since its tool
+//! calls have already touched the disk and a turn is only recorded once it
+//! ends. That is what makes the launch screen a monitor: parked sessions
+//! report `working` and `?` through the database like any running session,
+//! and opening one hands the same screen back rather than building a new
+//! one. They stay claimed while they run, so no other terminal can reach
+//! them. Quitting still ends everything: a worker is a task, and tasks go
+//! with the process.
 
 mod app;
 mod picker;
@@ -95,6 +103,15 @@ struct Chat {
     transcript_cache: render::TranscriptCache,
 }
 
+/// Sessions left working with nobody watching them, kept whole — worker,
+/// transcript, approval box and all — so reopening one picks the screen back
+/// up rather than building a new one from the database.
+///
+/// Only ever this process's own. A session another terminal claims is
+/// refused exactly as it always was: these are the ones *we* still hold, and
+/// holding them is what makes handing the screen back possible.
+type Parked = Vec<Box<Chat>>;
+
 /// Runs the TUI until the user quits. Always opens on the launch screen —
 /// there's no flag to skip straight into a new or resumed session, so this
 /// is the one and only way in.
@@ -106,6 +123,11 @@ pub async fn run(context: Context) -> Result<()> {
     // never leaves the user with a broken shell.
     let result = event_loop(&mut terminal, &context, &mut screen).await;
     if let Screen::Chat(chat) = screen {
+        // Cancelled rather than left to finish: the process is going, so a
+        // turn cannot outlive this wait however long it is given, and the
+        // abort is what reaps a tool subprocess still running. A no-op when
+        // nothing is in flight.
+        chat.conversation.send(Command::Cancel);
         chat.conversation.shutdown().await;
     }
     leave(&mut terminal)?;
@@ -259,12 +281,16 @@ fn start_chat(
     agentic: bool,
 ) -> Result<Chat> {
     let Some(claim) = crate::session::Heartbeat::claim(session.id().to_string())? else {
-        // One line, no paragraph breaks: this surfaces as the picker's
-        // notice, which is a single `Line`, and a `Line` renders `\n` as
-        // nothing at all rather than as a break — so a two-paragraph
-        // message arrives with its sentences run together.
+        // One line, no paragraph breaks, and short: this surfaces as the
+        // picker's notice, which is a single unwrapped `Line` — it renders
+        // `\n` as nothing at all rather than as a break, and anything past
+        // the terminal's width is clipped rather than folded, so the
+        // sentence that matters has to be the first one. The half-minute
+        // staleness window is in the README rather than here for that
+        // reason. Both causes are named because they read as different
+        // problems: someone else has it, or you left a turn running in it.
         anyhow::bail!(
-            "Session {} is open in another terminal — a stale claim clears within half a minute",
+            "Session {} is in use — another terminal, or a turn still finishing",
             &session.id()[..8]
         );
     };
@@ -463,7 +489,29 @@ fn draw(terminal: &mut Tui, screen: &mut Screen, tick: usize, selection: bool) -
     Ok(())
 }
 
+/// Drives the screens, and owns whatever they leave running.
+///
+/// The parked sessions are cleaned up here rather than by the caller so that
+/// every way out of the loop — quitting, or an error on the way to a frame —
+/// goes through the same shutdown.
 async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) -> Result<()> {
+    let mut parked = Parked::new();
+    let result = run_screens(terminal, context, screen, &mut parked).await;
+    // Cancelled rather than left to finish, for the reason the foreground
+    // conversation is: the process is going, and no task outlives it.
+    for chat in parked {
+        chat.conversation.send(Command::Cancel);
+        chat.conversation.shutdown().await;
+    }
+    result
+}
+
+async fn run_screens(
+    terminal: &mut Tui,
+    context: &Context,
+    screen: &mut Screen,
+    parked: &mut Parked,
+) -> Result<()> {
     let mut keys = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
     // A frame that overruns the tick must not queue up the ticks it missed:
@@ -492,7 +540,7 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
         let mut dirty = false;
         match wake {
             Wake::Key(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
-                quit = handle_key(context, screen, key).await?;
+                quit = handle_key(context, screen, parked, key).await?;
                 dirty = true;
             }
             Wake::Key(TermEvent::Paste(text)) => {
@@ -538,6 +586,31 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
                     tick = tick.wrapping_add(1);
                     dirty = true;
                 }
+                // Parked sessions carry on talking with nothing drawing
+                // them. Their events are applied anyway: an approval that
+                // arrives while you are elsewhere has to be waiting in the
+                // box when you come back, and a transcript missing the
+                // middle of a turn is worse than one that lagged.
+                for chat in parked.iter_mut() {
+                    while let Some(event) = chat.conversation.try_next_event() {
+                        chat.app.apply(event);
+                    }
+                }
+                // One that has finished has nothing left to watch, and its
+                // claim is only keeping it from being opened anywhere else.
+                let mut i = 0;
+                while i < parked.len() {
+                    // The approval check is belt and braces: an approval
+                    // pauses a turn without ending it, so `busy` covers it —
+                    // but letting go of a session that is waiting on an
+                    // answer would have the worker deny it on the way out,
+                    // which is the one outcome nobody asked for.
+                    if parked[i].app.busy || parked[i].app.pending_approval.is_some() {
+                        i += 1;
+                    } else {
+                        parked.remove(i).conversation.leave().await;
+                    }
+                }
                 // Sessions move on while the picker is open — including ones
                 // running in another terminal — so it re-reads rather than
                 // showing whatever was true when it was opened.
@@ -564,35 +637,54 @@ async fn event_loop(terminal: &mut Tui, context: &Context, screen: &mut Screen) 
 }
 
 /// Handles one keypress. Returns whether the TUI should exit.
-async fn handle_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> Result<bool> {
+async fn handle_key(
+    context: &Context,
+    screen: &mut Screen,
+    parked: &mut Parked,
+    key: KeyEvent,
+) -> Result<bool> {
     // Quit works from anywhere, including mid-turn.
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         return Ok(true);
     }
 
     match screen {
-        Screen::Launch(_) => handle_picker_key(context, screen, key).await,
+        Screen::Launch(_) => handle_picker_key(context, screen, parked, key).await,
         Screen::NameSession { .. } => handle_naming_key(context, screen, key),
         Screen::Chat(chat) => {
             if handle_chat_key(&mut chat.app, &chat.conversation, key) {
-                // Leaving the conversation: stop its worker before the
-                // screen is replaced, so its final writes land.
+                let busy = chat.app.busy;
                 let Screen::Chat(chat) =
                     std::mem::replace(screen, Screen::Launch(Box::new(launch_picker()?)))
                 else {
                     unreachable!("just matched Chat")
                 };
-                chat.conversation.shutdown().await;
-                // The list was loaded before the shutdown flushed this
-                // session, so refresh it to show the up-to-date title.
-                *screen = Screen::Launch(Box::new(launch_picker()?));
+                if busy {
+                    // Left working, and parked whole rather than let go of:
+                    // the worker keeps its claim, the approval it is about
+                    // to ask still has somewhere to be answered, and coming
+                    // back is this same screen rather than a fresh one.
+                    parked.push(chat);
+                } else {
+                    // Idle, so this is instant, and waiting is what lets an
+                    // unused session be discarded before the list is built.
+                    chat.conversation.leave().await;
+                    // The list was loaded before that flushed this session,
+                    // so refresh it to show the up-to-date title.
+                    *screen = Screen::Launch(Box::new(launch_picker()?));
+                }
             }
             Ok(false)
         }
     }
 }
 
-async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> Result<bool> {
+async fn handle_picker_key(
+    context: &Context,
+    screen: &mut Screen,
+    parked: &mut Parked,
+    key: KeyEvent,
+) -> Result<bool> {
     let Screen::Launch(p) = screen else {
         unreachable!("picker screen only")
     };
@@ -612,8 +704,20 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
             KeyCode::Esc => p.cancel_rename(),
             KeyCode::Enter => {
                 if let Some((id, title)) = p.confirm_rename() {
-                    let conn = store::open_db()?;
-                    store::set_session_title(&conn, &id, &title)?;
+                    // A parked session has a worker holding the same title
+                    // in memory, so it is told rather than written around —
+                    // otherwise the two disagree and the name you gave it is
+                    // the one that isn't on screen when you go back in.
+                    // Unlike deleting, there is nothing unsafe here to
+                    // refuse: renaming a running session is a fine thing to
+                    // want, it just has two places to land.
+                    match parked.iter().find(|chat| chat.app.session_id == id) {
+                        Some(chat) => chat.conversation.send(Command::SetTitle(title.clone())),
+                        None => {
+                            let conn = store::open_db()?;
+                            store::set_session_title(&conn, &id, &title)?;
+                        }
+                    }
                     p.apply_rename(&id, title);
                 }
             }
@@ -650,9 +754,20 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
             _ => p.resolve_delete(false),
         };
         if let Some(Activation::Delete(row)) = action {
-            let conn = store::open_db()?;
-            store::delete_session(&conn, &row.id)?;
-            p.remove_session(&row.id);
+            // Refused at the last moment rather than at the prompt, because
+            // this is where the row being deleted is known for certain. A
+            // worker is still writing turns into it; deleting the row from
+            // under one leaves it writing into nothing.
+            if parked.iter().any(|chat| chat.app.session_id == row.id) {
+                p.notice = Some(format!(
+                    "Session {} is still working — it can be deleted once it stops",
+                    &row.id[..8]
+                ));
+            } else {
+                let conn = store::open_db()?;
+                store::delete_session(&conn, &row.id)?;
+                p.remove_session(&row.id);
+            }
         }
         return Ok(false);
     }
@@ -675,22 +790,32 @@ async fn handle_picker_key(context: &Context, screen: &mut Screen, key: KeyEvent
                         input: String::new(),
                     }
                 }
-                Activation::Resume(row) => match open_row(context, &row) {
-                    Ok(chat) => *screen = Screen::Chat(Box::new(chat)),
-                    // Neither failure is fatal: a session that won't open is
-                    // one row in a list of them, and taking the whole TUI
-                    // down would lose access to every other session too.
-                    Err(OpenFailure::MissingDir(dir)) => {
-                        if let Screen::Launch(p) = screen {
-                            p.begin_repoint(row, dir);
-                        }
+                Activation::Resume(row) => {
+                    match parked.iter().position(|chat| chat.app.session_id == row.id) {
+                        // One we parked is already ours and already claimed,
+                        // so there is nothing to open: the screen is handed
+                        // straight back, mid-turn and mid-approval if that is
+                        // where it got to.
+                        Some(at) => *screen = Screen::Chat(parked.remove(at)),
+                        None => match open_row(context, &row) {
+                            Ok(chat) => *screen = Screen::Chat(Box::new(chat)),
+                            // Neither failure is fatal: a session that won't
+                            // open is one row in a list of them, and taking
+                            // the whole TUI down would lose access to every
+                            // other session too.
+                            Err(OpenFailure::MissingDir(dir)) => {
+                                if let Screen::Launch(p) = screen {
+                                    p.begin_repoint(row, dir);
+                                }
+                            }
+                            Err(OpenFailure::Other(e)) => {
+                                if let Screen::Launch(p) = screen {
+                                    p.notice = Some(e.to_string());
+                                }
+                            }
+                        },
                     }
-                    Err(OpenFailure::Other(e)) => {
-                        if let Screen::Launch(p) = screen {
-                            p.notice = Some(e.to_string());
-                        }
-                    }
-                },
+                }
                 // Delete and repoint are resolved by their confirmation
                 // flows, not here.
                 Activation::Delete(_) | Activation::Repoint(_) => {}
