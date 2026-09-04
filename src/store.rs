@@ -821,15 +821,60 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
 }
 
 /// Fetches a single session's summary by id (or id prefix, if unambiguous).
+/// Looks a session up by its full id or by a prefix of one.
+///
+/// A prefix that matches more than one session is an error rather than a
+/// coin toss. The same lookup backs `sessions delete`, so silently picking
+/// one of the candidates can destroy a conversation the user never named —
+/// and nothing about the old behaviour told them a choice had been made.
+///
+/// An exact id always wins, even when it is also a prefix of a longer one,
+/// so a session can never be made unreachable by the existence of another.
 pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<SessionSummary>> {
+    let mut stmt = conn.prepare("SELECT id FROM sessions WHERE id = ?1 OR id LIKE ?2 ORDER BY id")?;
+    let pattern = format!("{}%", id_or_prefix);
+    let ids: Vec<String> = stmt
+        .query_map(params![id_or_prefix, pattern], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+
+    let id = if ids.iter().any(|id| id == id_or_prefix) {
+        id_or_prefix.to_string()
+    } else {
+        match ids.len() {
+            0 => return Ok(None),
+            1 => ids.into_iter().next().expect("length checked"),
+            _ => {
+                // Listed with titles, because an id prefix is not something
+                // anyone recognises — the whole point of being ambiguous is
+                // that the user has to be able to tell them apart.
+                let mut lines = String::new();
+                for id in &ids {
+                    let title = load_summary(conn, id)?
+                        .map(|s| s.title)
+                        .unwrap_or_else(|| "?".to_string());
+                    lines.push_str(&format!("\n    {}  {}", &id[..8.min(id.len())], title));
+                }
+                anyhow::bail!(
+                    "'{id_or_prefix}' matches {} sessions:{lines}\n\nUse more of the id.",
+                    ids.len()
+                );
+            }
+        }
+    };
+
+    load_summary(conn, &id)
+}
+
+/// Reads one session's row by exact id.
+fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
+
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
          approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat \
-         FROM sessions WHERE id = ?1 OR id LIKE ?2",
+         FROM sessions WHERE id = ?1",
     )?;
 
-    let pattern = format!("{}%", id_or_prefix);
-    let mut rows = stmt.query(params![id_or_prefix, pattern])?;
+    let mut rows = stmt.query(params![id])?;
 
     if let Some(row) = rows.next()? {
         let title: String = row.get(1)?;
@@ -1535,6 +1580,73 @@ mod tests {
 
         let found = find_session(&conn, prefix).unwrap();
         assert_eq!(found.unwrap().id, id);
+    }
+
+/// Two sessions whose ids share `prefix`, titled so they can be told apart.
+    fn two_sharing_a_prefix(conn: &Connection) {
+        let made: Vec<String> = (0..2)
+            .map(|_| {
+                create_session(
+                    conn, "model-a", KIND_CHAT, None, Some(20), Some(0.7),
+                    &ApprovalSettings::default(), true, false, true, true, None,
+                )
+                .unwrap()
+            })
+            .collect();
+        for (old, (new, title)) in made
+            .iter()
+            .zip([("abcd1111zzzz", "FIRST"), ("abcd2222zzzz", "SECOND")])
+        {
+            conn.execute("UPDATE sessions SET id = ?1 WHERE id = ?2", params![new, old])
+                .unwrap();
+            conn.execute(
+                "UPDATE sessions SET title = ?1 WHERE id = ?2",
+                params![crypto::encrypt(title).unwrap(), new],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_prefix_is_refused_rather_than_guessed() {
+        // `sessions delete` resolves through here, so picking one of the
+        // candidates silently is how you lose the wrong conversation.
+        let conn = memory_db();
+        two_sharing_a_prefix(&conn);
+
+        let error = find_session(&conn, "abcd")
+            .expect_err("two matches is not a lookup")
+            .to_string();
+        assert!(error.contains("matches 2 sessions"), "{error}");
+        assert!(error.contains("FIRST") && error.contains("SECOND"), "{error}");
+    }
+
+    #[test]
+    fn a_prefix_that_narrows_to_one_still_resolves() {
+        let conn = memory_db();
+        two_sharing_a_prefix(&conn);
+        let found = find_session(&conn, "abcd2").unwrap().unwrap();
+        assert_eq!(found.id, "abcd2222zzzz");
+    }
+
+    #[test]
+    fn an_exact_id_wins_over_being_a_prefix_of_another() {
+        // Otherwise a session becomes unreachable the moment a longer id
+        // starts with it — the one case where refusing would be the bug.
+        let conn = memory_db();
+        two_sharing_a_prefix(&conn);
+        conn.execute("UPDATE sessions SET id = 'abcd' WHERE id = 'abcd1111zzzz'", [])
+            .unwrap();
+
+        let found = find_session(&conn, "abcd").unwrap().unwrap();
+        assert_eq!(found.id, "abcd");
+    }
+
+    #[test]
+    fn a_prefix_matching_nothing_is_still_absence_not_an_error() {
+        let conn = memory_db();
+        two_sharing_a_prefix(&conn);
+        assert!(find_session(&conn, "ffff").unwrap().is_none());
     }
 
     #[test]
