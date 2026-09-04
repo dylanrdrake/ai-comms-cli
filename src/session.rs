@@ -115,6 +115,11 @@ impl Drop for Heartbeat {
     }
 }
 
+/// The title a session carries until it is given a real one. Compared
+/// against rather than a flag, because a flag has to be reconstructed
+/// whenever a session is reopened and the stored title does not.
+pub const UNTITLED: &str = "Untitled";
+
 pub struct ChatSession {
     conn: Connection,
     id: String,
@@ -256,7 +261,7 @@ impl ChatSession {
         Ok(ChatSession {
             conn,
             id,
-            title: "Untitled".to_string(),
+            title: UNTITLED.to_string(),
             model,
             kind: kind.to_string(),
             effort_level,
@@ -293,7 +298,12 @@ impl ChatSession {
     ) -> Result<(Self, Vec<StoredMessage>)> {
         let history = store::load_messages(&conn, &summary.id)?;
         let messages: Vec<ChatMessage> = history.iter().map(|sm| sm.message.clone()).collect();
-        let title_set = messages.iter().any(|m| m.role == "user");
+        // A session keeps its name across a reopen, so the stored title is
+        // the evidence — not whether anyone has spoken in it yet. Inferring
+        // it from the messages made a named-but-empty session look unnamed
+        // the moment it was reopened, which both deleted it on the way out
+        // and let the first message overwrite the name with a derived one.
+        let title_set = summary.title != UNTITLED || messages.iter().any(|m| m.role == "user");
         let saved_len = messages.len();
 
         // Resuming with a different model (a `--model` flag) is a real
@@ -682,7 +692,11 @@ impl ChatSession {
     /// in it. Only backing out of the naming screen with a blank title, and
     /// then saying nothing, reads as "never mind".
     pub fn discard_if_unused(&self) -> Result<bool> {
-        if self.title_set || self.messages.iter().any(|m| m.role == "user") {
+        // The stored title, not `title_set`: this runs when a front end
+        // goes away, which is exactly when the flag is least trustworthy —
+        // it is rebuilt on every reopen, and getting it wrong here deletes
+        // a conversation rather than mislabelling one.
+        if self.title != UNTITLED || self.messages.iter().any(|m| m.role == "user") {
             return Ok(false);
         }
         store::delete_session(&self.conn, &self.id)
@@ -1285,6 +1299,57 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.model, "switched-model");
+    }
+
+    #[test]
+    fn a_named_but_empty_session_survives_being_reopened_and_left() {
+        // The TUI refuses a blank name, so every session it creates has one.
+        let mut session = memory_session();
+        session.set_title("Plan the migration".to_string()).unwrap();
+        let id = session.id().to_string();
+
+        // Open it from the picker and back straight out again without
+        // saying anything — which is what `discard_if_unused` runs on.
+        // Same connection, since the in-memory database lives in it.
+        let summary = store::find_session(&session.conn, &id).unwrap().unwrap();
+        let conn = std::mem::replace(&mut session.conn, Connection::open_in_memory().unwrap());
+        drop(session);
+        let (reopened, _) = ChatSession::resume(conn, &summary, summary.model.clone()).unwrap();
+        assert!(
+            !reopened.discard_if_unused().unwrap(),
+            "a session you took the trouble to name must not be deleted \
+             just because you have not typed in it yet"
+        );
+
+        assert!(
+            store::find_session(&reopened.conn, &id).unwrap().is_some(),
+            "it is gone from the picker"
+        );
+    }
+
+    #[test]
+    fn reopening_a_named_session_does_not_let_the_first_message_rename_it() {
+        // The same flag, the other way round: with `title_set` inferred from
+        // the messages, a named session you had not typed in yet came back
+        // looking unnamed, and `persist_pending` then derived a title over
+        // the one you chose.
+        let mut session = memory_session();
+        session.set_title("Plan the migration".to_string()).unwrap();
+        let id = session.id().to_string();
+
+        let summary = store::find_session(&session.conn, &id).unwrap().unwrap();
+        let conn = std::mem::replace(&mut session.conn, Connection::open_in_memory().unwrap());
+        drop(session);
+        let (mut reopened, _) = ChatSession::resume(conn, &summary, summary.model.clone()).unwrap();
+
+        reopened.push_user("something else entirely".to_string());
+        reopened.persist_pending().unwrap();
+
+        assert_eq!(
+            reopened.title(),
+            "Plan the migration",
+            "the name you gave it should outlast the first thing you say"
+        );
     }
 
     #[test]

@@ -103,7 +103,23 @@ regenerated each tick. It should look like noise, not a clock.
 - `clank ask "..."` — the CLI spinner uses the same frames.
 - `/models` while it fetches.
 
-## 6. From the round before, worth a glance
+## 6. A session surviving being reopened
+
+Fixed after this plan was written; the exact sequence that lost one:
+
+1. Launch `clank`, choose **New session**, give it a name.
+2. `Ctrl-B` straight back out without typing anything.
+3. Resume it from the picker.
+4. `Ctrl-B` back out again.
+
+It should still be listed. Before the fix it was deleted here, because
+reopening rebuilt "was this named?" from whether anyone had spoken in it.
+
+The same root caused a second one worth checking: name a session, back out,
+resume it, and *then* type something. The name you gave it should survive —
+it used to be replaced by one derived from that first message.
+
+## 7. From the round before, worth a glance
 
 - **Picker scrolls.** Accumulate more sessions than fit, or shrink the
   terminal. The list should follow the cursor, and the rule above it should
