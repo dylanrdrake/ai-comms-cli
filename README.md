@@ -446,10 +446,16 @@ turn tools on (see **Commands** below) — there's no separate "agent" launch
 option. A resumed session picks back up in whichever mode, model, and effort
 level it was last left in.
 
-Choosing "New session" from the launch screen asks for a title, and requires
+Choosing "Spawn clanker" from the launch screen asks for a name, and requires
 one — starting a session is meant to be deliberate, so there's no untitled
 path. The session is kept from the moment you confirm it, whether or not you
 ever say anything in it.
+
+That screen also shows the mark the new session will carry, and `Tab` rolls
+another. Because the mark is hashed from the session id, and the id is fixed
+once the session exists, this is the only moment it can be chosen rather than
+dealt — so keep pressing `Tab` until you get one you like, then name it and
+hit Enter.
 
 Every session carries a small square of braille dots, hashed from its id and
 the same for the life of the session. It says nothing you can type — the
@@ -507,6 +513,14 @@ that session again.
 | `r` | Rename the selected session |
 | `d` | Delete the selected session (asks to confirm) |
 | `q` | Quit |
+
+**Naming a clanker** (after choosing `Spawn clanker`)
+
+| Key | Does |
+|---|---|
+| `Tab` | Roll a different mark. It is hashed from the session id, which is fixed once the session exists, so this screen is the only place it can be chosen |
+| `Enter` | Spawn it with the name you typed. A blank name does nothing |
+| `Esc` | Back to the list, having created nothing |
 
 Opening a session whose directory no longer exists asks whether to resume in
 the current one instead, repointing the session there — the same thing

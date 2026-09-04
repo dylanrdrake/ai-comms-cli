@@ -109,7 +109,7 @@ regenerated each tick. It should look like noise, not a clock.
 
 Fixed after this plan was written; the exact sequence that lost one:
 
-1. Launch `clank`, choose **New session**, give it a name.
+1. Launch `clank`, choose **Spawn clanker**, give it a name.
 2. `Ctrl-B` straight back out without typing anything.
 3. Resume it from the picker.
 4. `Ctrl-B` back out again.
@@ -228,7 +228,21 @@ Then the things that must not have broken:
   should stay at full brightness. Scroll back and forth: the two should be
   distinguishable at a glance, without reading `sent` / `not sent`.
 
-## 10. From the round before, worth a glance
+## 10. Spawning a clanker
+
+- `clank` → the first row reads **Spawn clanker**, not "New session".
+- Enter on it → the naming screen shows a mark above the name field, with
+  `Tab for another` beside it.
+- `Tab` repeatedly → the mark should change every press, shape and colour,
+  and whatever you have typed must stay put.
+- Type a name, `Tab` some more, then Enter → the session that opens should
+  carry **the mark that was on screen when you pressed Enter**, both in the
+  reply gutter and on its row back in the list. A different one means the id
+  being shown is not the id being created.
+- `Esc` from the naming screen → nothing is created; the list is unchanged.
+- `clank sessions` → the same mark again, drawn by the CLI.
+
+## 11. From the round before, worth a glance
 
 - **Picker scrolls.** Accumulate more sessions than fit, or shrink the
   terminal. The list should follow the cursor, and the rule above it should

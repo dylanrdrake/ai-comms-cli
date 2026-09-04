@@ -115,6 +115,16 @@ impl Drop for Heartbeat {
     }
 }
 
+/// A fresh session id.
+///
+/// Here rather than inline at each caller because the TUI generates one
+/// *before* it creates anything: a session's mark is hashed from its id, so
+/// rolling a new id is how you get a different mark, and the naming screen
+/// lets you keep rolling until you like the one you are about to spawn.
+pub fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// The title a session carries until it is given a real one. Compared
 /// against rather than a flag, because a flag has to be reconstructed
 /// whenever a session is reopened and the stored title does not.
@@ -232,6 +242,9 @@ impl ChatSession {
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         conn: Connection,
+        // See `new_id`: the caller chooses it so the TUI can show what it
+        // will look like before creating anything.
+        id: String,
         model: String,
         kind: &str,
         effort_level: Option<String>,
@@ -244,8 +257,9 @@ impl ChatSession {
         stream: bool,
         working_dir: Option<String>,
     ) -> Result<Self> {
-        let id = store::create_session(
+        store::create_session(
             &conn,
+            &id,
             &model,
             kind,
             effort_level.as_deref(),
@@ -774,6 +788,7 @@ mod tests {
     fn memory_session() -> ChatSession {
         ChatSession::create(
             memory_conn(),
+            new_id(),
             "test-model".to_string(),
             KIND_CHAT,
             Some("high".to_string()),
@@ -992,6 +1007,7 @@ mod tests {
     fn session_in(dir: Option<&str>) -> ChatSession {
         ChatSession::create(
             memory_conn(),
+            new_id(),
             "test-model".to_string(),
             KIND_CHAT,
             None,
@@ -1068,6 +1084,7 @@ mod tests {
         let conn = memory_conn();
         let session = ChatSession::create(
             conn,
+            new_id(),
             "test-model".to_string(),
             KIND_CHAT,
             None,

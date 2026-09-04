@@ -87,10 +87,14 @@ enum Screen {
     /// Boxed for the same reason `Chat` is: it dwarfs the other variants,
     /// and every `Screen` would otherwise carry its footprint.
     Launch(Box<Picker>),
-    /// Naming a new session before it's created — reached by choosing "New
-    /// session" on the launch screen.
+    /// Naming a clanker before it's spawned — reached by choosing "Spawn
+    /// clanker" on the launch screen.
     NameSession {
         input: String,
+        /// The id it will be created with, rolled here rather than at
+        /// creation so its mark can be shown — and rolled again — before
+        /// anything is written. See [`session::new_id`].
+        id: String,
     },
     Chat(Box<Chat>),
 }
@@ -165,11 +169,12 @@ fn current_dir() -> Option<String> {
         .map(|dir| dir.display().to_string())
 }
 
-fn open_new(context: &Context, agentic: bool, title: String) -> Result<Chat> {
+fn open_new(context: &Context, agentic: bool, title: String, id: String) -> Result<Chat> {
     let kind = if agentic { KIND_AGENT_CHAT } else { KIND_CHAT };
 
     let mut session = ChatSession::create(
         store::open_db()?,
+        id,
         context.default_model.clone(),
         kind,
         context.effort_level.clone(),
@@ -483,7 +488,7 @@ fn draw(terminal: &mut Tui, screen: &mut Screen, tick: usize, selection: bool) -
             "↑/↓ move · Enter open · r rename · d delete · q quit",
             tick,
         ),
-        Screen::NameSession { input } => picker::draw_naming(frame, input),
+        Screen::NameSession { input, id } => picker::draw_naming(frame, input, id),
         Screen::Chat(chat) => render::draw(frame, &chat.app, &mut chat.transcript_cache, tick),
     })?;
     Ok(())
@@ -788,6 +793,7 @@ async fn handle_picker_key(
                 Activation::NewSession => {
                     *screen = Screen::NameSession {
                         input: String::new(),
+                        id: session::new_id(),
                     }
                 }
                 Activation::Resume(row) => {
@@ -830,7 +836,7 @@ async fn handle_picker_key(
 /// TUI should exit (always `false` — quitting from here isn't supported,
 /// same as any other picker screen).
 fn handle_naming_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> Result<bool> {
-    let Screen::NameSession { input } = screen else {
+    let Screen::NameSession { input, id } = screen else {
         unreachable!("naming screen only")
     };
 
@@ -844,9 +850,15 @@ fn handle_naming_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> R
             let title = input.trim();
             if !title.is_empty() {
                 let title = title.to_string();
-                *screen = Screen::Chat(Box::new(open_new(context, false, title)?));
+                let id = id.clone();
+                *screen = Screen::Chat(Box::new(open_new(context, false, title, id)?));
             }
         }
+        // Another id, which means another mark: the one thing about a
+        // clanker you cannot change afterwards, so it is worth being able to
+        // roll for one you like before it exists. Tab because every other
+        // key on this screen is either the name or the answer.
+        KeyCode::Tab => *id = session::new_id(),
         KeyCode::Backspace => {
             input.pop();
         }
@@ -1240,6 +1252,7 @@ mod tests {
         let context = test_context();
         let mut screen = Screen::NameSession {
             input: "   ".to_string(),
+            id: session::new_id(),
         };
 
         handle_naming_key(&context, &mut screen, KeyEvent::from(KeyCode::Enter)).unwrap();
@@ -1248,6 +1261,40 @@ mod tests {
             matches!(screen, Screen::NameSession { .. }),
             "a blank title should leave you on the naming screen"
         );
+    }
+
+    #[test]
+    fn tab_rolls_a_different_clanker_and_leaves_the_name_alone() {
+        // The mark is hashed from the id, so a new id is the only way to a
+        // new mark — and it has to happen before creation, since afterwards
+        // the id is what everything else refers to.
+        let context = test_context();
+        let mut screen = Screen::NameSession {
+            input: "Parser work".to_string(),
+            id: session::new_id(),
+        };
+        let Screen::NameSession { id: before, .. } = &screen else {
+            unreachable!()
+        };
+        let before = before.clone();
+
+        handle_naming_key(&context, &mut screen, KeyEvent::from(KeyCode::Tab)).unwrap();
+
+        let Screen::NameSession { input, id } = &screen else {
+            panic!("Tab left the naming screen")
+        };
+        assert_ne!(*id, before, "Tab must roll a different id");
+        assert_eq!(input, "Parser work", "and must not touch what was typed");
+
+        // Typing is not rerolling: only Tab moves the mark, or it would
+        // change under you as you named the thing.
+        let rolled = id.clone();
+        handle_naming_key(&context, &mut screen, KeyEvent::from(KeyCode::Char('!'))).unwrap();
+        let Screen::NameSession { input, id } = &screen else {
+            unreachable!()
+        };
+        assert_eq!(*id, rolled);
+        assert_eq!(input, "Parser work!");
     }
 
     #[test]

@@ -1647,6 +1647,7 @@ async fn cmd_session(
             };
             let mut session = ChatSession::create(
                 conn,
+                session::new_id(),
                 model,
                 KIND_CHAT,
                 default_effort_level.clone(),
@@ -1843,6 +1844,7 @@ fn open_agent_session(
 
     let session = ChatSession::create(
         conn,
+        session::new_id(),
         resolve_model(config, model),
         store::KIND_AGENT_CHAT,
         resolve_effort_level(config, effort_level),

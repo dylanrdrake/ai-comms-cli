@@ -268,6 +268,10 @@ pub fn derive_title(messages: &[ChatMessage]) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn create_session(
     conn: &Connection,
+    // Chosen by the caller rather than made here: the TUI shows a session's
+    // mark — hashed from this — before it commits to creating it, and lets
+    // you roll for one you like. `crate::session::new_id` makes them.
+    id: &str,
     model: &str,
     kind: &str,
     effort_level: Option<&str>,
@@ -279,8 +283,7 @@ pub fn create_session(
     highlight: bool,
     stream: bool,
     working_dir: Option<&str>,
-) -> Result<String> {
-    let id = uuid::Uuid::new_v4().to_string();
+) -> Result<()> {
     let ts = now();
     let title = crypto::encrypt("Untitled")?;
 
@@ -306,7 +309,7 @@ pub fn create_session(
         ],
     )?;
 
-    Ok(id)
+    Ok(())
 }
 
 /// Updates the session's title (e.g. once the first user message is known).
@@ -1234,8 +1237,10 @@ mod tests {
     #[test]
     fn create_and_load_session_roundtrip() {
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "orcarouter/auto",
             KIND_CHAT,
             None,
@@ -1282,8 +1287,10 @@ mod tests {
     #[test]
     fn reasoning_details_round_trip_through_persistence() {
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "anthropic/claude-sonnet-5",
             KIND_AGENT_CHAT,
             Some("high"),
@@ -1348,8 +1355,10 @@ mod tests {
     fn the_last_message_of_each_session_comes_back_in_one_query() {
         let conn = memory_db();
         let session = |model: &str| {
+            let id = crate::session::new_id();
             create_session(
                 &conn,
+                &id,
                 model,
                 KIND_CHAT,
                 None,
@@ -1362,7 +1371,8 @@ mod tests {
                 true,
                 None,
             )
-            .unwrap()
+            .unwrap();
+            id
         };
         let answered = session("model-a");
         let waiting = session("model-b");
@@ -1410,8 +1420,10 @@ mod tests {
         // An assistant message that only asks for a tool has no text, and an
         // empty cell says less than the tool's name does.
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "m",
             KIND_AGENT_CHAT,
             None,
@@ -1460,8 +1472,10 @@ mod tests {
         // someone watching them would make the view unusable.
         let conn = memory_db();
         let session = |model: &str| {
+            let id = crate::session::new_id();
             create_session(
                 &conn,
+                &id,
                 model,
                 KIND_CHAT,
                 None,
@@ -1474,7 +1488,8 @@ mod tests {
                 true,
                 None,
             )
-            .unwrap()
+            .unwrap();
+            id
         };
         let watched = session("model-a");
         let _other = session("model-b");
@@ -1524,8 +1539,10 @@ mod tests {
         // It names a file or a command the user typed about, so it gets the
         // same treatment as message content and titles.
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "m",
             KIND_CHAT,
             None,
@@ -1560,8 +1577,10 @@ mod tests {
     #[test]
     fn list_sessions_orders_by_updated_desc() {
         let conn = memory_db();
-        let id1 = create_session(
+        let id1 = crate::session::new_id();
+        create_session(
             &conn,
+            &id1,
             "model-a",
             KIND_CHAT,
             None,
@@ -1576,8 +1595,10 @@ mod tests {
         )
         .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let id2 = create_session(
+        let id2 = crate::session::new_id();
+        create_session(
             &conn,
+            &id2,
             "model-b",
             KIND_AGENT_CHAT,
             None,
@@ -1601,8 +1622,10 @@ mod tests {
     #[test]
     fn find_session_by_prefix() {
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "model-a",
             KIND_CHAT,
             None,
@@ -1626,8 +1649,10 @@ mod tests {
     fn two_sharing_a_prefix(conn: &Connection) {
         let made: Vec<String> = (0..2)
             .map(|_| {
+                let id = crate::session::new_id();
                 create_session(
                     conn,
+                    &id,
                     "model-a",
                     KIND_CHAT,
                     None,
@@ -1640,7 +1665,8 @@ mod tests {
                     true,
                     None,
                 )
-                .unwrap()
+                .unwrap();
+                id
             })
             .collect();
         for (old, (new, title)) in made
@@ -1709,8 +1735,10 @@ mod tests {
     }
 
     fn claimable_session(conn: &Connection) -> String {
+        let id = crate::session::new_id();
         create_session(
             conn,
+            &id,
             "m",
             KIND_AGENT_CHAT,
             None,
@@ -1723,7 +1751,8 @@ mod tests {
             true,
             None,
         )
-        .unwrap()
+        .unwrap();
+        id
     }
 
     #[test]
@@ -1808,8 +1837,10 @@ mod tests {
     #[test]
     fn set_session_kind_switches_the_stored_kind() {
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "model-a",
             KIND_CHAT,
             None,
@@ -1837,8 +1868,10 @@ mod tests {
     #[test]
     fn new_sessions_store_the_given_snapshot() {
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "model-a",
             KIND_CHAT,
             None,
@@ -1867,8 +1900,10 @@ mod tests {
     #[test]
     fn set_session_effort_level_switches_and_clears() {
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "model-a",
             KIND_CHAT,
             None,
@@ -1899,8 +1934,10 @@ mod tests {
     #[test]
     fn set_session_verbose_switches_the_flag() {
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "model-a",
             KIND_CHAT,
             None,
@@ -1925,8 +1962,10 @@ mod tests {
     #[test]
     fn set_session_max_iterations_switches_and_clears() {
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "model-a",
             KIND_CHAT,
             None,
@@ -1957,8 +1996,10 @@ mod tests {
     #[test]
     fn set_session_temperature_switches_and_clears() {
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "model-a",
             KIND_CHAT,
             None,
@@ -1986,8 +2027,10 @@ mod tests {
     #[test]
     fn set_session_approval_updates_the_stored_gates() {
         let conn = memory_db();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "model-a",
             KIND_CHAT,
             None,
@@ -2015,8 +2058,10 @@ mod tests {
     fn delete_session_removes_messages_via_cascade() {
         let conn = memory_db();
         conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
-        let id = create_session(
+        let id = crate::session::new_id();
+        create_session(
             &conn,
+            &id,
             "model-a",
             KIND_CHAT,
             None,

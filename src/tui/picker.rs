@@ -458,7 +458,7 @@ pub fn draw(
         let mut spans = vec![Span::styled(marker, Style::new().cyan().bold())];
         match item {
             LaunchItem::NewSession => {
-                spans.push(Span::styled("New session", base.green()));
+                spans.push(Span::styled("Spawn clanker", base.green()));
                 // Still set apart from the sessions below it, now that no
                 // heading does that: it is the one row that isn't one.
                 trailing_blank = true;
@@ -634,10 +634,16 @@ pub fn draw(
     }
 }
 
-/// The prompt shown before a new session is created, so it starts with a
-/// real name instead of "Untitled". Leaving it blank falls back to the
-/// usual behavior: derived from the first message once there is one.
-pub fn draw_naming(frame: &mut Frame, input: &str) {
+/// The prompt shown before a clanker is spawned, so it starts with a real
+/// name instead of "Untitled". Leaving it blank falls back to the usual
+/// behavior: derived from the first message once there is one.
+///
+/// Also where its mark is chosen. The mark is hashed from the session id, so
+/// it cannot be changed once the session exists — this screen holds an id
+/// that has not been written yet, and Tab rolls another, which is the only
+/// point at which the thing you will be looking at for the next week is
+/// yours to pick rather than dealt to you.
+pub fn draw_naming(frame: &mut Frame, input: &str, id: &str) {
     let areas = Layout::vertical([
         Constraint::Length(1), // title
         Constraint::Length(1), // rule
@@ -652,10 +658,20 @@ pub fn draw_naming(frame: &mut Frame, input: &str) {
     );
     draw_rule(frame, areas[1], None);
 
+    // The mark this session will carry for the rest of its life, shown
+    // before it has one: it is hashed from an id that does not have to be
+    // kept, so this is the only moment it can be chosen rather than dealt.
+    let (mark, mark_style) = identicon(id);
     let lines = vec![
         Line::raw(""),
         Line::from(vec![
-            Span::styled("  Session title  ", Style::new().dark_gray()),
+            Span::raw("  "),
+            Span::styled(mark, mark_style),
+            Span::styled("  Tab for another", Style::new().dark_gray()),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  Clanker name  ", Style::new().dark_gray()),
             Span::raw(input.to_string()),
             Span::styled("▏", Style::new().yellow()),
         ]),
@@ -664,7 +680,7 @@ pub fn draw_naming(frame: &mut Frame, input: &str) {
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " A title is required · Enter start · Esc cancel",
+            " A name is required · Tab reroll · Enter spawn · Esc cancel",
             Style::new().dark_gray(),
         ))),
         areas[3],
@@ -966,6 +982,46 @@ mod tests {
             Activity::Working,
         );
         assert!(picker_of(vec![busy_row]).has_working_session());
+    }
+
+    /// Renders the naming screen off-screen, the same way.
+    fn naming_to_string(input: &str, id: &str, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_naming(frame, input, id))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_first_row_spawns_a_clanker() {
+        let out = picker_to_string(&picker_of(vec![]), 60, 10);
+        assert!(out.contains("Spawn clanker"), "{out}");
+    }
+
+    #[test]
+    fn naming_shows_the_mark_the_clanker_will_carry() {
+        // The mark is hashed from the id, so this is the one moment it can
+        // be seen before it is committed to — and the screen has to actually
+        // show it, or rerolling is rolling blind.
+        let id = "4f2a91b2-3c1d-4e8a-9f02-7b6c5d4e3a21";
+        let out = naming_to_string("Parser work", id, 60, 10);
+        assert!(out.contains(&identicon(id).0), "{out}");
+        assert!(out.contains("Parser work"), "{out}");
+        assert!(out.contains("Tab"), "the reroll key is offered: {out}");
+
+        // A different id is a different mark, which is the whole point.
+        let other = "0000ffff-3c1d-4e8a-9f02-7b6c5d4e3a21";
+        assert_ne!(identicon(id).0, identicon(other).0);
     }
 
     /// Renders the launch screen off-screen so the list can be asserted on.
