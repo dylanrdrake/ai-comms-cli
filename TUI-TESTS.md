@@ -76,9 +76,9 @@ Edge cases:
 `8adb1a6` removed the "In this directory" / "Elsewhere" split.
 
 - `clank` → one list, newest first, no section headings.
-- Directory column: `.` for the directory you are in, `~/…` under home, a
-  full path above home, `dir not recorded` for sessions saved before it was
-  tracked.
+- Directory column: `~` for home itself (even when that is where you are),
+  `.` for any other directory you are in, `~/…` under home, a full path
+  above home, `dir not recorded` for sessions saved before it was tracked.
 - Arrow top to bottom — the cursor should never skip a row or land
   somewhere that cannot be opened.
 - Delete one with `d` → the list closes up, the cursor stays sensible.
