@@ -8,6 +8,7 @@
 * Skills? implement Agent Skill Standard: agentskills.io
 
 NEXT:
+* Vim mode
 * $ command UI re-think
   What exists: a box above the prompt showing the command and, once it exits,
   its output, which you then send to the conversation or discard (Ctrl-S /

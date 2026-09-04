@@ -520,6 +520,7 @@ the current one instead, repointing the session there — the same thing
 | `Esc` | Cancel the in-flight turn (kills a running tool command too) |
 | `Alt-Enter` / `Shift-Enter` | Insert a newline instead of sending. `Alt-Enter` works everywhere; `Shift-Enter` needs a terminal that supports the kitty keyboard protocol (kitty, WezTerm, Ghostty, foot, recent Alacritty), because the older input protocol can't tell `Shift-Enter` apart from `Enter` at all |
 | `↑` / `↓` | Recall previous messages into the input box |
+| `Tab` | Complete a slash command being typed: fills in as much of the name as every match shares, then steps through the matches one press at a time. Only ever touches a command *name* — in a message, in a path, or once you're onto a command's arguments, it does nothing |
 | `$ <command>` | Run a shell command yourself, in the session's directory. No model call, no tokens, no approval — you typed it. Output appears in its own box and waits for you to decide whether the model should see it |
 | `Ctrl-S` / `Ctrl-D` | Send that output to the conversation, or discard it. Sending waits for your next message rather than prompting a reply. Different keys from the approval's on purpose, since both boxes can be open at once. Use `/send` and `/discard` where something has claimed the chord — Zed's terminal does |
 | `Ctrl-Y` / `Ctrl-N` | Allow or deny a tool approval. It gets its own box above the prompt rather than taking the prompt over, so you can keep typing — and keep sending — while a decision waits, which is why it's a chord rather than a bare `y`/`n`. Use `/allow` and `/deny` where the chords are claimed; without a way to answer, a turn waits forever |
@@ -570,6 +571,26 @@ about it.
 A message that merely starts with a slash is still sent as normal text
 whenever it isn't close to a command — paths (`/etc/hosts`), and words that
 merely extend a command name (`/verbosely`), both go through untouched.
+
+**The box shows you which it is before you send.** As you type, the leading
+`/command` turns cyan the moment it names a real one — the name only, not
+its argument, so `/effort` stays lit while you type the level after it. A
+path, a half-typed name, or a misspelling stays the colour of ordinary text.
+It answers "is this a command as spelled?", not "will this parse" — a lit
+`/approval bogus off` still comes back as a usage error, and an unlit
+`/mdoel` is still caught as a typo when you send it.
+
+**And a row above it says what you could be typing.** While the name is
+still ambiguous the row lists every command that starts with what's there
+(`/m` → `models model max-iterations`), with a `+N` when more match than the
+row can hold; `Tab` fills in what they all share and then steps through them,
+marking the one it has landed on. Once the name is settled the row turns into
+that command's form — `/approval [<read|write|terminal|all> <on|off>]` — for
+as long as you're typing its arguments. Nothing appears above an ordinary
+message.
+
+Both are **TUI only**: `clank session` reads a line at a time and can neither
+restyle what has been printed nor draw above the line you are on.
 
 All of the above persist to the session, so they stick across
 `Ctrl-B`/`--resume` too.

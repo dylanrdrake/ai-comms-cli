@@ -231,6 +231,58 @@ pub struct App {
     /// What was being typed before Up was first pressed, restored once Down
     /// walks back past the newest history entry.
     draft: String,
+    /// Where Tab has got to in the commands matching what was typed, if a
+    /// run of Tabs is still going. See [`App::complete_command`].
+    completion: Option<Completion>,
+}
+
+/// A run of Tab presses stepping through the commands that match a prefix.
+///
+/// `written` is what the last press left in the box, and is how the run
+/// knows it is still the current one: any edit at all changes the input, so
+/// the next Tab starts over from what is now typed. That is cheaper than
+/// clearing this from every method that touches `input`, and cannot be
+/// forgotten when a new one is added.
+struct Completion {
+    /// What had been typed when the run started — the matches are always
+    /// recomputed from this, never from the name a press has since written.
+    prefix: String,
+    written: String,
+    /// Which match is in the box now. `None` after a press that only filled
+    /// in what every match shares, which is a step no match owns.
+    index: Option<usize>,
+}
+
+/// What the row above the input box has to say about a half-typed command.
+pub enum CommandHint {
+    /// The names still in the running, and which one Tab has landed on.
+    Matches {
+        names: Vec<&'static str>,
+        active: Option<usize>,
+    },
+    /// The form of a command whose name is settled, while its arguments are
+    /// being typed.
+    Syntax(&'static str),
+}
+
+/// The longest run of characters every one of `names` starts with — what
+/// Tab can fill in without choosing between them. Empty when they share
+/// nothing, which is what a bare `/` gets.
+fn shared_prefix(names: &[&'static str]) -> String {
+    let mut shared = String::new();
+    let Some(first) = names.first() else {
+        return shared;
+    };
+    for (i, ch) in first.char_indices() {
+        if !names
+            .iter()
+            .all(|name| name.get(i..).is_some_and(|rest| rest.starts_with(ch)))
+        {
+            break;
+        }
+        shared.push(ch);
+    }
+    shared
 }
 
 impl App {
@@ -261,6 +313,7 @@ impl App {
             input_history: Vec::new(),
             history_cursor: None,
             draft: String::new(),
+            completion: None,
         }
     }
 
@@ -687,6 +740,100 @@ impl App {
             } else {
                 selected.saturating_sub(1)
             };
+        }
+    }
+
+    /// Tab: fills in as much of the command name as every match agrees on,
+    /// and once there is nothing left to agree on, steps through them one
+    /// press at a time.
+    ///
+    /// Deliberately confined to the name. An argument is not a fixed set of
+    /// words the way a name is — a model, a title, a temperature — so there
+    /// is nothing there to complete, and rewriting one would be guessing at
+    /// what was being typed rather than finishing it.
+    ///
+    /// Inert on anything else, which is what keeps Tab from having to be
+    /// taken away from ordinary typing: a message, a path, an unrecognized
+    /// name — none of them match a command, so none of them are touched.
+    pub fn complete_command(&mut self) {
+        // Still the run the last press left behind, or a new one starting
+        // from what is in the box now.
+        let resumed = self.completion.take().filter(|c| c.written == self.input);
+        let prefix = match &resumed {
+            Some(run) => run.prefix.clone(),
+            None => match crate::ui::command_prefix(&self.input) {
+                Some(prefix) => prefix.to_string(),
+                None => return,
+            },
+        };
+        let names = crate::ui::command_matches(&prefix);
+        if names.is_empty() {
+            return;
+        }
+
+        let shared = shared_prefix(&names);
+        let index = match &resumed {
+            // A second press means the first one wasn't what was wanted.
+            Some(run) => Some(run.index.map_or(0, |i| (i + 1) % names.len())),
+            // Nothing to fill in — every match already agrees to exactly
+            // what is typed — so this press steps instead of filling.
+            None => (shared == prefix).then_some(0),
+        };
+        let word = match index {
+            Some(i) => names[i],
+            None => &shared,
+        };
+
+        // Leading whitespace is left where it is: it is text that was typed,
+        // and the name goes back exactly where the name was.
+        let lead = self.input.len() - self.input.trim_start().len();
+        self.input.truncate(lead);
+        self.input.push('/');
+        self.input.push_str(word);
+        self.cursor = self.input.len();
+        self.completion = Some(Completion {
+            prefix,
+            written: self.input.clone(),
+            index,
+        });
+    }
+
+    /// What to show above the input box, if anything: the commands still
+    /// matching a name being typed, or the form of one already named.
+    ///
+    /// A live run of Tabs keeps showing the list it is stepping through,
+    /// rather than the one match the name it just wrote has — the point of
+    /// the row mid-run is the choice being made, and a list that collapsed
+    /// to one row on the first press would take that away.
+    pub fn command_hint(&self) -> Option<CommandHint> {
+        if let Some(run) = self.completion.as_ref().filter(|c| c.written == self.input) {
+            let names = crate::ui::command_matches(&run.prefix);
+            if !names.is_empty() {
+                return Some(CommandHint::Matches {
+                    names,
+                    active: run.index,
+                });
+            }
+        }
+        let Some(prefix) = crate::ui::command_prefix(&self.input) else {
+            // Past the name: the form of the command, while its argument is
+            // typed. `None` for ordinary prose, which names nothing.
+            return crate::ui::command_syntax(&self.input).map(CommandHint::Syntax);
+        };
+        let names = crate::ui::command_matches(prefix);
+        match names.as_slice() {
+            // Nothing matches: a path, or a name that isn't one. Saying so
+            // would put a row under every message beginning with a slash.
+            [] => None,
+            // Nothing left to choose — it is this command, so show its form
+            // rather than its name back.
+            [only] if *only == prefix => {
+                crate::ui::command_syntax(&self.input).map(CommandHint::Syntax)
+            }
+            _ => Some(CommandHint::Matches {
+                names,
+                active: None,
+            }),
         }
     }
 
@@ -1705,6 +1852,156 @@ mod tests {
         a.move_left();
         a.insert_char('é');
         assert_eq!(a.input, "caéf");
+    }
+
+    /// Types `text` into a fresh box, the way the key handler would.
+    fn typing(text: &str) -> App {
+        let mut a = app();
+        for c in text.chars() {
+            a.insert_char(c);
+        }
+        a
+    }
+
+    #[test]
+    fn tab_fills_in_as_much_as_every_match_agrees_on() {
+        let mut a = typing("/hel");
+        a.complete_command();
+        assert_eq!(a.input, "/help");
+        assert_eq!(a.cursor, a.input.len());
+
+        // Two matches, agreeing on more than was typed: it fills in to
+        // where they part company and stops there rather than picking one.
+        let mut a = typing("/te");
+        a.complete_command();
+        assert_eq!(a.input, "/temp");
+    }
+
+    #[test]
+    fn tab_steps_through_the_matches_when_there_is_nothing_to_fill_in() {
+        // "m" is all three of these agree on, so there is nothing to add.
+        let mut a = typing("/m");
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            a.complete_command();
+            seen.push(a.input.clone());
+        }
+        // ...and the fourth press comes back round to the first.
+        assert_eq!(seen, ["/models", "/model", "/max-iterations", "/models"]);
+    }
+
+    #[test]
+    fn typing_anything_ends_the_run() {
+        // Otherwise a Tab much later would carry on stepping through a list
+        // chosen for a prefix that is no longer there.
+        let mut a = typing("/m");
+        a.complete_command();
+        assert_eq!(a.input, "/models");
+        a.backspace();
+        assert_eq!(a.input, "/model");
+        a.complete_command();
+        // Had the run carried on it would be at its second match, "/model",
+        // which is exactly what is typed. Starting over from "model" — two
+        // commands begin with it, agreeing on nothing further — steps to the
+        // first of those instead.
+        assert_eq!(a.input, "/models");
+    }
+
+    #[test]
+    fn tab_leaves_anything_that_is_not_a_name_alone() {
+        for text in [
+            "",
+            "hello",
+            "/etc/hosts",
+            "/nonesuch",
+            "/model gpt-5",
+            "$ ls",
+        ] {
+            let mut a = typing(text);
+            a.complete_command();
+            assert_eq!(a.input, text, "{text} was rewritten");
+        }
+    }
+
+    #[test]
+    fn tab_puts_the_name_back_where_the_name_was() {
+        let mut a = typing("  /hel");
+        a.complete_command();
+        assert_eq!(a.input, "  /help");
+    }
+
+    #[test]
+    fn the_hint_offers_matches_until_the_name_is_settled() {
+        let matches = |text: &str| match typing(text).command_hint() {
+            Some(CommandHint::Matches { names, active }) => (names, active),
+            _ => panic!("{text} did not offer matches"),
+        };
+        assert_eq!(matches("/m").0, ["models", "model", "max-iterations"]);
+        assert_eq!(matches("/m").1, None);
+        // A name that is also the start of a longer one still offers both.
+        assert_eq!(matches("/temp").0, ["temperature", "temp"]);
+        // Everything, for a slash on its own.
+        assert_eq!(matches("/").0.len(), crate::ui::help_rows().len());
+    }
+
+    #[test]
+    fn the_hint_turns_into_the_form_once_there_is_no_choice_left() {
+        let syntax = |text: &str| match typing(text).command_hint() {
+            Some(CommandHint::Syntax(syntax)) => syntax,
+            _ => panic!("{text} did not show a form"),
+        };
+        assert_eq!(syntax("/help"), "/help");
+        // Past the name, while the argument is typed.
+        assert_eq!(
+            syntax("/approval read "),
+            "/approval [<read|write|terminal|all> <on|off>]"
+        );
+        assert_eq!(
+            syntax("/session title Notes"),
+            "/session [title <new title>]"
+        );
+    }
+
+    #[test]
+    fn the_hint_says_nothing_about_a_message() {
+        for text in [
+            "",
+            "hello",
+            "what about /etc/hosts",
+            "/etc/hosts",
+            "/nonesuch",
+            "$ ls",
+        ] {
+            assert!(
+                typing(text).command_hint().is_none(),
+                "{text} put a row above the box"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hint_keeps_the_list_it_is_stepping_through() {
+        // Collapsing to the one match the written name has would take the
+        // choice off the screen at the moment it is being made.
+        let mut a = typing("/m");
+        a.complete_command();
+        assert_eq!(a.input, "/models");
+        match a.command_hint() {
+            Some(CommandHint::Matches { names, active }) => {
+                assert_eq!(names, ["models", "model", "max-iterations"]);
+                assert_eq!(active, Some(0));
+            }
+            _ => panic!("the list went away mid-run"),
+        }
+    }
+
+    #[test]
+    fn shared_prefix_is_what_they_all_start_with() {
+        assert_eq!(shared_prefix(&["temperature", "temp"]), "temp");
+        assert_eq!(shared_prefix(&["models", "model"]), "model");
+        assert_eq!(shared_prefix(&["ask", "back"]), "");
+        assert_eq!(shared_prefix(&[]), "");
+        assert_eq!(shared_prefix(&["only"]), "only");
     }
 
     #[test]

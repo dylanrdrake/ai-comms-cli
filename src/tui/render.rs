@@ -1,6 +1,6 @@
 //! Drawing the TUI. Pure presentation over [`App`] — no state changes here.
 
-use super::app::{App, ModelBrowser, ShellState, ToolStatus, TranscriptItem};
+use super::app::{App, CommandHint, ModelBrowser, ShellState, ToolStatus, TranscriptItem};
 use crate::ui::{json_fields, summarize, tool_call_fields, ApprovalRequest};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -141,6 +141,11 @@ pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usi
         Some(browser) => browser_height(browser),
         None => 0,
     };
+    // One row, directly above the box, while a command is being typed into
+    // it. Nothing is reserved when there is nothing to say, so the prompt
+    // does not sit a row higher for the whole session.
+    let hint = app.command_hint();
+    let hint_rows = u16::from(hint.is_some());
 
     let input_rows = content_rows
         .clamp(1, MAX_INPUT_ROWS)
@@ -152,7 +157,9 @@ pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usi
             frame
                 .area()
                 .height
-                .saturating_sub(7 + pending_rows + approval_rows + shell_rows + browser_rows)
+                .saturating_sub(
+                    7 + pending_rows + approval_rows + shell_rows + browser_rows + hint_rows,
+                )
                 .max(1),
         );
 
@@ -164,6 +171,7 @@ pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usi
         Constraint::Length(shell_rows),     // a $ command, running or waiting
         Constraint::Length(browser_rows),   // the /models browser, if open
         Constraint::Length(pending_rows),   // messages waiting, if any
+        Constraint::Length(hint_rows),      // what a half-typed command could be
         Constraint::Length(input_rows + 2), // message prompt, bordered, plus its borders
         Constraint::Length(1),              // settings: ask/agent, model, effort, temp, verbose
         Constraint::Length(1),              // key bindings
@@ -185,9 +193,14 @@ pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usi
     if pending_rows > 0 {
         draw_pending(frame, areas[6], app);
     }
-    draw_input(frame, areas[7], app, scrolled);
-    draw_settings(frame, areas[8], app, tick);
-    draw_keybindings(frame, areas[9], app);
+    if let Some(hint) = &hint {
+        draw_hint(frame, areas[7], hint);
+    }
+    draw_input(frame, areas[8], app, scrolled);
+    draw_settings(frame, areas[9], app, tick);
+    // Tab is only offered while there is something for it to complete.
+    let completing = matches!(hint, Some(CommandHint::Matches { .. }));
+    draw_keybindings(frame, areas[10], app, completing);
 }
 
 /// The blank row between the transcript and the approval box, matching the
@@ -1028,6 +1041,87 @@ fn render_item(
 /// `scrolled` carries the "scrolled — End to follow" notice onto the box's
 /// top border, right-aligned — the same edge the transcript's own border
 /// used to show it on, back when it had one.
+/// The row above the input box while a command is being typed: the names
+/// still matching, or the form of the one already named.
+///
+/// Indented to sit under the box's first column rather than its border, so
+/// a name here lines up with the same name being typed below it.
+fn draw_hint(frame: &mut Frame, area: Rect, hint: &CommandHint) {
+    let spans = match hint {
+        CommandHint::Syntax(syntax) => vec![
+            Span::raw(HINT_INDENT),
+            Span::styled(*syntax, Style::new().dark_gray()),
+        ],
+        CommandHint::Matches { names, active } => match_spans(names, *active, area.width as usize),
+    };
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Lines the row up with the text inside the bordered box below it.
+const HINT_INDENT: &str = " ";
+
+/// As many matching names as the row holds, the one Tab has landed on picked
+/// out in the colour it now wears in the box below.
+///
+/// A list too long for the row says how many it left off: with nothing
+/// there, a bare `/` would look like the session had eight commands. The
+/// window slides to keep the stepped-to name visible, since a mark you
+/// cannot see is the same as no mark.
+fn match_spans(names: &[&'static str], active: Option<usize>, width: usize) -> Vec<Span<'static>> {
+    const GAP: &str = "  ";
+    // What `count` names starting at `from` take up, gaps included.
+    let width_of = |from: usize, count: usize| {
+        HINT_INDENT.len()
+            + names[from..from + count]
+                .iter()
+                .map(|n| n.len())
+                .sum::<usize>()
+            + GAP.len() * count.saturating_sub(1)
+    };
+    // How many fit if the row starts at `from`. Always at least one, since
+    // a row with nothing on it says less than a clipped name does.
+    let fits = |from: usize| {
+        (1..=names.len() - from)
+            .take_while(|count| width_of(from, *count) <= width)
+            .last()
+            .unwrap_or(1)
+    };
+
+    let start = match active {
+        Some(i) if i >= fits(0) => i,
+        _ => 0,
+    };
+    let mut shown = fits(start);
+    // The "+N" costs a name where there isn't room for both.
+    if start + shown < names.len() {
+        let left = names.len() - (start + shown);
+        let marker = GAP.len() + 1 + left.to_string().len();
+        if width_of(start, shown) + marker > width && shown > 1 {
+            shown -= 1;
+        }
+    }
+
+    let mut spans = vec![Span::raw(HINT_INDENT)];
+    for (offset, name) in names[start..start + shown].iter().enumerate() {
+        if offset > 0 {
+            spans.push(Span::raw(GAP));
+        }
+        let style = match active {
+            Some(i) if i == start + offset => COMMAND,
+            _ => Style::new().dark_gray(),
+        };
+        spans.push(Span::styled(*name, style));
+    }
+    let left = names.len() - (start + shown);
+    if left > 0 {
+        spans.push(Span::styled(
+            format!("{GAP}+{left}"),
+            Style::new().dark_gray(),
+        ));
+    }
+    spans
+}
+
 fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
     // While the browser is open the prompt is the filter. Nothing is lost by
     // borrowing it: `/models` was submitted to get here, so the draft was
@@ -1054,7 +1148,7 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
     }
 
     let width = area.width.saturating_sub(2).max(1);
-    let rows = input_lines(&app.input, width);
+    let rows = styled_input_lines(&app.input, width);
     let (cursor_row, cursor_col) = input_cursor(&app.input, app.cursor, width);
 
     // Once the text is taller than the box, follow the cursor rather than
@@ -1077,11 +1171,9 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
 
     // Wrapped by hand rather than by `Wrap`, so the cursor position below is
     // computed against exactly the rows being drawn.
-    let paragraph = Paragraph::new(Text::from(
-        rows.into_iter().map(Line::from).collect::<Vec<_>>(),
-    ))
-    .block(block)
-    .scroll((scroll, 0));
+    let paragraph = Paragraph::new(Text::from(rows))
+        .block(block)
+        .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
 
     frame.set_cursor_position((
@@ -1094,23 +1186,87 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &App, scrolled: bool) {
 /// hard-wrapped at `width`. Hard rather than word wrapping so that a cursor
 /// position can be computed exactly against what's drawn.
 fn input_lines(input: &str, width: u16) -> Vec<String> {
+    input_rows(input, width)
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// The same rows, each paired with the `char` offset into `input` it starts
+/// at, so a span of the input can be found again once it has been wrapped.
+///
+/// The offsets count the newlines the split consumes, and are what let
+/// [`styled_input_lines`] colour a range without wrapping the text a second
+/// time — two wrapping implementations that disagreed would put the colour
+/// somewhere the caret isn't.
+fn input_rows(input: &str, width: u16) -> Vec<(usize, String)> {
     let width = width.max(1) as usize;
     let mut rows = Vec::new();
-    for segment in input.split('\n') {
+    let mut offset = 0usize;
+    for (i, segment) in input.split('\n').enumerate() {
+        // Every split after the first ate a newline to get here.
+        if i > 0 {
+            offset += 1;
+        }
         let chars: Vec<char> = segment.chars().collect();
         if chars.is_empty() {
-            rows.push(String::new());
+            rows.push((offset, String::new()));
             continue;
         }
         for chunk in chars.chunks(width) {
-            rows.push(chunk.iter().collect());
+            rows.push((offset, chunk.iter().collect()));
+            offset += chunk.len();
         }
         // A segment filling the last row exactly puts the caret on the next.
         if chars.len().is_multiple_of(width) {
-            rows.push(String::new());
+            rows.push((offset, String::new()));
         }
     }
     rows
+}
+
+/// What a recognized command looks like in the input box, before it is sent.
+/// Cyan is the colour the rest of the TUI already spends on "this is live" —
+/// the picker's cursor, the model browser's border, the streaming caret.
+const COMMAND: Style = Style::new().fg(Color::Cyan);
+
+/// The input box's rows, with the leading `/command` picked out when what is
+/// typed names one. Feedback while typing rather than after sending: a
+/// message that starts with a slash but isn't a command — a path, a
+/// misspelling — simply stays the colour of ordinary text.
+fn styled_input_lines(input: &str, width: u16) -> Vec<Line<'static>> {
+    let Some(span) = crate::ui::command_span(input) else {
+        return input_lines(input, width)
+            .into_iter()
+            .map(Line::from)
+            .collect();
+    };
+    input_rows(input, width)
+        .into_iter()
+        .map(|(offset, row)| command_row(offset, row, &span))
+        .collect()
+}
+
+/// One wrapped row, split at whatever part of `span` falls inside it.
+/// Everything is clamped to the row, so a row wholly before or after the
+/// span comes back as it went in.
+fn command_row(offset: usize, row: String, span: &std::ops::Range<usize>) -> Line<'static> {
+    let chars: Vec<char> = row.chars().collect();
+    let start = span.start.saturating_sub(offset).min(chars.len());
+    let end = span.end.saturating_sub(offset).min(chars.len());
+    if start >= end {
+        return Line::from(row);
+    }
+    let take = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
+    let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::raw(take(0..start)));
+    }
+    spans.push(Span::styled(take(start..end), COMMAND));
+    if end < chars.len() {
+        spans.push(Span::raw(take(end..chars.len())));
+    }
+    Line::from(spans)
 }
 
 /// Where the caret sits, in the same rows [`input_lines`] produces.
@@ -1217,7 +1373,7 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
 /// Dimmed a step further than the rest of the muted (dark_gray) text
 /// elsewhere, so it recedes into the background rather than competing with
 /// the settings row right above it.
-fn draw_keybindings(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_keybindings(frame: &mut Frame, area: Rect, app: &App, completing: bool) {
     // A shade darker than the plain `dark_gray()` used elsewhere — `.dim()`
     // alone isn't reliable across terminals (some ignore the SGR faint
     // attribute entirely), so the color itself carries the extra dimness.
@@ -1228,6 +1384,11 @@ fn draw_keybindings(frame: &mut Frame, area: Rect, app: &App) {
                 " Ctrl-Y allow · Ctrl-N deny · Enter send · Esc cancel · Ctrl-B back · Ctrl-C quit"
             } else if matches!(app.pending_shell, Some(ShellState::Finished { .. })) {
                 " Ctrl-S send with next message · Ctrl-D discard · Ctrl-B back · Ctrl-C quit"
+            } else if completing {
+                // Scrolling gives up its place rather than the row wrapping:
+                // the keys worth naming are the ones for what is on screen
+                // right now, and the list above is what that is.
+                " Tab complete · Enter send · Esc cancel · Ctrl-B back · Ctrl-C quit"
             } else {
                 " Enter send · Esc cancel · PgUp/PgDn scroll · Ctrl-B back · Ctrl-C quit"
             },
@@ -1881,6 +2042,191 @@ mod tests {
         let approval_at = out.find("Write to disk").expect("approval shown");
         let shell_at = out.find("$ ls").expect("command shown");
         assert!(approval_at < shell_at, "approval sits above: {out}");
+    }
+
+    /// Each span of each row as (text, whether it is coloured as a command),
+    /// which is the whole of what these tests care about.
+    fn marked(input: &str, width: u16) -> Vec<Vec<(String, bool)>> {
+        styled_input_lines(input, width)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| (span.content.to_string(), span.style == COMMAND))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_command_name_is_marked_off_from_its_argument() {
+        assert_eq!(
+            marked("/session title Notes", 40),
+            vec![vec![
+                ("/session".to_string(), true),
+                (" title Notes".to_string(), false),
+            ]]
+        );
+    }
+
+    #[test]
+    fn an_ordinary_message_is_left_alone() {
+        // One unstyled span, not a split one: nothing here is a command, so
+        // there is nothing to divide.
+        assert_eq!(
+            marked("what does /etc/hosts do?", 40),
+            vec![vec![("what does /etc/hosts do?".to_string(), false)]]
+        );
+        assert_eq!(marked("/hel", 40), vec![vec![("/hel".to_string(), false)]]);
+    }
+
+    #[test]
+    fn the_mark_follows_the_name_across_a_wrap() {
+        // The box is narrow enough to split the name itself. The colour has
+        // to break where the row breaks and pick up again, or it lands on
+        // whatever text happens to sit at those columns on the next row.
+        assert_eq!(
+            marked("/session title", 5),
+            vec![
+                vec![("/sess".to_string(), true)],
+                vec![("ion".to_string(), true), (" t".to_string(), false)],
+                vec![("itle".to_string(), false)],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_newline_before_the_command_does_not_shift_the_mark() {
+        // The newline is a character the rows don't show. Uncounted, every
+        // offset after it is one short and the colour slides left.
+        assert_eq!(
+            marked("\n/help me", 40),
+            vec![
+                // The blank row carries no spans at all to style.
+                vec![],
+                vec![("/help".to_string(), true), (" me".to_string(), false)],
+            ]
+        );
+    }
+
+    /// The symbols on the first rendered row containing `needle` that are
+    /// drawn in the command colour, so the wiring into `draw_input` — not
+    /// just the row builder — is what's under test.
+    fn command_coloured_row(app: &App, width: u16, height: u16, needle: &str) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, app, &mut TranscriptCache::default(), 0))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        for y in 0..buffer.area.height {
+            let cells: Vec<_> = (0..buffer.area.width).map(|x| &buffer[(x, y)]).collect();
+            let text: String = cells.iter().map(|c| c.symbol()).collect();
+            if text.contains(needle) {
+                return cells
+                    .iter()
+                    .filter(|c| c.fg == COMMAND.fg.unwrap())
+                    .map(|c| c.symbol())
+                    .collect();
+            }
+        }
+        panic!("{needle} was never drawn");
+    }
+
+    /// The hint row's spans as (text, is-it-the-active-one).
+    fn hint_row(
+        names: &[&'static str],
+        active: Option<usize>,
+        width: usize,
+    ) -> Vec<(String, bool)> {
+        match_spans(names, active, width)
+            .into_iter()
+            .map(|span| (span.content.to_string(), span.style == COMMAND))
+            .collect()
+    }
+
+    #[test]
+    fn a_list_too_long_for_the_row_says_how_much_it_left_off() {
+        // Without the count a bare `/` looks like a session with four
+        // commands in it.
+        let names = ["help", "models", "model", "agent", "ask", "effort"];
+        let text: String = hint_row(&names, None, 22)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        // "model" would fit on its own, but not alongside the count that
+        // says three more are missing, and the count is the load-bearing
+        // half.
+        assert_eq!(text, " help  models  +4");
+    }
+
+    #[test]
+    fn the_row_slides_to_keep_the_stepped_to_name_in_view() {
+        // A mark you cannot see is the same as no mark at all: Tab has
+        // written "effort" into the box, so "effort" has to be on the row.
+        let names = ["help", "models", "model", "agent", "ask", "effort"];
+        let row = hint_row(&names, Some(5), 22);
+        assert!(row.iter().any(|(text, active)| text == "effort" && *active));
+        assert!(!row.iter().any(|(text, _)| text == "help"));
+    }
+
+    #[test]
+    fn the_whole_list_fits_when_the_row_is_wide_enough() {
+        let names = ["models", "model"];
+        assert_eq!(
+            hint_row(&names, Some(1), 40),
+            vec![
+                (" ".to_string(), false),
+                ("models".to_string(), false),
+                ("  ".to_string(), false),
+                ("model".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_row_above_the_box_shows_what_is_being_typed_into_it() {
+        let mut app = sample_app();
+        app.input = "/m".to_string();
+        app.cursor = app.input.len();
+        let out = render_to_string(&app, 74, 16);
+        assert!(out.contains("models  model  max-iterations"), "{out}");
+        // Tab is worth naming only while there is something to complete.
+        assert!(out.contains("Tab complete"), "{out}");
+
+        // Once the name is settled the row turns into the command's form...
+        app.input = "/approval ".to_string();
+        app.cursor = app.input.len();
+        let out = render_to_string(&app, 74, 16);
+        assert!(
+            out.contains("/approval [<read|write|terminal|all>"),
+            "{out}"
+        );
+        assert!(!out.contains("Tab complete"), "{out}");
+
+        // ...and an ordinary message gets no row at all.
+        app.input = "hello there".to_string();
+        app.cursor = app.input.len();
+        let out = render_to_string(&app, 74, 16);
+        assert!(!out.contains("Tab complete"), "{out}");
+        assert!(out.contains("PgUp/PgDn scroll"), "{out}");
+    }
+
+    #[test]
+    fn the_box_shows_a_command_as_a_command_before_it_is_sent() {
+        let mut app = sample_app();
+        app.input = "/effort high".to_string();
+        app.cursor = app.input.len();
+        // Matched on the whole line: the hint row above the box carries the
+        // command's name too, and this is about the box itself.
+        assert_eq!(
+            command_coloured_row(&app, 74, 16, "/effort high"),
+            "/effort"
+        );
+
+        // ...and says nothing about a message that merely starts with one.
+        app.input = "/etc/hosts is the file".to_string();
+        app.cursor = app.input.len();
+        assert_eq!(command_coloured_row(&app, 74, 16, &app.input.clone()), "");
     }
 
     #[test]
@@ -3013,6 +3359,10 @@ mod tests {
             category: "write",
             arguments: "{}".into(),
         });
+        // ...and the hint row has to survive a terminal narrower than the
+        // shortest command name.
+        app.input = "/".to_string();
+        app.cursor = 1;
         for (w, h) in [(1, 1), (3, 2), (10, 4), (20, 5), (200, 60)] {
             let _ = render_to_string(&app, w, h);
         }

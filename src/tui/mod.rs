@@ -1052,6 +1052,10 @@ fn handle_chat_key(app: &mut App, conversation: &Conversation, key: KeyEvent) ->
                 conversation.send(Command::Cancel);
             }
         }
+        // Only ever completes a command name — see `complete_command` — so
+        // Tab stays free for whatever it means to the terminal everywhere
+        // else, and pressing it in the middle of a message does nothing.
+        KeyCode::Tab => app.complete_command(),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Left => app.move_left(),
         KeyCode::Right => app.move_right(),

@@ -1,6 +1,8 @@
-# Manual test plan: the last five commits
+# Manual test plan
 
-`ea6c987` · `204b418` · `8c6a317` · `8adb1a6` · `144e511` (TODO only, nothing to test)
+Started on `ea6c987` · `204b418` · `8c6a317` · `8adb1a6` · `144e511` (TODO
+only, nothing to test); later sections are appended as changes land, so the
+list is no longer five commits long.
 
 Rebuild first — `cargo install --path .`, or run `./target/release/clank`.
 Ordered by how likely each is to be broken, not by how new it is.
@@ -119,7 +121,57 @@ The same root caused a second one worth checking: name a session, back out,
 resume it, and *then* type something. The name you gave it should survive —
 it used to be replaced by one derived from that first message.
 
-## 7. From the round before, worth a glance
+## 7. Commands, as you type them
+
+New: the leading `/command` in the input box turns cyan once it names a real
+command, and a row above the box says what it could still be. Type these
+without pressing Enter and watch the box.
+
+```
+/hel                  plain — not a command yet (the row above the box
+                      does list "help"; that part is the next block)
+/help                 the whole word turns cyan
+/helpful              plain again — a longer word is a different word
+/effort               cyan
+/effort high          the name stays cyan, "high" does not
+/etc/hosts            plain, the case this must never claim
+/mdoel gpt-5          plain — send it and it is still caught as a typo
+```
+
+- Narrow the terminal until `/max-iterations` wraps mid-name. The colour
+  should break where the row breaks and pick up on the next row, under the
+  right characters.
+- Backspace through a lit command — it should go plain the moment the name
+  stops being one, not a keystroke later.
+- `↑` to recall a command from history — it should come back lit.
+
+Then the row above the box, and `Tab`:
+
+```
+/m                    lists: models  model  max-iterations
+Tab                   /models, and "models" is marked on the row
+Tab Tab               /model, then /max-iterations
+Tab                   back round to /models
+/hel then Tab         /help — one match, so it just fills it in
+/te then Tab          /temp — as far as temperature and temp agree,
+                      and no further
+/                     lists as many as fit, then a "+N" count
+Tab × 25              steps through all 21 and round again; the row
+                      should slide so the marked one is always visible
+/approval             the row becomes the command's form
+/approval read on     the form stays up while you type the arguments
+hello                 no row at all
+/etc/hosts            no row at all
+```
+
+- The bottom row should read `Tab complete …` only while there is a list
+  above the box — not while the form is showing, where Tab does nothing.
+- Tab in the middle of an ordinary message must do nothing at all.
+- Tab with the `/models` browser open must do nothing (the browser owns the
+  keyboard; the box is its filter).
+- The line-based `clank session` does none of this, by design.
+
+## 8. From the round before, worth a glance
 
 - **Picker scrolls.** Accumulate more sessions than fit, or shrink the
   terminal. The list should follow the cursor, and the rule above it should

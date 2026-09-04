@@ -648,6 +648,32 @@ fn command_word(trimmed: &str) -> Option<&str> {
     Some(rest.split_whitespace().next().unwrap_or(rest))
 }
 
+/// The stretch of `text` that names a command — the `/` and the word after
+/// it, not its arguments — when that word is one this session knows.
+///
+/// For a front end that can style what is being typed, so a recognized
+/// command looks different from a message before it is sent. It answers the
+/// narrower question than [`classify`] does: whether the *name* is real, not
+/// whether the whole line parses. `/effort` is a command as soon as it is
+/// spelled, and stays one while its value is still being typed — a highlight
+/// that came and went between `/effort` and `/effort high` would flicker at
+/// exactly the moment it is being read.
+///
+/// Measured in `char`s from the start of `text`, since the callers that draw
+/// it work in columns rather than bytes. Leading whitespace is skipped the
+/// same way [`classify`] trims it, so a line that runs is a line that lights
+/// up.
+pub fn command_span(text: &str) -> Option<std::ops::Range<usize>> {
+    let trimmed = text.trim_start();
+    let word = command_word(trimmed)?;
+    if !COMMANDS.iter().any(|c| c.word == word) {
+        return None;
+    }
+    let start = text.chars().count() - trimmed.chars().count();
+    // The slash, then the word.
+    Some(start..start + 1 + word.chars().count())
+}
+
 /// Every in-session command: the word, how it is invoked, what it does, and
 /// whether invoking it wrongly is an error.
 ///
@@ -805,6 +831,38 @@ const COMMANDS: [Command; 21] = [
         usage: None,
     },
 ];
+
+/// The name a line is still in the middle of typing: `"eff"` for `"/eff"`,
+/// `""` for a bare `"/"`.
+///
+/// `None` once the line has moved past the name — a space after it settles
+/// which command it is — and for anything that isn't a `/` line at all. That
+/// is the whole of what completion may rewrite: a name mid-typing, never an
+/// argument, and never prose.
+pub fn command_prefix(text: &str) -> Option<&str> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    (!rest.contains(char::is_whitespace)).then_some(rest)
+}
+
+/// Every command name starting with `prefix`, in the order [`help_rows`]
+/// lists them, so what completion offers and what `/help` prints read the
+/// same way down the screen.
+pub fn command_matches(prefix: &str) -> Vec<&'static str> {
+    COMMANDS
+        .iter()
+        .map(|c| c.word)
+        .filter(|word| word.starts_with(prefix))
+        .collect()
+}
+
+/// The form of whatever command `text` names, for showing above the box
+/// while its arguments are typed. The same string `/help` lists, rather than
+/// the terser one an error quotes: this is a reminder of the shape, not a
+/// complaint that the shape was got wrong.
+pub fn command_syntax(text: &str) -> Option<&'static str> {
+    let word = command_word(text.trim_start())?;
+    COMMANDS.iter().find(|c| c.word == word).map(|c| c.syntax)
+}
 
 /// The commands as `/help` shows them: how to type it, and what it does.
 pub fn help_rows() -> Vec<(String, String)> {
@@ -1134,6 +1192,93 @@ mod tests {
             classify("/modelling is fun"),
             Submission::Message("/modelling is fun".to_string())
         );
+    }
+
+    #[test]
+    fn a_command_span_covers_the_name_and_nothing_else() {
+        // The name only: the value is still being typed, and colouring it
+        // would say the whole line had been understood.
+        assert_eq!(command_span("/effort high"), Some(0..7));
+        assert_eq!(command_span("/help"), Some(0..5));
+        // Trimmed the same way `classify` trims, so what lights up and what
+        // runs agree.
+        assert_eq!(command_span("  /help"), Some(2..7));
+    }
+
+    #[test]
+    fn a_command_span_holds_off_until_the_name_is_real() {
+        // Mid-word, before it names anything.
+        assert_eq!(command_span("/hel"), None);
+        // Past it: a longer word is a different word.
+        assert_eq!(command_span("/helpful"), None);
+        // Paths are the case this must never claim.
+        assert_eq!(command_span("/etc/hosts"), None);
+        assert_eq!(command_span("/usr/bin/env"), None);
+        // A slash anywhere but the front is just prose.
+        assert_eq!(command_span("what does /help do"), None);
+        assert_eq!(command_span("hello"), None);
+        assert_eq!(command_span("/"), None);
+    }
+
+    #[test]
+    fn a_command_prefix_is_only_ever_the_name_being_typed() {
+        assert_eq!(command_prefix("/eff"), Some("eff"));
+        assert_eq!(command_prefix("  /eff"), Some("eff"));
+        // A bare slash is a name nothing has been typed into yet.
+        assert_eq!(command_prefix("/"), Some(""));
+        // Past the name: the space settled which command it is, and there
+        // is nothing left here to complete.
+        assert_eq!(command_prefix("/effort hi"), None);
+        assert_eq!(command_prefix("/effort "), None);
+        assert_eq!(command_prefix("hello"), None);
+        assert_eq!(command_prefix("$ ls"), None);
+    }
+
+    #[test]
+    fn matches_are_offered_in_the_order_help_prints_them() {
+        // Two lists in different orders would read as two different sets.
+        assert_eq!(command_matches("mo"), ["models", "model"]);
+        assert_eq!(command_matches("temp"), ["temperature", "temp"]);
+        assert_eq!(command_matches("help"), ["help"]);
+        assert!(command_matches("nonesuch").is_empty());
+        assert_eq!(command_matches("").len(), COMMANDS.len());
+    }
+
+    #[test]
+    fn the_syntax_shown_is_the_one_help_lists() {
+        assert_eq!(command_syntax("/model"), Some("/model [name]"));
+        // Read off the name, whatever is being typed after it.
+        assert_eq!(
+            command_syntax("/model anthropic/opus"),
+            Some("/model [name]")
+        );
+        assert_eq!(command_syntax("/etc/hosts"), None);
+        assert_eq!(command_syntax("hello"), None);
+    }
+
+    #[test]
+    fn every_command_help_lists_can_be_seen_as_you_type_it() {
+        // The two would drift apart silently: a command added to `COMMANDS`
+        // but matched by a hand-written list here would work, list itself in
+        // `/help`, and stay stubbornly uncoloured in the box.
+        for (syntax, _) in help_rows() {
+            let word = syntax.split_whitespace().next().unwrap().to_string();
+            assert_eq!(
+                command_span(&word),
+                Some(0..word.chars().count()),
+                "{syntax} does not light up"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_span_counts_characters_not_bytes() {
+        // The callers draw in columns. A non-breaking space is one column
+        // and two bytes, and `trim_start` counts it as whitespace — so this
+        // does name a command, and measured in bytes the span would land a
+        // column to the right of the word it belongs to.
+        assert_eq!(classify("\u{a0}/help"), Submission::ShowHelp);
+        assert_eq!(command_span("\u{a0}/help"), Some(1..6));
     }
 
     #[test]
