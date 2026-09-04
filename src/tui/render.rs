@@ -56,6 +56,33 @@ pub(super) fn home_relative(dir: &str) -> String {
     }
 }
 
+/// FNV-1a, 64-bit. The mark has to be identical in every process that draws
+/// this session, so it can come from nothing but the id, and the wider hash
+/// leaves room to slice a half, a half and a colour out of independent bits.
+fn identicon_hash(seed: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The two braille cells of a session's mark, without a colour.
+///
+/// Split out for the CLI, which paints with `colored` rather than ratatui and
+/// so cannot take the `Style` its sibling returns. Braille specifically
+/// because every pattern in that block is East Asian Width Neutral — the `●`
+/// the CLI drew before is Ambiguous, and some terminals give it two cells,
+/// which shifts every wrapped line under it out of line with the gutter.
+pub(crate) fn identicon_mark(seed: &str) -> String {
+    let hash = identicon_hash(seed);
+    let half = |bits: u64| {
+        let pattern = MARK_PATTERNS[bits as usize % MARK_PATTERNS.len()];
+        char::from_u32(0x2800 + u32::from(pattern)).unwrap_or('?')
+    };
+    format!("{}{}", half(hash), half(hash >> 12))
+}
+
 /// A mark: a square of braille dots derived from `seed`, and the same every
 /// time for the same seed.
 ///
@@ -64,39 +91,8 @@ pub(super) fn home_relative(dir: &str) -> String {
 /// refreshes under you, with rows moving as sessions are touched, is easier
 /// to keep your place in when the row you were watching carries the same
 /// mark it had a moment ago.
-/// The two braille cells of a session's mark, without a colour.
-///
-/// Split out for the CLI, which paints with `colored` rather than ratatui
-/// and so cannot take the `Style` its sibling returns. The glyph is the part
-/// that has to agree between front ends anyway: it is what identifies the
-/// session, and it is braille specifically because every pattern in that
-/// block is East Asian Width Neutral — the `●` this replaced is Ambiguous,
-/// which some terminals draw two cells wide, shifting every wrapped line
-/// under it out of alignment with the gutter.
-pub(crate) fn identicon_mark(seed: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in seed.bytes() {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let half = |bits: u64| {
-        let pattern = MARK_PATTERNS[bits as usize % MARK_PATTERNS.len()];
-        char::from_u32(0x2800 + u32::from(pattern)).unwrap_or('?')
-    };
-    format!("{}{}", half(hash), half(hash >> 12))
-}
-
 pub(super) fn identicon(seed: &str) -> (String, Style) {
-    // FNV-1a, 64-bit: the mark has to be identical in every process that
-    // draws this session, so it can come from nothing but the id, and the
-    // wider hash leaves room to slice a half, a half and a colour out of
-    // independent bits.
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in seed.bytes() {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-
-    let fg = IDENTICON_FG[(hash >> 24) as usize % IDENTICON_FG.len()];
-
+    let fg = IDENTICON_FG[(identicon_hash(seed) >> 24) as usize % IDENTICON_FG.len()];
     (identicon_mark(seed), Style::new().fg(Color::Indexed(fg)))
 }
 

@@ -292,7 +292,7 @@ clank approval all on        # Prompt for all actions
 **Per-session approval.** These commands set the default new sessions start
 with. A session remembers its own approval settings too: running `/approval`
 inside it (see [`session`](#session) or [the full-screen
-UI](#clank-with-no-command--the-full-screen-ui)) switches and records
+UI](#clank-with-no-command)) switches and records
 them for that session alone, the same way `/model` does for models — so
 resuming later with no override picks up where you left off rather than
 reverting to the configured default.
@@ -419,7 +419,7 @@ two sets of turns into a history neither of them wrote. The claim expires by
 itself, so a session whose runner died is available again with nothing to
 clean up.
 
-#### `clank` with no command — the full-screen UI
+#### `clank` with no command
 A full-screen terminal UI. Unlike the line-based `session`, it owns the
 screen, which is what lets the input box stay live while a reply streams in,
 tool approvals appear inline, and a running turn be interrupted. Otherwise
@@ -451,9 +451,15 @@ Every session carries a small square of braille dots, hashed from its id and
 the same for the life of the session. It says nothing you can type — the
 session id isn't shown on the launch screen at all — and exists purely so a
 row you have seen before is recognisable while the list refreshes and rows
-move under you. The same mark, in a single cell, is the gutter glyph beside
-every reply once you're inside that session, so the conversation you're
-reading is tied to the row you picked.
+move under you. The same mark is the gutter glyph beside every reply once
+you're inside that session, and the CLI's `session` and `agent` draw it too,
+so a reply is tied to the session it came from wherever you read it.
+
+A session being run by another process can be seen but not opened: only one
+process may hold a session at a time, since two appending turns to one
+history would interleave them irreparably. Opening one says so. The hold is
+released when that process finishes, and expires by itself within half a
+minute if it died instead.
 
 Each row also shows what that session is doing, re-read every couple of
 seconds so one you're running in another terminal stays current:
@@ -901,7 +907,10 @@ Each session gets an id (a UUID) and a title derived from your first message (or
 - `clank session --resume <id>` to continue a saved session — works for one currently in ask mode or agent mode alike, since mode is just session state now, not a separate command
 - `clank session --resume` with no id to pick one from a numbered list of all your saved sessions
 
-Any unique prefix of a session's id works wherever a full id is expected.
+Any unique prefix of a session's id works wherever a full id is expected. A
+prefix matching more than one session is refused, and the candidates listed
+with their titles — `sessions delete` resolves ids the same way, so guessing
+between them would eventually delete the wrong conversation.
 
 ## Examples
 
