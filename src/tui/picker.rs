@@ -137,8 +137,14 @@ fn state_badge(state: LastState, held: bool, tick: usize) -> (String, Style) {
     // idle at a prompt in another terminal, which looks openable and isn't
     // — so it gets a glyph of its own rather than a `✓` you can't act on.
     if held && !matches!(state, LastState::Working | LastState::AwaitingApproval) {
+        // A screen, because that is the fact: another terminal has it open.
+        // Not a padlock — every lock glyph (🔒 🔓 🔏 🔐) is East Asian Width
+        // *Wide*, and `⚿` is *Ambiguous*, so any of them would push this row
+        // a column right of the others on some terminals and not on
+        // others. If the font lacks this one it draws tofu, which is ugly
+        // but still one cell, so the column survives either way.
         return (
-            format!("{:<BADGE_WIDTH$}", "⧉"),
+            format!("{:<BADGE_WIDTH$}", "⎚"),
             Style::new().dark_gray().bold(),
         );
     }

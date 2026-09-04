@@ -471,7 +471,7 @@ seconds so one you're running in another terminal stays current:
 | `?` yellow | Waiting on an approval nobody has answered |
 | `✗` red | The last turn ended in an error — worth resuming to see why |
 | `✓` green | The model answered; the turn ran to completion |
-| `⧉` grey | Held by another process — it can be seen but not opened. Only shown when nothing else already implies a live process: a working or waiting session says so with its own badge |
+| `⎚` grey | Held by another process — it can be seen but not opened. Only shown when nothing else already implies a live process: a working or waiting session says so with its own badge |
 | `⋯` cyan | Something was sent and nothing came back, and no process is saying otherwise |
 | `⚑` yellow | Stopped part-way — after a tool result with no answer, or on a tool call that never ran |
 | (blank) | Created, never used |
