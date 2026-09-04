@@ -171,7 +171,7 @@ fn open_new(context: &Context, agentic: bool, title: String) -> Result<Chat> {
         })?;
     }
 
-    Ok(start_chat(context, session, Vec::new(), agentic))
+    start_chat(context, session, Vec::new(), agentic)
 }
 
 fn open_resumed(context: &Context, summary: &SessionSummary) -> Result<Chat> {
@@ -185,7 +185,7 @@ fn open_resumed(context: &Context, summary: &SessionSummary) -> Result<Chat> {
     // is reported in the transcript and the session opens where it is —
     // loudly, because its bound is now the wrong one.
     let entered = session::enter_working_dir(&session)?;
-    let mut chat = start_chat(context, session, history, agentic);
+    let mut chat = start_chat(context, session, history, agentic)?;
     match entered {
         session::EnteredDir::Moved(dir) => chat
             .app
@@ -240,15 +240,30 @@ fn open_row_here(context: &Context, row: &SessionRow) -> Result<Chat> {
         session.set_working_dir(cwd)?;
     }
     let agentic = summary.kind == KIND_AGENT_CHAT;
-    Ok(start_chat(context, session, history, agentic))
+    start_chat(context, session, history, agentic)
 }
 
+/// Builds the chat screen for a session this process has taken.
+///
+/// Claims first, and refuses if the claim is already held: two processes
+/// appending turns to one history write colliding `seq` values, which reload
+/// as a conversation with its turns shuffled and its tool results detached
+/// from the calls they answer. Nothing detects that and nothing repairs it,
+/// so it has to be prevented rather than warned about.
 fn start_chat(
     context: &Context,
     session: ChatSession,
     history: Vec<StoredMessage>,
     agentic: bool,
-) -> Chat {
+) -> Result<Chat> {
+    let Some(claim) = crate::session::Heartbeat::claim(session.id().to_string())? else {
+        anyhow::bail!(
+            "Session {} is open in another terminal.\n\n\
+             Close it there, or wait — a claim left behind by a process that \
+             died expires on its own within half a minute.",
+            &session.id()[..8]
+        );
+    };
     let mut app = App::new(
         session.model().to_string(),
         session.effort_level().map(str::to_string),
@@ -275,12 +290,13 @@ fn start_chat(
         context.temperature,
         context.effort_level.clone(),
         agentic,
+        claim,
     );
-    Chat {
+    Ok(Chat {
         app,
         conversation,
         transcript_cache: render::TranscriptCache::default(),
-    }
+    })
 }
 
 /// Replays a resumed session into the transcript so the TUI opens showing

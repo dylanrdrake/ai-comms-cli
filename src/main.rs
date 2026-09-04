@@ -1586,13 +1586,20 @@ async fn cmd_session(
     // Lets a CLI session report approvals the way a TUI one does — the
     // prompt blocks on stdin, so without this it would look merely busy to
     // anyone watching the picker.
-    match terminal_ui::ActivityWriter::new(session.id().to_string()) {
-        Ok(activity) => ui.watch(activity),
-        // Not being watchable is no reason to refuse to run.
-        Err(e) => eprintln!(
-            "{} Session activity won't be reported: {e}",
-            "note:".bright_black()
+    // The claim, not merely the reporting: two processes appending turns to
+    // one history write colliding `seq` values, and the result reloads as a
+    // conversation with its turns shuffled and its tool results detached
+    // from the calls they answer. Nothing detects that and nothing repairs
+    // it, so a session that cannot be claimed is not run.
+    match terminal_ui::ActivityWriter::claim(session.id().to_string()) {
+        Ok(Some(activity)) => ui.watch(activity),
+        Ok(None) => anyhow::bail!(
+            "Session {} is already being run by another process.\n\n\
+             Wait for it to finish. A claim left behind by a process that \
+             died expires on its own within half a minute.",
+            session.short_id()
         ),
+        Err(e) => anyhow::bail!("Could not claim session {}: {e}", session.short_id()),
     }
 
     loop {
@@ -1726,7 +1733,7 @@ fn open_agent_session(
     effort_level: Option<String>,
     session: bool,
     resume: Option<String>,
-) -> Result<Option<ChatSession>> {
+) -> Result<Option<(ChatSession, terminal_ui::ActivityWriter)>> {
     if !session && resume.is_none() {
         return Ok(None);
     }
@@ -1736,19 +1743,21 @@ fn open_agent_session(
     if let Some(id_or_prefix) = resume {
         let summary = resolve_resume_target(&conn, &id_or_prefix)?;
 
-        // Two processes appending to one session interleave their turns into
-        // a history neither of them wrote, and the loser of the race is
-        // usually the detached one nobody is watching. A heartbeat is the
-        // only evidence available, and it expires on its own — so a session
-        // whose runner died is claimable again without anything to clean up.
-        if store::heartbeat_is_live(summary.heartbeat) {
+        // Claimed before the history is read, not after: the claim is one
+        // conditional write, so nothing can slip between deciding the
+        // session is free and taking it. Two processes appending to one
+        // history write colliding `seq` values, and the result reloads as a
+        // conversation with its turns shuffled and its tool results detached
+        // from the calls they answer — unrepairable, and silent.
+        let Some(activity) = terminal_ui::ActivityWriter::claim(summary.id.clone())? else {
             anyhow::bail!(
                 "Session {} is already being run by another process.\n\n\
                  Wait for it to finish, or start a separate run with \
-                 `--session` instead of appending to this one.",
+                 `--session` instead of appending to this one. A claim left \
+                 behind by a process that died expires within half a minute.",
                 summary.id
             );
-        }
+        };
         for (flag, given) in [
             ("--model", model.is_some()),
             ("--max-iterations", max_iterations.is_some()),
@@ -1797,7 +1806,7 @@ fn open_agent_session(
             session.short_id(),
             session.title()
         );
-        return Ok(Some(session));
+        return Ok(Some((session, activity)));
     }
 
     let session = ChatSession::create(
@@ -1816,6 +1825,11 @@ fn open_agent_session(
             .ok()
             .map(|dir| dir.display().to_string()),
     )?;
+    // Nothing else can be holding a session created a line ago, but it goes
+    // through the same claim so that every path out of here owns one.
+    let Some(activity) = terminal_ui::ActivityWriter::claim(session.id().to_string())? else {
+        anyhow::bail!("Could not claim the session just created");
+    };
     // No title is set, which leaves it eligible for the usual
     // derive-from-first-message step — and the first message is the task, so
     // the picker names the session after the work rather than "Untitled".
@@ -1825,7 +1839,7 @@ fn open_agent_session(
         session.short_id(),
         session.short_id()
     );
-    Ok(Some(session))
+    Ok(Some((session, activity)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1841,7 +1855,7 @@ async fn cmd_agent(
 ) -> Result<()> {
     let config = load_config()?;
 
-    let mut stored = open_agent_session(
+    let stored = open_agent_session(
         &config,
         model.clone(),
         max_iterations,
@@ -1855,7 +1869,7 @@ async fn cmd_agent(
     // merge only applies to a run that has no session to remember anything.
     let (model, max_iterations, temperature, effort_level, approval, sandbox, stream) =
         match &stored {
-            Some(session) => (
+            Some((session, _)) => (
                 session.model().to_string(),
                 session.max_iterations(),
                 session.temperature(),
@@ -1885,7 +1899,7 @@ async fn cmd_agent(
 
     let gates = SessionGates::new(approval, sandbox);
 
-    let Some(session) = &mut stored else {
+    let Some((mut session, activity)) = stored else {
         agent::run_agent(
             &client,
             &mut ui,
@@ -1904,14 +1918,7 @@ async fn cmd_agent(
     // Reports Working/Failed to the picker, which is the whole point of
     // running with a session: a detached task is otherwise invisible until
     // it finishes.
-    match terminal_ui::ActivityWriter::new(session.id().to_string()) {
-        Ok(activity) => ui.watch(activity),
-        // Not being watchable is no reason to refuse to run.
-        Err(e) => eprintln!(
-            "{} Session activity won't be reported: {e}",
-            "note:".bright_black()
-        ),
-    }
+    ui.watch(activity);
 
     session.push_user(task.to_string());
     if let Err(e) = session.persist_pending() {

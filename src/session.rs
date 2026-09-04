@@ -35,44 +35,61 @@ use std::path::Path;
 pub struct Heartbeat {
     conn: Connection,
     session_id: String,
-    ticker: tokio::task::JoinHandle<()>,
+    /// Identifies this claim, so renewing and releasing only ever touch a
+    /// claim this process actually holds. Random per claim rather than a
+    /// PID, which the OS reuses.
+    owner: String,
+    /// `None` when there is no Tokio runtime to tick on. The claim is still
+    /// real — it just expires on its own instead of being renewed.
+    ticker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Heartbeat {
-    /// Claims the session and starts ticking. Stamps once up front, so the
-    /// claim is visible immediately rather than an interval from now.
+    /// Takes the session for this process, or reports that someone else has
+    /// it. `Ok(None)` means a live claim is already held.
     ///
-    /// Returns `None` outside a Tokio runtime, which is the case in tests
-    /// that build a session without one — a missing heartbeat reads as "not
-    /// running", so the worst it costs is a row that understates itself.
-    pub fn start(session_id: String) -> Result<Option<Self>> {
-        if tokio::runtime::Handle::try_current().is_err() {
+    /// The claim is a single conditional write, so it cannot be split into a
+    /// check and a take. Only the renewal below needs a runtime, which is why
+    /// the claim itself is attempted unconditionally: a test without a
+    /// runtime still gets a real claim, and simply lets it lapse.
+    pub fn claim(session_id: String) -> Result<Option<Self>> {
+        let owner = uuid::Uuid::new_v4().to_string();
+        let conn = store::open_db()?;
+        if !store::claim_session(&conn, &session_id, &owner)? {
             return Ok(None);
         }
 
-        let conn = store::open_db()?;
-        store::touch_session_heartbeat(&conn, &session_id)?;
-
         // Its own handle: this writes on a timer, from a task, while the
         // caller's connection is busy with whatever the turn is doing.
-        let ticking = store::open_db()?;
-        let id = session_id.clone();
-        let ticker = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(store::HEARTBEAT_INTERVAL);
-            loop {
-                interval.tick().await;
-                if store::touch_session_heartbeat(&ticking, &id).is_err() {
-                    // A failed stamp is not worth stopping over: the next
-                    // tick may well succeed, and the cost of being wrong is
-                    // a row that briefly looks abandoned.
-                    continue;
+        let ticker = if tokio::runtime::Handle::try_current().is_ok() {
+            let ticking = store::open_db()?;
+            let id = session_id.clone();
+            let mine = owner.clone();
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(store::HEARTBEAT_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    match store::renew_session_claim(&ticking, &id, &mine) {
+                        // Starved past the stale window, and the session has
+                        // been taken by someone else. Stop renewing rather
+                        // than stamping over a claim that is no longer ours.
+                        Ok(false) => break,
+                        Ok(true) => {}
+                        // A failed write proves nothing; the next tick may
+                        // well succeed, and the cost of being wrong for one
+                        // interval is a row that briefly looks abandoned.
+                        Err(_) => {}
+                    }
                 }
-            }
-        });
+            }))
+        } else {
+            None
+        };
 
         Ok(Some(Heartbeat {
             conn,
             session_id,
+            owner,
             ticker,
         }))
     }
@@ -80,11 +97,14 @@ impl Heartbeat {
 
 impl Drop for Heartbeat {
     fn drop(&mut self) {
-        self.ticker.abort();
+        if let Some(ticker) = &self.ticker {
+            ticker.abort();
+        }
         // Best-effort, and only an optimisation: it makes a clean exit
         // register at once instead of after the staleness window. The exits
-        // this whole mechanism exists for never reach here at all.
-        let _ = store::clear_session_heartbeat(&self.conn, &self.session_id);
+        // this whole mechanism exists for never reach here at all. Scoped to
+        // our own claim, so a late exit cannot release someone else's.
+        let _ = store::release_session_claim(&self.conn, &self.session_id, &self.owner);
     }
 }
 

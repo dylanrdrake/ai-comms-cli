@@ -14,8 +14,13 @@ use colored::*;
 use std::future::Future;
 use std::io::{self, Write};
 
-/// Writes what the session is doing while a turn runs, for anything watching
-/// the list of sessions.
+/// Holds the session for this process, and writes what it is doing while a
+/// turn runs, for anything watching the list of sessions.
+///
+/// The two jobs travel together because they have the same lifetime, but
+/// they are not equally optional: reporting is a courtesy, while the claim is
+/// what stops a second process appending turns to the same history. See
+/// [`Self::claim`].
 ///
 /// Holds its own database handle rather than borrowing the session: the turn
 /// already has that borrowed mutably for the whole call, and an approval
@@ -23,19 +28,30 @@ use std::io::{self, Write};
 pub struct ActivityWriter {
     conn: rusqlite::Connection,
     session_id: String,
-    /// Held, not used: it ticks on its own and gives up the claim when this
-    /// writer is dropped. Without it every activity written below would go
-    /// stale after its window and stop being believed.
-    _heartbeat: Option<crate::session::Heartbeat>,
+    /// Held, not used: it renews while this writer is alive and gives the
+    /// claim up when it drops.
+    _claim: crate::session::Heartbeat,
 }
 
 impl ActivityWriter {
-    pub fn new(session_id: String) -> Result<Self> {
-        Ok(ActivityWriter {
+    /// Claims the session, returning `Ok(None)` if another live process
+    /// already holds it.
+    ///
+    /// A caller must not run the session without one of these. Two processes
+    /// appending to one history write colliding `seq` values, and the result
+    /// reloads as a conversation whose turns are shuffled and whose tool
+    /// results no longer follow the calls they answer — which most providers
+    /// reject outright, so the session stops being resumable at all. Nothing
+    /// detects it and nothing repairs it.
+    pub fn claim(session_id: String) -> Result<Option<Self>> {
+        let Some(claim) = crate::session::Heartbeat::claim(session_id.clone())? else {
+            return Ok(None);
+        };
+        Ok(Some(ActivityWriter {
             conn: crate::store::open_db()?,
-            _heartbeat: crate::session::Heartbeat::start(session_id.clone())?,
             session_id,
-        })
+            _claim: claim,
+        }))
     }
 
     fn set(&self, activity: Option<crate::store::Activity>, detail: Option<&str>) {

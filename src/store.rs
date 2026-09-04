@@ -173,6 +173,10 @@ pub fn open_db() -> Result<Connection> {
     ensure_column(&conn, "sessions", "verbose", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "sessions", "max_iterations", "INTEGER")?;
     ensure_column(&conn, "sessions", "temperature", "REAL")?;
+    // Who holds the session, so a claim can only be renewed or released by
+    // the process that took it. Null on rows written before claims existed,
+    // which reads as unheld — correct, since no live process owns them.
+    ensure_column(&conn, "sessions", "claim_owner", "TEXT")?;
     ensure_column(
         &conn,
         "sessions",
@@ -638,32 +642,51 @@ pub fn heartbeat_is_live(heartbeat: Option<i64>) -> bool {
     heartbeat.is_some_and(|beat| now() - beat < HEARTBEAT_STALE_AFTER)
 }
 
-/// Stamps the session as still being run, right now.
+/// Takes the session for this process, if nobody live holds it.
 ///
-/// Deliberately separate from [`set_session_activity`]: activity changes at
-/// the edges of a turn, while this has to keep ticking through the long
-/// middle of one — and through an approval prompt, where the process is alive
-/// and waiting rather than working.
+/// One statement, so the check and the claim cannot be separated. Reading
+/// the heartbeat first and stamping afterwards left a window wide enough for
+/// two `--resume`s to both decide the session was free — and two processes
+/// on one session write colliding `seq` values, which reload as a
+/// conversation with its turns shuffled and its tool results detached from
+/// the calls they answer. That is unrepairable, and nothing reports it.
 ///
-/// Does not touch `updated_at`, for the same reason activity doesn't: it
-/// would reorder the list under the cursor of anyone watching.
-pub fn touch_session_heartbeat(conn: &Connection, session_id: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE sessions SET heartbeat = ?1 WHERE id = ?2",
-        params![now(), session_id],
+/// Returns whether the claim was taken. A stale heartbeat is claimable: a
+/// process killed outright never gets to release, so the claim has to expire
+/// on its own or a crash would lock the session for good.
+pub fn claim_session(conn: &Connection, session_id: &str, owner: &str) -> Result<bool> {
+    let taken = conn.execute(
+        "UPDATE sessions SET heartbeat = ?1, claim_owner = ?2 \
+         WHERE id = ?3 AND (heartbeat IS NULL OR heartbeat < ?4)",
+        params![now(), owner, session_id, now() - HEARTBEAT_STALE_AFTER],
     )?;
-    Ok(())
+    Ok(taken == 1)
 }
 
-/// Gives up the claim on a session, on the way out of a clean exit.
+/// Re-stamps a claim this process holds, reporting whether it still holds it.
 ///
-/// Only makes the common case immediate — the stale check is what actually
-/// makes this correct, since the exits that matter here are the ones that
-/// never run any cleanup.
-pub fn clear_session_heartbeat(conn: &Connection, session_id: &str) -> Result<()> {
+/// Scoped to the owner because a process starved past the stale window loses
+/// the session to whoever takes it next. Re-stamping unconditionally would
+/// let the revived one carry on writing into a session it no longer owns,
+/// which is the collision the claim exists to prevent, arrived at the long
+/// way round.
+pub fn renew_session_claim(conn: &Connection, session_id: &str, owner: &str) -> Result<bool> {
+    let held = conn.execute(
+        "UPDATE sessions SET heartbeat = ?1 WHERE id = ?2 AND claim_owner = ?3",
+        params![now(), session_id, owner],
+    )?;
+    Ok(held == 1)
+}
+
+/// Gives up a claim, if it is still this process's to give up.
+///
+/// Also owner-scoped: a zombie that exits after being declared stale must not
+/// clear the claim of whoever has since taken the session.
+pub fn release_session_claim(conn: &Connection, session_id: &str, owner: &str) -> Result<()> {
     conn.execute(
-        "UPDATE sessions SET heartbeat = NULL WHERE id = ?1",
-        params![session_id],
+        "UPDATE sessions SET heartbeat = NULL, claim_owner = NULL \
+         WHERE id = ?1 AND claim_owner = ?2",
+        params![session_id, owner],
     )?;
     Ok(())
 }
@@ -1128,6 +1151,7 @@ mod tests {
                 activity           TEXT,
                 activity_detail    TEXT,
                 heartbeat          INTEGER,
+                claim_owner        TEXT,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -1647,6 +1671,93 @@ mod tests {
         let conn = memory_db();
         two_sharing_a_prefix(&conn);
         assert!(find_session(&conn, "ffff").unwrap().is_none());
+    }
+
+fn claimable_session(conn: &Connection) -> String {
+        create_session(
+            conn, "m", KIND_AGENT_CHAT, None, Some(20), Some(0.7),
+            &ApprovalSettings::default(), true, false, true, true, None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_second_claim_on_a_held_session_is_refused() {
+        let conn = memory_db();
+        let id = claimable_session(&conn);
+        assert!(claim_session(&conn, &id, "first").unwrap());
+        assert!(
+            !claim_session(&conn, &id, "second").unwrap(),
+            "two processes must not both hold one session"
+        );
+    }
+
+    #[test]
+    fn a_claim_nobody_is_renewing_can_be_taken_over() {
+        // A process killed outright never releases, so the claim has to
+        // expire or a crash would lock the session for good.
+        let conn = memory_db();
+        let id = claimable_session(&conn);
+        assert!(claim_session(&conn, &id, "dead").unwrap());
+        conn.execute(
+            "UPDATE sessions SET heartbeat = ?1 WHERE id = ?2",
+            params![now() - HEARTBEAT_STALE_AFTER - 1, id],
+        )
+        .unwrap();
+
+        assert!(claim_session(&conn, &id, "next").unwrap());
+    }
+
+    #[test]
+    fn a_zombie_cannot_renew_a_claim_it_has_lost() {
+        // Starved past the window, then revived: renewing unconditionally
+        // would stamp over the process that has since taken the session, and
+        // both would then write to one history.
+        let conn = memory_db();
+        let id = claimable_session(&conn);
+        claim_session(&conn, &id, "zombie").unwrap();
+        conn.execute(
+            "UPDATE sessions SET heartbeat = ?1 WHERE id = ?2",
+            params![now() - HEARTBEAT_STALE_AFTER - 1, id],
+        )
+        .unwrap();
+        claim_session(&conn, &id, "successor").unwrap();
+
+        assert!(
+            !renew_session_claim(&conn, &id, "zombie").unwrap(),
+            "the zombie must be told it no longer holds the session"
+        );
+        assert!(renew_session_claim(&conn, &id, "successor").unwrap());
+    }
+
+    #[test]
+    fn a_zombie_cannot_release_someone_elses_claim() {
+        // The same zombie exiting late: an unconditional clear would hand
+        // the session away while its new owner is mid-turn.
+        let conn = memory_db();
+        let id = claimable_session(&conn);
+        claim_session(&conn, &id, "zombie").unwrap();
+        conn.execute(
+            "UPDATE sessions SET heartbeat = ?1 WHERE id = ?2",
+            params![now() - HEARTBEAT_STALE_AFTER - 1, id],
+        )
+        .unwrap();
+        claim_session(&conn, &id, "successor").unwrap();
+
+        release_session_claim(&conn, &id, "zombie").unwrap();
+        assert!(
+            !claim_session(&conn, &id, "opportunist").unwrap(),
+            "the successor's claim survived the zombie's exit"
+        );
+    }
+
+    #[test]
+    fn releasing_a_claim_frees_the_session_at_once() {
+        let conn = memory_db();
+        let id = claimable_session(&conn);
+        claim_session(&conn, &id, "first").unwrap();
+        release_session_claim(&conn, &id, "first").unwrap();
+        assert!(claim_session(&conn, &id, "second").unwrap());
     }
 
     #[test]

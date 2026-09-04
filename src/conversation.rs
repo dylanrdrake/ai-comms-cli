@@ -289,18 +289,17 @@ impl Conversation {
         temperature: Option<f32>,
         effort_level_default: Option<String>,
         agentic: bool,
+        claim: crate::session::Heartbeat,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let worker = Worker {
             client,
-            // Started before the session moves in, since it needs the id.
-            // A failure here costs the row its liveness, not the session:
-            // there is no reason to refuse to run over it.
-            _heartbeat: crate::session::Heartbeat::start(session.id().to_string())
-                .ok()
-                .flatten(),
+            // Taken by the caller, before it committed to opening the
+            // session at all: without it two processes append turns to one
+            // history, and the claim is the only thing that prevents it.
+            _claim: claim,
             // Built before the session moves in, and shared with every turn
             // this worker spawns so a mid-turn `/approval` reaches it.
             gates: SessionGates::new(session.approval().clone(), session.sandbox()),
@@ -370,11 +369,10 @@ struct Worker {
     /// request has no seam to inject at, so ask mode queues instead.
     steering: Steering,
     events: mpsc::UnboundedSender<Event>,
-    /// Held, not used: it ticks while this worker is alive and gives up the
-    /// claim when the worker ends. Every `set_activity` below is a statement
-    /// about a live process, and this is what backs that up — without it the
-    /// TUI's own sessions would go stale in the picker mid-turn.
-    _heartbeat: Option<crate::session::Heartbeat>,
+    /// Held, not used: it renews while this worker is alive and gives the
+    /// claim up when the worker ends. Every `set_activity` below is a
+    /// statement about a live process, and this is what backs that up.
+    _claim: crate::session::Heartbeat,
 }
 
 impl Worker {
