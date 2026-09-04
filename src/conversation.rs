@@ -294,6 +294,8 @@ impl Conversation {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
+        let mut session = session;
+        session.writes_under_claim(claim.owner().to_string());
         let worker = Worker {
             client,
             // Taken by the caller, before it committed to opening the

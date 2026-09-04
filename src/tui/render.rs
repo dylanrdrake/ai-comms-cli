@@ -64,6 +64,27 @@ pub(super) fn home_relative(dir: &str) -> String {
 /// refreshes under you, with rows moving as sessions are touched, is easier
 /// to keep your place in when the row you were watching carries the same
 /// mark it had a moment ago.
+/// The two braille cells of a session's mark, without a colour.
+///
+/// Split out for the CLI, which paints with `colored` rather than ratatui
+/// and so cannot take the `Style` its sibling returns. The glyph is the part
+/// that has to agree between front ends anyway: it is what identifies the
+/// session, and it is braille specifically because every pattern in that
+/// block is East Asian Width Neutral — the `●` this replaced is Ambiguous,
+/// which some terminals draw two cells wide, shifting every wrapped line
+/// under it out of alignment with the gutter.
+pub(crate) fn identicon_mark(seed: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in seed.bytes() {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let half = |bits: u64| {
+        let pattern = MARK_PATTERNS[bits as usize % MARK_PATTERNS.len()];
+        char::from_u32(0x2800 + u32::from(pattern)).unwrap_or('?')
+    };
+    format!("{}{}", half(hash), half(hash >> 12))
+}
+
 pub(super) fn identicon(seed: &str) -> (String, Style) {
     // FNV-1a, 64-bit: the mark has to be identical in every process that
     // draws this session, so it can come from nothing but the id, and the
@@ -74,16 +95,9 @@ pub(super) fn identicon(seed: &str) -> (String, Style) {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
     }
 
-    let half = |bits: u64| {
-        let pattern = MARK_PATTERNS[bits as usize % MARK_PATTERNS.len()];
-        char::from_u32(0x2800 + u32::from(pattern)).unwrap_or('?')
-    };
     let fg = IDENTICON_FG[(hash >> 24) as usize % IDENTICON_FG.len()];
 
-    (
-        format!("{}{}", half(hash), half(hash >> 12)),
-        Style::new().fg(Color::Indexed(fg)),
-    )
+    (identicon_mark(seed), Style::new().fg(Color::Indexed(fg)))
 }
 
 pub fn draw(frame: &mut Frame, app: &App, cache: &mut TranscriptCache, tick: usize) {
@@ -909,7 +923,7 @@ fn input_lines(input: &str, width: u16) -> Vec<String> {
             rows.push(chunk.iter().collect());
         }
         // A segment filling the last row exactly puts the caret on the next.
-        if chars.len() % width == 0 {
+        if chars.len().is_multiple_of(width) {
             rows.push(String::new());
         }
     }
@@ -2014,6 +2028,81 @@ mod tests {
             !flat(&rows[1]).starts_with(' '),
             "hung anyway: {:?}",
             flat(&rows[1])
+        );
+    }
+
+    /// A frame must not cost more as the conversation grows.
+    ///
+    /// The transcript used to be rebuilt from scratch every frame — every
+    /// reply's markdown re-parsed and re-wrapped — and a frame was drawn per
+    /// streamed token, so a long session cost the two multiplied together.
+    /// Blocks are cached and only the visible rows are assembled now, and
+    /// nothing else in the suite would notice if that stopped being true:
+    /// the other render tests check what is drawn, never what it cost.
+    ///
+    /// The budget is deliberately loose. This corpus takes ~0.3ms optimised
+    /// and ~5ms in the unoptimised build the test suite actually runs in, so
+    /// 50ms leaves an order of magnitude for a loaded or slow machine. What
+    /// it catches is a return to per-frame O(transcript): the same corpus
+    /// cost tens of milliseconds *optimised* before the cache, so it would
+    /// overrun this by a wide margin rather than a marginal one. It is not
+    /// here to measure anything finely.
+    #[test]
+    fn a_frame_does_not_get_more_expensive_as_the_transcript_grows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::time::{Duration, Instant};
+
+        const BUDGET: Duration = Duration::from_millis(50);
+
+        let body = concat!(
+            "Here is **one** paragraph of prose that runs on a while, with ",
+            "some `inline code` and a [link](http://example.com) in it.\n\n",
+            "- first item\n- second item\n- third item\n\n",
+            "```rust\nfn main() {\n    let v = compute(alpha, beta, gamma);\n}\n```\n\n",
+            "More trailing prose to bulk the message out, twice over. ",
+            "More trailing prose to bulk the message out, twice over.",
+        );
+
+        let mut app = App::new("m".to_string(), None, "abcd1234".to_string());
+        for i in 0..1200 {
+            app.transcript
+                .push(TranscriptItem::User(format!("question {i}")));
+            app.transcript.push(TranscriptItem::Assistant {
+                text: format!("Reply {i}. {body}"),
+                streaming: false,
+                label: Some("m".into()),
+            });
+        }
+        let bytes: usize = app
+            .transcript
+            .iter()
+            .map(|item| match item {
+                TranscriptItem::User(t) => t.len(),
+                TranscriptItem::Assistant { text, .. } => text.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(bytes > 300_000, "the corpus should be big enough to matter");
+
+        let mut cache = TranscriptCache::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        // The first frame renders every block, and is not what is measured:
+        // the claim is about the steady state, which is where the ten frames
+        // a second are spent.
+        terminal.draw(|f| draw(f, &app, &mut cache, 0)).unwrap();
+
+        let frames = 20;
+        let start = Instant::now();
+        for _ in 0..frames {
+            terminal.draw(|f| draw(f, &app, &mut cache, 0)).unwrap();
+        }
+        let per_frame = start.elapsed() / frames;
+
+        assert!(
+            per_frame < BUDGET,
+            "a frame over {bytes} bytes of transcript took {per_frame:?}, \
+             budget {BUDGET:?} — the transcript is being rebuilt per frame again"
         );
     }
 

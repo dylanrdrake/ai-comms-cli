@@ -678,6 +678,22 @@ pub fn renew_session_claim(conn: &Connection, session_id: &str, owner: &str) -> 
     Ok(held == 1)
 }
 
+/// Whether `owner` still holds this session's claim.
+///
+/// Read inside the write transaction so the answer cannot go stale between
+/// the check and the insert.
+pub fn claim_is_held_by(conn: &Connection, session_id: &str, owner: &str) -> Result<bool> {
+    let held: Option<String> = conn
+        .query_row(
+            "SELECT claim_owner FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(held.as_deref() == Some(owner))
+}
+
 /// Gives up a claim, if it is still this process's to give up.
 ///
 /// Also owner-scoped: a zombie that exits after being declared stale must not
@@ -1176,7 +1192,7 @@ mod tests {
 
     #[test]
     fn derive_title_uses_first_user_message() {
-        let messages = vec![
+        let messages = [
             ChatMessage {
                 role: "system".to_string(),
                 content: Some("system prompt".to_string()),
@@ -1234,7 +1250,7 @@ mod tests {
         )
         .unwrap();
 
-        let messages = vec![
+        let messages = [
             ChatMessage {
                 role: "user".to_string(),
                 content: Some("hello".to_string()),

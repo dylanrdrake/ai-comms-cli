@@ -1838,6 +1838,9 @@ async fn cmd_agent(
     // Reports Working/Failed to the picker, which is the whole point of
     // running with a session: a detached task is otherwise invisible until
     // it finishes.
+    // Bound before the first write, so a turn that outlives its claim is
+    // refused rather than interleaved into a session someone else now holds.
+    session.writes_under_claim(activity.claim_owner().to_string());
     ui.watch(activity);
 
     session.push_user(task.to_string());

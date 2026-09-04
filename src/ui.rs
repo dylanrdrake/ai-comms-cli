@@ -385,7 +385,7 @@ pub fn classify(text: &str) -> Submission {
 
     match trimmed.strip_prefix("/model") {
         // "/models-are-great" is a message, not a malformed command.
-        Some(rest) if rest.is_empty() => return Submission::ShowModel,
+        Some("") => return Submission::ShowModel,
         Some(rest) if rest.starts_with(char::is_whitespace) => {
             let name = rest.trim();
             return if name.is_empty() {

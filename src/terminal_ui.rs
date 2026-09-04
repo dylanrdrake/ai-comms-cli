@@ -13,6 +13,7 @@ use anyhow::Result;
 use colored::*;
 use std::future::Future;
 use std::io::{self, Write};
+use unicode_width::UnicodeWidthStr;
 
 /// Holds the session for this process, and writes what it is doing while a
 /// turn runs, for anything watching the list of sessions.
@@ -52,6 +53,16 @@ impl ActivityWriter {
             session_id,
             _claim: claim,
         }))
+    }
+
+    /// The claim this writer holds, for binding a session's writes to it.
+    pub fn claim_owner(&self) -> &str {
+        self._claim.owner()
+    }
+
+    /// The session being watched, so a front end can derive its mark.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     fn set(&self, activity: Option<crate::store::Activity>, detail: Option<&str>) {
@@ -95,12 +106,19 @@ pub struct TerminalAgentUi {
     /// resolved, so — unlike a call that ran with no prompt at all —
     /// `ToolCallCompleted`/`ToolCallDenied` draw no further marker for it.
     approval_shown: bool,
+    /// This session's braille mark, the same one the TUI's gutter and the
+    /// picker's rows draw. `None` for a one-shot `agent`, which has no
+    /// session to be identified by; that falls back to a plain marker.
+    mark: Option<String>,
 }
 
 impl TerminalAgentUi {
     /// Starts reporting what this session is doing while turns run, so a
     /// CLI session shows up in the picker the way a TUI one does.
     pub fn watch(&mut self, activity: ActivityWriter) {
+        // Taken here because this is the moment the UI learns it belongs to
+        // a session at all — a one-shot run never calls it.
+        self.mark = Some(crate::tui::identicon_mark(activity.session_id()));
         self.activity = Some(activity);
     }
 
@@ -113,6 +131,7 @@ impl TerminalAgentUi {
             tool_header_open: false,
             approval_shown: false,
             activity: None,
+            mark: None,
         }
     }
 
@@ -167,12 +186,22 @@ impl TerminalAgentUi {
                     let label = format!("{}:", response_label(&model, &effort_level));
                     println!("{} {}", label.cyan(), wrap::wrap(&text));
                 } else {
-                    // Matches the TUI transcript's dot marker, now that
-                    // neither shows a model label on every reply — and,
-                    // like the TUI's gutter, a wrapped continuation
-                    // line lines up under the first rather than
-                    // resuming at column 0.
-                    println!("{} {}", "●".cyan(), wrap::wrap_indented(&text, "  "));
+                    // The session's own mark, the same one the TUI's
+                    // gutter and the picker's rows draw, so a reply is tied
+                    // to the session it came from wherever you read it.
+                    // Braille rather than the `●` this replaced: every
+                    // pattern in that block is East Asian Width Neutral,
+                    // while `●` is Ambiguous and some terminals give it two
+                    // cells, shifting the wrapped lines under it out of
+                    // line with the gutter.
+                    //
+                    // The indent is measured from the mark rather than
+                    // fixed: a session's mark is two cells where the
+                    // one-shot fallback is one, and a wrapped line has to
+                    // start under the text either way.
+                    let mark = self.mark.as_deref().unwrap_or("⠶");
+                    let indent = " ".repeat(UnicodeWidthStr::width(mark) + 1);
+                    println!("{} {}", mark.cyan(), wrap::wrap_indented(&text, &indent));
                 }
                 // One blank line after every transcript unit, matching
                 // the TUI, which spaces its items the same way
@@ -267,8 +296,8 @@ impl AgentUi for TerminalAgentUi {
         self.render_agent_event(event)
     }
 
-    fn approve(&mut self, request: ApprovalRequest) -> impl Future<Output = Result<bool>> + Send {
-        async move { self.prompt_approval(request) }
+    async fn approve(&mut self, request: ApprovalRequest) -> Result<bool> {
+        self.prompt_approval(request)
     }
 }
 

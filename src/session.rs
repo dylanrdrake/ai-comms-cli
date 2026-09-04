@@ -95,6 +95,13 @@ impl Heartbeat {
     }
 }
 
+impl Heartbeat {
+    /// The token identifying this claim, for binding a session's writes to it.
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+}
+
 impl Drop for Heartbeat {
     fn drop(&mut self) {
         if let Some(ticker) = &self.ticker {
@@ -111,6 +118,18 @@ impl Drop for Heartbeat {
 pub struct ChatSession {
     conn: Connection,
     id: String,
+    /// The claim this session's writes belong to, when the caller took one.
+    ///
+    /// A process starved past the staleness window loses the session to
+    /// whoever claims it next. It has no way to notice on its own — the turn
+    /// carries on and persists at the end of it, into a session someone else
+    /// is now writing to, which is the `seq` collision the claim exists to
+    /// prevent, reached the long way round. Checked inside the write
+    /// transaction so the answer cannot go stale before the insert.
+    ///
+    /// `None` for sessions built without a claim, which is every test and no
+    /// real caller; those write unchecked, as they did before.
+    claim_owner: Option<String>,
     /// The session's current title. "Untitled" until [`Self::persist_pending`]
     /// derives a real one from the first user message.
     title: String,
@@ -252,6 +271,7 @@ impl ChatSession {
             messages: Vec::new(),
             title_set: false,
             saved_len: 0,
+            claim_owner: None,
         })
     }
 
@@ -302,6 +322,7 @@ impl ChatSession {
                 messages,
                 title_set,
                 saved_len,
+                claim_owner: None,
             },
             history,
         ))
@@ -418,6 +439,11 @@ impl ChatSession {
     /// This session's `/temperature` override, if one is set.
     pub fn temperature(&self) -> Option<f32> {
         self.temperature
+    }
+
+    /// Binds this session's writes to a claim, so they stop if it is lost.
+    pub fn writes_under_claim(&mut self, owner: String) {
+        self.claim_owner = Some(owner);
     }
 
     /// Switches this session's tool-approval gates and records them.
@@ -590,6 +616,20 @@ impl ChatSession {
         // rather than leaving an answer to a question nobody can see.
         let tx = self.conn.unchecked_transaction()?;
 
+        // Inside the transaction: if this process has lost the session, the
+        // turn it just ran belongs to nobody and writing it would collide
+        // with whoever holds the session now.
+        if let Some(owner) = &self.claim_owner {
+            if !store::claim_is_held_by(&tx, &self.id, owner)? {
+                anyhow::bail!(
+                    "Session {} was taken over by another process while this turn ran, \
+                     so its messages were not saved — writing them now would interleave \
+                     with the turns that process is writing.",
+                    &self.id[..8.min(self.id.len())]
+                );
+            }
+        }
+
         for (seq, message) in self.messages.iter().enumerate().skip(self.saved_len) {
             store::append_message(
                 &tx,
@@ -694,6 +734,7 @@ mod tests {
                 activity           TEXT,
                 activity_detail    TEXT,
                 heartbeat          INTEGER,
+                claim_owner        TEXT,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
@@ -1034,6 +1075,57 @@ mod tests {
         assert!(
             summary.verbose,
             "it has to survive a reload, not just live in memory"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_outlived_its_claim_is_not_written() {
+        // A process starved past the staleness window loses the session to
+        // whoever claims it next, and finds out only here. Persisting anyway
+        // would collide with the turns that process is writing.
+        let mut session = memory_session();
+        session.writes_under_claim("mine".to_string());
+        store::claim_session(&session.conn, session.id(), "mine").unwrap();
+        session.push_user("before".to_string());
+        session.persist_pending().expect("held: should save");
+
+        // Taken over, which can only happen once our claim has gone stale —
+        // a fresh one is not claimable, so backdate it the way a starved
+        // process's would be.
+        session
+            .conn
+            .execute(
+                "UPDATE sessions SET heartbeat = 0 WHERE id = ?1",
+                rusqlite::params![session.id()],
+            )
+            .unwrap();
+        assert!(
+            store::claim_session(&session.conn, session.id(), "usurper").unwrap(),
+            "the stale claim should be takeable"
+        );
+        session.push_user("after".to_string());
+        let error = session
+            .persist_pending()
+            .expect_err("a lost claim must not write")
+            .to_string();
+        assert!(error.contains("taken over"), "{error}");
+
+        let stored = store::load_messages(&session.conn, session.id()).unwrap();
+        assert_eq!(stored.len(), 1, "only what was written while we held it");
+    }
+
+    #[test]
+    fn a_session_bound_to_no_claim_writes_as_before() {
+        // Every test builds one of these, and so does any caller that never
+        // took a claim; the check must not turn those into failures.
+        let mut session = memory_session();
+        session.push_user("unclaimed".to_string());
+        session.persist_pending().expect("no claim, no check");
+        assert_eq!(
+            store::load_messages(&session.conn, session.id())
+                .unwrap()
+                .len(),
+            1
         );
     }
 

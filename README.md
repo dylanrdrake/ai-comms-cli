@@ -291,7 +291,8 @@ clank approval all on        # Prompt for all actions
 
 **Per-session approval.** These commands set the default new sessions start
 with. A session remembers its own approval settings too: running `/approval`
-inside it (see [`session`](#session) or [`tui`](#tui)) switches and records
+inside it (see [`session`](#session) or [the full-screen
+UI](#clank-with-no-command--the-full-screen-ui)) switches and records
 them for that session alone, the same way `/model` does for models — so
 resuming later with no override picks up where you left off rather than
 reverting to the configured default.
@@ -418,7 +419,7 @@ two sets of turns into a history neither of them wrote. The claim expires by
 itself, so a session whose runner died is available again with nothing to
 clean up.
 
-#### `tui`
+#### `clank` with no command — the full-screen UI
 A full-screen terminal UI. Unlike the line-based `session`, it owns the
 screen, which is what lets the input box stay live while a reply streams in,
 tool approvals appear inline, and a running turn be interrupted. Otherwise

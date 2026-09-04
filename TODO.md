@@ -155,12 +155,13 @@ NEXT:
   and there's no indication they exist. The two blank lines between sections
   cost two more rows. Wants a scroll offset that follows the selection, and
   probably some hint that the list continues past the edge.
-* the transcript's reply avatar `●` (U+25CF) is East Asian Width Ambiguous,
-  so some terminals draw it two cells wide and the whole reply gutter shifts
-  against the wrapped continuation lines under it. Same bug the picker badges
-  had. `—` for notices and `·` in the settings bar are Ambiguous too. The fix
-  is a Neutral-width character: ✦ ⏺ ◉ ✻ ❖ ⟡ ✧ ❉ ✱ ⌾ ⬤ are all safe, as is
-  anything in the braille block.
+* East Asian Width Ambiguous glyphs, part done. The transcript's reply
+  avatar was `●` (U+25CF), which some terminals draw two cells wide, shifting
+  every wrapped line under it out of line with the gutter. Both front ends now
+  draw the session's braille mark instead — braille is the one block where
+  every pattern is Neutral — so the avatar is fixed. Still Ambiguous and still
+  unfixed: `—` on notices and `·` in the settings bar. Safe replacements are
+  ✦ ⏺ ◉ ✻ ❖ ⟡ ✧ ❉ ✱ ⌾ ⬤, or anything in the braille block.
 * the client's timeouts are hardcoded in client.rs and can't be configured:
   CONNECT_TIMEOUT 20s, REQUEST_TIMEOUT 300s, STREAM_IDLE_TIMEOUT 90s, plus
   tools.rs's 30s default for a terminal command when the model doesn't give one.
