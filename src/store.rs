@@ -1,5 +1,5 @@
 use crate::client::{ChatMessage, ToolCall};
-use crate::config::{get_config_dir, ApprovalSettings};
+use crate::config::{get_config_dir, ApprovalSettings, ToolAccessSettings};
 use crate::crypto;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -10,15 +10,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const KIND_CHAT: &str = "chat";
 pub const KIND_AGENT_CHAT: &str = "agent_chat";
 
-/// What a session's mode is called wherever one is shown: the picker, the
-/// CLI's resume list, and the in-session settings bar. The stored kind is
-/// still `chat`, but "ask" is the word the commands use (`/ask`, `/agent`),
-/// so it's the word the listings should use too.
+/// How a clanker's tools read on a row: whether it has any at all.
+///
+/// A glyph rather than the old `agent`/`ask`, which named modes that no
+/// longer exist — and rather than words, because this sits in a fixed-width
+/// column beside every clanker in the launch screen and in `clank clankers
+/// list`, where "no tools" cost eight of them. The hammer is the one the
+/// transcript already puts in front of every tool call, so the column and
+/// the conversation agree on what a tool looks like.
+///
+/// Both are East Asian Wide — two columns for one `char`. That is fine
+/// where every row carries one of them, since they misreport their width by
+/// the same amount and stay aligned with each other; it is not fine mixed
+/// with narrow text in the same column.
 pub fn mode_label(agentic: bool) -> &'static str {
     if agentic {
-        "agent"
+        "🔨"
     } else {
-        "ask"
+        "💬"
     }
 }
 
@@ -57,10 +66,10 @@ pub struct SessionSummary {
     /// The sampling temperature this session is currently set to — same
     /// deal as `max_iterations`.
     pub temperature: Option<f64>,
-    /// This session's current tool-approval settings — a snapshot of the
-    /// configured default taken when it was created, mutable from inside
-    /// it with `/approval`.
-    pub approval: ApprovalSettings,
+    /// What each tool may do in this session — a snapshot of the configured
+    /// default taken when it was created, mutable from inside it with
+    /// `/tools`.
+    pub tool_access: ToolAccessSettings,
     /// Whether this session confines the agent's file writes to the working
     /// directory — a snapshot of the configured default taken when it was
     /// created, mutable from inside it with `/sandbox`.
@@ -102,7 +111,7 @@ pub fn open_db() -> Result<Connection> {
     let path = get_config_dir()?.join("chats.db");
     let conn = Connection::open(path)?;
 
-    // A detached `agent --session` run writes to the same database the TUI
+    // A detached `clank "..." --tools --save` run writes to the same database the TUI
     // and the picker are reading, which the default rollback journal turns
     // into an immediate `SQLITE_BUSY` for whoever loses the race. WAL lets
     // readers and one writer proceed together; the timeout covers two
@@ -127,6 +136,7 @@ pub fn open_db() -> Result<Connection> {
             approval_read      INTEGER NOT NULL DEFAULT 1,
             approval_write     INTEGER NOT NULL DEFAULT 1,
             approval_terminal  INTEGER NOT NULL DEFAULT 1,
+            tool_access        TEXT,
             sandbox            INTEGER NOT NULL DEFAULT 1,
             stream             INTEGER NOT NULL DEFAULT 1,
             working_dir        TEXT,
@@ -177,6 +187,13 @@ pub fn open_db() -> Result<Connection> {
     // the process that took it. Null on rows written before claims existed,
     // which reads as unheld — correct, since no live process owns them.
     ensure_column(&conn, "sessions", "claim_owner", "TEXT")?;
+    // What each tool may do, as JSON. NULL in a row written before tools had
+    // their own states, and read back as whatever the three `approval_*`
+    // booleans beside it meant — see `tool_access_of`. Those columns are
+    // left in place rather than dropped: nothing writes them now, dropping a
+    // column in SQLite rebuilds the table, and they are the only record of
+    // what an old session wanted.
+    ensure_column(&conn, "sessions", "tool_access", "TEXT")?;
     ensure_column(
         &conn,
         "sessions",
@@ -277,7 +294,7 @@ pub fn create_session(
     effort_level: Option<&str>,
     max_iterations: Option<i64>,
     temperature: Option<f64>,
-    approval: &ApprovalSettings,
+    access: &ToolAccessSettings,
     sandbox: bool,
     verbose: bool,
     highlight: bool,
@@ -288,7 +305,7 @@ pub fn create_session(
     let title = crypto::encrypt("Untitled")?;
 
     conn.execute(
-        "INSERT INTO sessions (id, title, model, kind, effort_level, max_iterations, temperature, approval_read, approval_write, approval_terminal, sandbox, verbose, highlight, stream, working_dir, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+        "INSERT INTO sessions (id, title, model, kind, effort_level, max_iterations, temperature, tool_access, sandbox, verbose, highlight, stream, working_dir, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
         params![
             id,
             title,
@@ -297,9 +314,7 @@ pub fn create_session(
             effort_level,
             max_iterations,
             temperature,
-            approval.read_disk,
-            approval.write_disk,
-            approval.terminal,
+            serde_json::to_string(access)?,
             sandbox,
             verbose,
             highlight,
@@ -333,8 +348,40 @@ pub fn set_session_model(conn: &Connection, session_id: &str, model: &str) -> Re
     Ok(())
 }
 
+/// What a stored row means for tool access.
+///
+/// `stored` is the JSON column, absent for every session created before
+/// tools had states of their own. Those fall back to the three category
+/// booleans written beside them, which said the same thing more coarsely:
+/// "this category asks first" becomes `Ask` for the tools in it, "it does
+/// not" becomes `Allow`. Nothing is rewritten — an old session simply reads
+/// as what it always meant, and only says so in the new column once
+/// something changes it.
+///
+/// Unparseable JSON falls back the same way rather than failing the read: a
+/// session that cannot be opened is worse than one whose gates are the ones
+/// it was created with.
+fn tool_access_of(stored: Option<&str>, legacy: &ApprovalSettings) -> ToolAccessSettings {
+    stored
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_else(|| ToolAccessSettings::from_legacy(legacy))
+}
+
+/// Records what each tool may do in this session.
+pub fn set_session_tool_access(
+    conn: &Connection,
+    session_id: &str,
+    access: &ToolAccessSettings,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET tool_access = ?1 WHERE id = ?2",
+        params![serde_json::to_string(access)?, session_id],
+    )?;
+    Ok(())
+}
+
 /// Records a session's current kind (`KIND_CHAT` / `KIND_AGENT_CHAT`), so
-/// switching between plain and agent mode mid-session sticks on resume and
+/// turning a clanker's tools on or off sticks on resume and
 /// in `sessions list`, the same way [`set_session_model`] does for models.
 pub fn set_session_kind(conn: &Connection, session_id: &str, kind: &str) -> Result<()> {
     conn.execute(
@@ -408,25 +455,8 @@ pub fn set_session_temperature(
     Ok(())
 }
 
-/// Records an `/approval`-style override for this session's tool-approval
+/// Records a `/tools`-style override for this session's tool
 /// gates.
-pub fn set_session_approval(
-    conn: &Connection,
-    session_id: &str,
-    approval: &ApprovalSettings,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE sessions SET approval_read = ?1, approval_write = ?2, approval_terminal = ?3 WHERE id = ?4",
-        params![
-            approval.read_disk,
-            approval.write_disk,
-            approval.terminal,
-            session_id
-        ],
-    )?;
-    Ok(())
-}
-
 /// Records whether this session confines the agent's file writes to the
 /// working directory.
 pub fn set_session_sandbox(conn: &Connection, session_id: &str, sandbox: bool) -> Result<()> {
@@ -821,7 +851,7 @@ fn message_preview(content: Option<&str>, tool_calls: Option<&str>) -> String {
 pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access \
          FROM sessions ORDER BY updated_at DESC",
     )?;
 
@@ -835,11 +865,14 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
             verbose: row.get(5)?,
             max_iterations: row.get(6)?,
             temperature: row.get(7)?,
-            approval: ApprovalSettings {
-                read_disk: row.get(8)?,
-                write_disk: row.get(9)?,
-                terminal: row.get(10)?,
-            },
+            tool_access: tool_access_of(
+                row.get::<_, Option<String>>(20)?.as_deref(),
+                &ApprovalSettings {
+                    read_disk: row.get(8)?,
+                    write_disk: row.get(9)?,
+                    terminal: row.get(10)?,
+                },
+            ),
             sandbox: row.get(11)?,
             stream: row.get(12)?,
             working_dir: row.get(13)?,
@@ -912,7 +945,7 @@ pub fn find_session(conn: &Connection, id_or_prefix: &str) -> Result<Option<Sess
 fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, model, kind, effort_level, verbose, max_iterations, temperature, \
-         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat \
+         approval_read, approval_write, approval_terminal, sandbox, stream, working_dir, activity, activity_detail, created_at, updated_at, highlight, heartbeat, tool_access \
          FROM sessions WHERE id = ?1",
     )?;
 
@@ -929,11 +962,14 @@ fn load_summary(conn: &Connection, id: &str) -> Result<Option<SessionSummary>> {
             verbose: row.get(5)?,
             max_iterations: row.get(6)?,
             temperature: row.get(7)?,
-            approval: ApprovalSettings {
-                read_disk: row.get(8)?,
-                write_disk: row.get(9)?,
-                terminal: row.get(10)?,
-            },
+            tool_access: tool_access_of(
+                row.get::<_, Option<String>>(20)?.as_deref(),
+                &ApprovalSettings {
+                    read_disk: row.get(8)?,
+                    write_disk: row.get(9)?,
+                    terminal: row.get(10)?,
+                },
+            ),
             sandbox: row.get(11)?,
             stream: row.get(12)?,
             working_dir: row.get(13)?,
@@ -1164,6 +1200,7 @@ mod tests {
                 approval_read      INTEGER NOT NULL DEFAULT 1,
                 approval_write     INTEGER NOT NULL DEFAULT 1,
                 approval_terminal  INTEGER NOT NULL DEFAULT 1,
+                tool_access        TEXT,
                 sandbox            INTEGER NOT NULL DEFAULT 1,
                 stream             INTEGER NOT NULL DEFAULT 1,
                 working_dir        TEXT,
@@ -1246,7 +1283,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1296,7 +1333,7 @@ mod tests {
             Some("high"),
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1364,7 +1401,7 @@ mod tests {
                 None,
                 Some(20),
                 Some(0.7),
-                &ApprovalSettings::default(),
+                &ToolAccessSettings::default(),
                 true,
                 false,
                 true,
@@ -1429,7 +1466,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1481,7 +1518,7 @@ mod tests {
                 None,
                 Some(20),
                 Some(0.7),
-                &ApprovalSettings::default(),
+                &ToolAccessSettings::default(),
                 true,
                 false,
                 true,
@@ -1548,7 +1585,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1586,7 +1623,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1604,7 +1641,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1631,7 +1668,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1658,7 +1695,7 @@ mod tests {
                     None,
                     Some(20),
                     Some(0.7),
-                    &ApprovalSettings::default(),
+                    &ToolAccessSettings::default(),
                     true,
                     false,
                     true,
@@ -1744,7 +1781,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1846,7 +1883,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1877,7 +1914,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1894,7 +1931,7 @@ mod tests {
         // left `NULL` to be resolved against the config on every resume.
         assert_eq!(summary.max_iterations, Some(20));
         assert_eq!(summary.temperature, Some(0.7));
-        assert_eq!(summary.approval, ApprovalSettings::default());
+        assert_eq!(summary.tool_access, ToolAccessSettings::default());
     }
 
     #[test]
@@ -1909,7 +1946,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1943,7 +1980,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1971,7 +2008,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -2005,7 +2042,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -2025,7 +2062,43 @@ mod tests {
     }
 
     #[test]
-    fn set_session_approval_updates_the_stored_gates() {
+    fn a_session_from_before_tools_had_states_reads_as_what_it_meant() {
+        // The column is NULL for every session created before this existed.
+        // Rather than migrate them, the three booleans beside it are read as
+        // what they always said: "this category asks" or "it does not".
+        let legacy = ApprovalSettings {
+            read_disk: false,
+            write_disk: true,
+            terminal: false,
+        };
+        let derived = tool_access_of(None, &legacy);
+        assert_eq!(
+            derived.access("read_file"),
+            crate::config::ToolAccess::Allow
+        );
+        assert_eq!(derived.access("write_file"), crate::config::ToolAccess::Ask);
+        // The shell keeps its own default rather than the old boolean.
+        assert_eq!(
+            derived.access("run_terminal_command"),
+            crate::config::ToolAccess::Never
+        );
+
+        // Once the column holds something, it is the answer and the old
+        // booleans are ignored.
+        let stored = ToolAccessSettings::default()
+            .with("all", crate::config::ToolAccess::Never)
+            .unwrap();
+        let json = serde_json::to_string(&stored).unwrap();
+        assert_eq!(tool_access_of(Some(&json), &legacy), stored);
+
+        // Nonsense in the column falls back rather than failing the read: a
+        // session that will not open is worse than one whose gates are the
+        // ones it was created with.
+        assert_eq!(tool_access_of(Some("{{{"), &legacy), derived);
+    }
+
+    #[test]
+    fn set_session_tool_access_updates_the_stored_gates() {
         let conn = memory_db();
         let id = crate::session::new_id();
         create_session(
@@ -2036,7 +2109,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -2045,13 +2118,14 @@ mod tests {
         )
         .unwrap();
 
-        let custom = ApprovalSettings {
-            read_disk: true,
-            write_disk: false,
-            terminal: false,
-        };
-        set_session_approval(&conn, &id, &custom).unwrap();
-        assert_eq!(find_session(&conn, &id).unwrap().unwrap().approval, custom);
+        let custom = ToolAccessSettings::default()
+            .with("write", crate::config::ToolAccess::Allow)
+            .unwrap();
+        set_session_tool_access(&conn, &id, &custom).unwrap();
+        assert_eq!(
+            find_session(&conn, &id).unwrap().unwrap().tool_access,
+            custom
+        );
     }
 
     #[test]
@@ -2067,7 +2141,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            &ApprovalSettings::default(),
+            &ToolAccessSettings::default(),
             true,
             false,
             true,

@@ -8,13 +8,14 @@
 //! channels and never touches the loop directly.
 //!
 //! The design assumes exactly one turn in flight at a time. Sending while
-//! busy joins that turn in agent mode, where the loop has iterations to
-//! inject between, and queues in ask mode, where a single request has no
+//! busy joins that turn when the clanker has tools, where the loop has
+//! iterations to inject between, and queues when it has none, where a single
+//! request has no
 //! seam; cancelling aborts the in-flight turn and drops both.
 
 use crate::agent::{self, Steering};
 use crate::client::Client;
-use crate::config::{ApprovalSettings, SessionGates};
+use crate::config::{SessionGates, ToolAccess, ToolAccessSettings};
 use crate::session::ChatSession;
 use crate::store::Activity;
 use crate::ui::{AgentEvent, AgentUi, ApprovalRequest, Submission};
@@ -49,9 +50,6 @@ pub enum Command {
     /// Switch the model for subsequent turns. A turn already running keeps
     /// the model it started with.
     SetModel(String),
-    /// Switch between plain and agent (tool-calling) mode for subsequent
-    /// turns. A turn already running keeps the mode it started with.
-    SetAgentic(bool),
     /// Switch the reasoning effort for subsequent turns. `None` nullifies
     /// it — no effort field is sent until set again. A turn already running
     /// keeps the effort it started with.
@@ -74,7 +72,7 @@ pub enum Command {
     /// Confine the agent's file writes to the working directory, or let
     /// them go anywhere.
     SetSandbox(bool),
-    /// Switch the tool-calling iteration cap per turn (agent mode only).
+    /// Switch the tool-calling iteration cap per turn (only used with tools).
     /// `None` nullifies it — a turn falls back to whatever the configured
     /// default is when it runs. A turn already running keeps the cap it
     /// started with.
@@ -83,10 +81,14 @@ pub enum Command {
     /// that concrete value to the session now (`/max-iterations default`),
     /// distinct from [`Command::SetMaxIterations`]`(None)`.
     ResetMaxIterations,
-    /// Switch one tool-approval gate (`"read"`/`"write"`/`"terminal"`/`"all"`)
+    /// Switch what a tool, a category, or everything may do
     /// for subsequent turns. A turn already running keeps the gates it
     /// started with.
-    SetApproval { category: String, enabled: bool },
+    SetToolAccess {
+        target: String,
+        access: ToolAccess,
+    },
+    ResetToolAccess,
     /// Switch the sampling temperature for subsequent turns. `None`
     /// nullifies it, same deal as [`Command::SetMaxIterations`]. A turn
     /// already running keeps the temperature it started with.
@@ -115,7 +117,7 @@ pub enum Event {
     Busy(bool),
     /// A message was accepted while a turn was running, so it is waiting
     /// rather than being sent. Carries the text so a front end can show what
-    /// is waiting, not only how many: in agent mode this message is about to
+    /// is waiting, not only how many: with tools this message is about to
     /// change what the model does next.
     ///
     /// There is no matching "dequeued" event. A waiting message leaves by
@@ -149,12 +151,6 @@ pub enum Event {
         model: String,
         effort_level: Option<String>,
     },
-    /// Agent (tool-calling) mode was turned on or off (or a change failed).
-    /// Front ends re-label from here rather than assuming the command
-    /// succeeded.
-    AgenticChanged {
-        agentic: bool,
-    },
     /// The reasoning effort changed (or a change failed). Front ends
     /// re-label from here rather than assuming the command succeeded.
     EffortChanged {
@@ -179,10 +175,10 @@ pub enum Event {
     MaxIterationsChanged {
         max_iterations: Option<usize>,
     },
-    /// A tool-approval gate changed (or a change failed). Front ends
-    /// re-label from here rather than assuming the command succeeded.
-    ApprovalSettingsChanged {
-        approval: ApprovalSettings,
+    /// What a tool may do changed (or a change failed). Front ends re-label
+    /// from here rather than assuming the command succeeded.
+    ToolAccessChanged {
+        access: ToolAccessSettings,
     },
     /// The sampling temperature changed (or a change failed). Front ends
     /// re-label from here rather than assuming the command succeeded.
@@ -214,7 +210,6 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
     match submission {
         Submission::Message(text) => Some(Command::Send(text.clone())),
         Submission::SetModel(model) => Some(Command::SetModel(model.clone())),
-        Submission::SetAgentic(agentic) => Some(Command::SetAgentic(*agentic)),
         Submission::SetEffort(effort_level) => Some(Command::SetEffort(effort_level.clone())),
         Submission::ResetEffort => Some(Command::ResetEffort),
         Submission::SetVerbose(verbose) => Some(Command::SetVerbose(*verbose)),
@@ -230,10 +225,11 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         Submission::BrowseModels => Some(Command::ListModels),
         Submission::SetTemperature(temperature) => Some(Command::SetTemperature(*temperature)),
         Submission::ResetTemperature => Some(Command::ResetTemperature),
-        Submission::SetApproval { category, enabled } => Some(Command::SetApproval {
-            category: category.clone(),
-            enabled: *enabled,
+        Submission::SetToolAccess { target, access } => Some(Command::SetToolAccess {
+            target: target.clone(),
+            access: *access,
         }),
+        Submission::ResetToolAccess => Some(Command::ResetToolAccess),
 
         // Read-only, and front-end specific in how they're shown. `/model`
         // bare is here too: the TUI round-trips it through the worker so the
@@ -242,7 +238,7 @@ pub fn command_for(submission: &Submission) -> Option<Command> {
         Submission::ShowHelp
         | Submission::ShowEffort
         | Submission::ShowModel
-        | Submission::ShowApproval
+        | Submission::ShowTools
         | Submission::ShowSandbox
         | Submission::ShowStatus
         | Submission::ShowVerbose
@@ -296,7 +292,7 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    /// Starts the worker. `session` carries the history (possibly resumed)
+    /// Starts the worker. The session carries the history (possibly resumed)
     /// that turns will extend.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
@@ -305,7 +301,7 @@ impl Conversation {
         max_iterations: Option<usize>,
         temperature: Option<f32>,
         effort_level_default: Option<String>,
-        agentic: bool,
+        tool_access_default: ToolAccessSettings,
         claim: crate::session::Heartbeat,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -322,9 +318,9 @@ impl Conversation {
             // history, and the claim is the only thing that prevents it.
             _claim: claim,
             // Built before the session moves in, and shared with every turn
-            // this worker spawns so a mid-turn `/approval` reaches it.
+            // this worker spawns so a mid-turn `/tools` reaches it.
             gates: SessionGates::new(
-                session.approval().clone(),
+                session.tool_access().clone(),
                 session.sandbox(),
                 command_timeout,
             ),
@@ -333,7 +329,7 @@ impl Conversation {
             max_iterations,
             temperature,
             effort_level_default,
-            agentic,
+            tool_access_default,
             events: event_tx,
         };
         let task = tokio::spawn(worker.run(command_rx));
@@ -422,18 +418,20 @@ struct Worker {
     /// The configured default effort level this session started from — same
     /// deal as `temperature`; only consulted by `/effort default`.
     effort_level_default: Option<String>,
-    /// Whether turns run the tool-calling loop (`agent-chat`) or are a plain
-    /// exchange (`chat`).
-    agentic: bool,
-    /// The session's approval gates as a shared handle. A running turn holds
-    /// a clone of this rather than a copy of the settings, so `/approval`
+    /// What `clank tools` allows, which is what `/tools on` turns on. A
+    /// clanker starts with no tools, so the configured access is a policy
+    /// for when they are switched on rather than a state it is created in.
+    tool_access_default: ToolAccessSettings,
+    /// What each tool may do, as a shared handle. A running turn holds a
+    /// clone of this rather than a copy of the settings, so `/tools`
     /// typed mid-turn applies to the turn's next tool call — see
     /// [`ApprovalGates`].
     gates: SessionGates,
     /// Messages typed while a turn is running. Like `gates`, a running turn
     /// holds a clone, so what is typed reaches the turn already in progress
-    /// rather than the one after it. Only agent mode can use it: a single
-    /// request has no seam to inject at, so ask mode queues instead.
+    /// rather than the one after it. Only a clanker with tools can use it: a
+    /// single request has no seam to inject at, so one without them queues
+    /// instead.
     steering: Steering,
     events: mpsc::UnboundedSender<Event>,
     /// Held, not used: it renews while this worker is alive and gives the
@@ -479,7 +477,6 @@ impl Worker {
                 Command::ListModels => self.list_models(),
                 Command::Include(text) => self.include(text),
                 Command::SetModel(model) => self.set_model(model),
-                Command::SetAgentic(agentic) => self.set_agentic(agentic),
                 Command::SetEffort(effort_level) => self.set_effort(effort_level),
                 Command::ResetEffort => self.reset_effort(),
                 Command::SetVerbose(verbose) => self.set_verbose(verbose),
@@ -491,7 +488,8 @@ impl Worker {
                     self.set_max_iterations(max_iterations)
                 }
                 Command::ResetMaxIterations => self.reset_max_iterations(),
-                Command::SetApproval { category, enabled } => self.set_approval(&category, enabled),
+                Command::SetToolAccess { target, access } => self.set_tool_access(&target, access),
+                Command::ResetToolAccess => self.reset_tool_access(),
                 Command::SetTemperature(temperature) => self.set_temperature(temperature),
                 Command::ResetTemperature => self.reset_temperature(),
                 // Only meaningful while a turn is running, where they're
@@ -539,7 +537,10 @@ impl Worker {
         // Snapshotted per turn, like model and effort: streaming shapes how
         // the next request is made, not what a running tool may do.
         let stream = self.session.stream();
-        let agentic = self.agentic;
+        // Read per turn rather than held: a clanker has tools when at
+        // least one of them is not `never`, so `/tools off` mid-session
+        // makes the next turn a plain exchange with nothing to carry it.
+        let agentic = self.session.tool_access().any_tools();
 
         let mut turn = tokio::spawn(async move {
             let mut ui = ui;
@@ -692,7 +693,6 @@ impl Worker {
                         // is a reasonable thing to want.
                         Some(Command::ListModels) => self.list_models(),
                         Some(Command::SetModel(model)) => self.set_model(model),
-                        Some(Command::SetAgentic(agentic)) => self.set_agentic(agentic),
                         Some(Command::SetEffort(effort_level)) => self.set_effort(effort_level),
                         Some(Command::ResetEffort) => self.reset_effort(),
                         Some(Command::SetVerbose(verbose)) => self.set_verbose(verbose),
@@ -712,9 +712,10 @@ impl Worker {
                         // a safety control, so someone flipping one during a
                         // turn means *this* turn — waiting for the next one
                         // would be exactly backwards.
-                        Some(Command::SetApproval { category, enabled }) => {
-                            self.set_approval(&category, enabled)
+                        Some(Command::SetToolAccess { target, access }) => {
+                            self.set_tool_access(&target, access)
                         }
+                        Some(Command::ResetToolAccess) => self.reset_tool_access(),
                         Some(Command::SetTemperature(temperature)) => {
                             self.set_temperature(temperature)
                         }
@@ -839,18 +840,6 @@ impl Worker {
     /// Switches agent (tool-calling) mode and tells the front end what it
     /// ended up as, so the display can't drift from what the next turn will
     /// actually use.
-    fn set_agentic(&mut self, agentic: bool) {
-        if let Err(e) = self.session.set_agentic(agentic) {
-            let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                message: format!("Failed to switch mode: {e}"),
-            }));
-        }
-        self.agentic = self.session.is_agentic();
-        let _ = self.events.send(Event::AgenticChanged {
-            agentic: self.agentic,
-        });
-    }
-
     /// Switches reasoning effort and tells the front end what it ended up
     /// as, so the display can't drift from what the next turn will
     /// actually use.
@@ -958,7 +947,7 @@ impl Worker {
         self.set_temperature(self.temperature);
     }
 
-    /// Switches one tool-approval gate and tells the front end what the
+    /// Switches what a tool may do and tells the front end what the
     /// session's gates ended up as, so the display can't drift from what
     /// the next turn will actually use.
     fn set_sandbox(&mut self, sandbox: bool) {
@@ -973,18 +962,43 @@ impl Worker {
         let _ = self.events.send(Event::SandboxChanged { sandbox });
     }
 
-    fn set_approval(&mut self, category: &str, enabled: bool) {
-        let approval = self.session.approval().with_category(category, enabled);
-        // Through the shared handle as well as the session, so a turn
-        // already running sees it at its next tool call.
-        self.gates.set_approval(approval.clone());
-        if let Err(e) = self.session.set_approval(approval) {
+    fn set_tool_access(&mut self, target: &str, access: ToolAccess) {
+        let Some(updated) = self.session.tool_access().with(target, access) else {
             let _ = self.events.send(Event::Agent(AgentEvent::Error {
-                message: format!("Failed to switch approval: {e}"),
+                message: format!("No tool or category called {target}"),
+            }));
+            return;
+        };
+        // Through the shared handle as well as the session, so a turn
+        // already running sees it at its next tool call — including a tool
+        // just set to `never`, which is refused there rather than waiting
+        // for a turn that never offers it again.
+        self.gates.set_access(updated.clone());
+        if let Err(e) = self.session.set_tool_access(updated) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to switch tool access: {e}"),
             }));
         }
-        let _ = self.events.send(Event::ApprovalSettingsChanged {
-            approval: self.session.approval().clone(),
+        let _ = self.events.send(Event::ToolAccessChanged {
+            access: self.session.tool_access().clone(),
+        });
+    }
+
+    /// Tools on, as `clank tools` allows them — what `/tools on` means.
+    ///
+    /// Not the same as setting them all to one state: the web tool runs
+    /// without asking unless told otherwise, and switching tools on should
+    /// not quietly start prompting for it.
+    fn reset_tool_access(&mut self) {
+        let defaults = self.tool_access_default.clone();
+        self.gates.set_access(defaults.clone());
+        if let Err(e) = self.session.set_tool_access(defaults) {
+            let _ = self.events.send(Event::Agent(AgentEvent::Error {
+                message: format!("Failed to switch tool access: {e}"),
+            }));
+        }
+        let _ = self.events.send(Event::ToolAccessChanged {
+            access: self.session.tool_access().clone(),
         });
     }
 
@@ -1083,7 +1097,6 @@ mod tests {
                 Submission::SetModel("m".to_string()),
                 Command::SetModel("m".to_string()),
             ),
-            (Submission::SetAgentic(true), Command::SetAgentic(true)),
             (
                 Submission::SetEffort(Some("high".to_string())),
                 Command::SetEffort(Some("high".to_string())),
@@ -1107,15 +1120,16 @@ mod tests {
                 Command::Shell("ls".to_string()),
             ),
             (
-                Submission::SetApproval {
-                    category: "write".to_string(),
-                    enabled: false,
+                Submission::SetToolAccess {
+                    target: "write".to_string(),
+                    access: ToolAccess::Allow,
                 },
-                Command::SetApproval {
-                    category: "write".to_string(),
-                    enabled: false,
+                Command::SetToolAccess {
+                    target: "write".to_string(),
+                    access: ToolAccess::Allow,
                 },
             ),
+            (Submission::ResetToolAccess, Command::ResetToolAccess),
         ]
     }
 
@@ -1141,7 +1155,7 @@ mod tests {
             Submission::ShowHelp,
             Submission::ShowEffort,
             Submission::ShowModel,
-            Submission::ShowApproval,
+            Submission::ShowTools,
             Submission::ShowSandbox,
             Submission::ShowStatus,
             Submission::ShowVerbose,

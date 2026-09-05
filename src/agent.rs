@@ -1,5 +1,5 @@
 use crate::client::{ChatMessage, Client, StreamEvent};
-use crate::config::{ApprovalSettings, SessionGates};
+use crate::config::{SessionGates, ToolAccess, ToolAccessSettings};
 use crate::tools::{execute_tool, get_tool_definitions};
 use crate::ui::{AgentEvent, AgentUi, ApprovalRequest};
 use anyhow::Result;
@@ -17,35 +17,25 @@ user message as the only request currently being asked of you - use earlier turn
 background context. Do not restate, re-summarize, or redo work from earlier turns unless the \
 user explicitly asks you to.";
 
-fn get_tool_category(tool_name: &str) -> &'static str {
-    match tool_name {
-        "read_file" | "list_files" => "read",
-        "write_file" | "replace_in_file" => "write",
-        "run_terminal_command" => "terminal",
-        _ => "unknown",
-    }
-}
-
-fn requires_approval(tool_name: &str, approval: &ApprovalSettings) -> bool {
-    // `web_fetch` never asks. It reads a page and changes nothing, and the
-    // point of having it at all is that the model reaches for it instead of
-    // curling raw markup — a prompt on every page is exactly the friction
-    // that would send it back to `run_terminal_command` — the more dangerous
-    // call, and one a session can silence with `/approval terminal off`.
-    if tool_name == "web_fetch" {
-        return false;
-    }
-
-    match get_tool_category(tool_name) {
-        "read" => approval.read_disk,
-        "write" => approval.write_disk,
-        "terminal" => approval.terminal,
-        _ => true,
-    }
+/// The tools this run may offer the model.
+///
+/// A tool set to `Never` is left out of the request entirely rather than
+/// refused when it is called: it costs no tokens, and the model is never
+/// invited to try something it cannot have. The refusal at the call site
+/// still exists, because this list is built once per turn and a gate can be
+/// changed while that turn runs.
+fn offered_tools(access: &ToolAccessSettings) -> Vec<serde_json::Value> {
+    get_tool_definitions()
+        .into_iter()
+        .filter(|definition| {
+            let name = definition["function"]["name"].as_str().unwrap_or_default();
+            access.access(name) != ToolAccess::Never
+        })
+        .collect()
 }
 
 // Every parameter here is a distinct, independently-overridable request
-// setting (model, iteration cap, temperature, approval gates, effort) —
+// setting (model, iteration cap, temperature, tool access, effort) —
 // bundling them into a struct wouldn't simplify anything, just move the
 // same list one level out.
 #[allow(clippy::too_many_arguments)]
@@ -160,13 +150,13 @@ async fn request_turn(
 /// that isn't the very first entry — it has to immediately follow a user
 /// message or a tool-result-ending assistant message, which in practice
 /// means it can only ever validly sit at the start of the conversation.
-/// `/agent` can turn tool-calling on at any point mid-conversation, so
+/// `/tools` can turn tool-calling on at any point mid-conversation, so
 /// there's no position session.rs could insert the agent system prompt at
 /// that's guaranteed to stay valid as the conversation grows around it.
 ///
 /// So it isn't stored history at all: any stray copy already sitting
 /// somewhere in the array — from before this existed, or left over from a
-/// session that's since switched back to ask mode — is dropped, and a
+/// clanker whose tools have since been turned off — is dropped, and a
 /// fresh one is prepended exactly when this turn actually needs it
 /// (`agentic`, i.e. tools are in play). This heals an already-poisoned
 /// session automatically, the same way `strip_dangling_reasoning` does for
@@ -317,7 +307,7 @@ pub async fn run_agent_turn(
         )
     })?;
 
-    let tool_definitions = get_tool_definitions();
+    let tool_definitions = offered_tools(&gates.access());
     let mut iteration = 0;
     let mut final_response = None;
 
@@ -394,18 +384,24 @@ pub async fn run_agent_turn(
 
                 // Check if approval is needed
                 // Read per tool call rather than once per turn: a gate
-                // flipped with `/approval` while this turn is running is
+                // changed with `/tools` while this turn is running is
                 // meant to apply to what the turn does next, not to the
                 // turn after it.
-                let approved = if requires_approval(tool_name, &gates.approval()) {
-                    ui.approve(ApprovalRequest {
-                        tool_name: tool_name.clone(),
-                        category: get_tool_category(tool_name),
-                        arguments: tool_call.function.arguments.clone(),
-                    })
-                    .await?
-                } else {
-                    true
+                let approved = match gates.access().access(tool_name) {
+                    // Denied outright. Reachable even though the tool was
+                    // left out of the request: the list was built before the
+                    // turn began, and a gate closed part-way through has to
+                    // take effect on the call in front of it.
+                    ToolAccess::Never => false,
+                    ToolAccess::Allow => true,
+                    ToolAccess::Ask => {
+                        ui.approve(ApprovalRequest {
+                            tool_name: tool_name.clone(),
+                            category: crate::tools::category_of(tool_name),
+                            arguments: tool_call.function.arguments.clone(),
+                        })
+                        .await?
+                    }
                 };
 
                 let result = if approved {
@@ -532,6 +528,7 @@ mod tests {
     }
     use super::*;
     use crate::client::{function_call_type, FunctionCall, ToolCall};
+    use crate::config::ApprovalSettings;
 
     /// An [`AgentUi`] that renders nothing, for exercising the loop's own
     /// decisions without a front end.
@@ -583,67 +580,117 @@ mod tests {
 
     #[test]
     fn categorizes_known_tools() {
-        assert_eq!(get_tool_category("read_file"), "read");
-        assert_eq!(get_tool_category("list_files"), "read");
-        assert_eq!(get_tool_category("write_file"), "write");
-        assert_eq!(get_tool_category("replace_in_file"), "write");
-        assert_eq!(get_tool_category("run_terminal_command"), "terminal");
-        assert_eq!(get_tool_category("something_else"), "unknown");
+        assert_eq!(crate::tools::category_of("read_file"), "read");
+        assert_eq!(crate::tools::category_of("list_files"), "read");
+        assert_eq!(crate::tools::category_of("write_file"), "write");
+        assert_eq!(crate::tools::category_of("replace_in_file"), "write");
+        assert_eq!(
+            crate::tools::category_of("run_terminal_command"),
+            "terminal"
+        );
+        assert_eq!(crate::tools::category_of("web_fetch"), "web");
+        assert_eq!(crate::tools::category_of("something_else"), "unknown");
     }
 
-    fn settings(read: bool, write: bool, terminal: bool) -> ApprovalSettings {
-        ApprovalSettings {
-            read_disk: read,
-            write_disk: write,
-            terminal,
+    #[test]
+    fn the_shell_is_off_by_default_and_the_web_runs_freely() {
+        // Three defaults, three reasons. The shell can do anything the user
+        // can, so it is not offered until asked for. The web reads a page
+        // and changes nothing, and a prompt per page is what would push the
+        // model back to curling through the shell. Everything else asks.
+        let fresh = ToolAccessSettings::default();
+        for tool in crate::tools::TOOLS {
+            let expected = match tool.name {
+                "run_terminal_command" => ToolAccess::Never,
+                "web_fetch" => ToolAccess::Allow,
+                _ => ToolAccess::Ask,
+            };
+            assert_eq!(fresh.access(tool.name), expected, "{}", tool.name);
         }
+        // A name we do not know is the last thing that should run unwatched.
+        assert_eq!(fresh.access("something_else"), ToolAccess::Ask);
+        // And with the shell off, a fresh clanker still has tools.
+        assert!(fresh.any_tools());
     }
 
     #[test]
-    fn requires_approval_respects_per_category_flags() {
-        let all_on = settings(true, true, true);
-        assert!(requires_approval("read_file", &all_on));
-        assert!(requires_approval("list_files", &all_on));
-        assert!(requires_approval("write_file", &all_on));
-        assert!(requires_approval("replace_in_file", &all_on));
-        assert!(requires_approval("run_terminal_command", &all_on));
+    fn a_category_sets_every_tool_in_it_and_nothing_else() {
+        let settings = ToolAccessSettings::default()
+            .with("write", ToolAccess::Allow)
+            .unwrap();
+        assert_eq!(settings.access("write_file"), ToolAccess::Allow);
+        assert_eq!(settings.access("replace_in_file"), ToolAccess::Allow);
+        assert_eq!(settings.access("read_file"), ToolAccess::Ask);
+        assert_eq!(settings.access("run_terminal_command"), ToolAccess::Never);
 
-        let all_off = settings(false, false, false);
-        assert!(!requires_approval("read_file", &all_off));
-        assert!(!requires_approval("list_files", &all_off));
-        assert!(!requires_approval("write_file", &all_off));
-        assert!(!requires_approval("replace_in_file", &all_off));
-        assert!(!requires_approval("run_terminal_command", &all_off));
+        // One tool on its own, and a word that names neither.
+        let one = settings.with("read_file", ToolAccess::Never).unwrap();
+        assert_eq!(one.access("read_file"), ToolAccess::Never);
+        assert_eq!(one.access("list_files"), ToolAccess::Ask);
+        assert!(settings.with("nonesuch", ToolAccess::Ask).is_none());
     }
 
     #[test]
-    fn requires_approval_is_independent_per_category() {
-        // Only write approval enabled: read and terminal should be auto-approved,
-        // write should still prompt.
-        let write_only = settings(false, true, false);
-        assert!(!requires_approval("read_file", &write_only));
-        assert!(requires_approval("write_file", &write_only));
-        assert!(!requires_approval("run_terminal_command", &write_only));
+    fn a_tool_set_to_never_is_not_offered_at_all() {
+        // Left out of the request rather than refused when called: it costs
+        // no tokens, and the model is never invited to try.
+        let settings = ToolAccessSettings::default()
+            .with("write_file", ToolAccess::Never)
+            .unwrap();
+        let offered: Vec<String> = offered_tools(&settings)
+            .iter()
+            .map(|definition| definition["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+
+        assert!(!offered.iter().any(|name| name == "write_file"));
+        assert!(offered.iter().any(|name| name == "read_file"));
+        // The shell is `never` out of the box, so two are missing.
+        assert!(!offered.iter().any(|name| name == "run_terminal_command"));
+        assert_eq!(offered.len(), crate::tools::TOOLS.len() - 2);
+
+        // And with everything off there is nothing to send, which is what a
+        // clanker with no tools now is.
+        assert!(offered_tools(&ToolAccessSettings::none()).is_empty());
+        assert!(!ToolAccessSettings::none().any_tools());
+        assert!(ToolAccessSettings::default().any_tools());
     }
 
     #[test]
-    fn web_fetch_never_asks() {
-        // Deliberately exempt, and not via the `_ => true` fall-through that
-        // catches unmapped tools — this one is named. Prompting per page is
-        // what would push the model back to curling raw HTML.
-        assert!(!requires_approval("web_fetch", &settings(true, true, true)));
-        assert!(!requires_approval(
-            "web_fetch",
-            &settings(false, false, false)
-        ));
+    fn old_category_gates_still_mean_what_they_meant() {
+        // Sessions and configs written before tools had their own states
+        // hold three booleans. `true` was "ask first"; `false` was "just do
+        // it". Nothing is rewritten — they simply read as the same thing.
+        let legacy = ApprovalSettings {
+            read_disk: false,
+            write_disk: true,
+            terminal: false,
+        };
+        let derived = ToolAccessSettings::from_legacy(&legacy);
+        assert_eq!(derived.access("read_file"), ToolAccess::Allow);
+        assert_eq!(derived.access("list_files"), ToolAccess::Allow);
+        assert_eq!(derived.access("write_file"), ToolAccess::Ask);
+
+        // Two exceptions, both keeping their own default. The web was never
+        // part of the old model at all. The shell was, but the old model
+        // could not say "not offered", so reading its boolean would leave an
+        // upgrade with a shell a fresh install does not have.
+        assert_eq!(derived.access("web_fetch"), ToolAccess::Allow);
+        assert_eq!(
+            derived.access("run_terminal_command"),
+            ToolAccess::Never,
+            "the old terminal gate does not survive the upgrade"
+        );
     }
 
     #[test]
-    fn unknown_tools_always_require_approval() {
-        // Fail-safe: an unrecognized tool name must default to requiring approval,
-        // even when every known category is set to auto-approve.
-        let all_off = settings(false, false, false);
-        assert!(requires_approval("some_future_tool", &all_off));
+    fn a_tool_we_do_not_know_still_asks() {
+        // Fail-safe: a name that is not one of ours belongs to no category,
+        // so no bulk setting reaches it and its default stands even when
+        // everything else has been waved through.
+        let all_allowed = ToolAccessSettings::default()
+            .with("all", ToolAccess::Allow)
+            .unwrap();
+        assert_eq!(all_allowed.access("some_future_tool"), ToolAccess::Ask);
     }
 
     #[test]
@@ -744,7 +791,7 @@ mod tests {
         // to be typed, which a provider can reject if that position isn't
         // valid (e.g. right after a plain assistant reply). An
         // already-poisoned session — or one that's since switched back to
-        // ask mode — must not keep resending that stray copy.
+        // no tools — must not keep resending that stray copy.
         let stray = ChatMessage {
             role: "system".to_string(),
             content: Some(AGENT_CHAT_SYSTEM_PROMPT.to_string()),

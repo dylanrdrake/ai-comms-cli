@@ -23,7 +23,7 @@ use std::sync::Arc;
 use client::{ChatMessage, Client};
 use config::{
     clear_api_key, get_api_key, get_config_path, load_config, save_config, set_api_key,
-    ApprovalSettings, SessionGates, VALID_EFFORT_STYLES,
+    SessionGates, ToolAccess, ToolAccessSettings, VALID_EFFORT_STYLES,
 };
 use session::ChatSession;
 use spinner::Spinner;
@@ -36,9 +36,47 @@ use ui::{parse_bool, response_label};
 #[command(about = "Clanker Command Center - An OpenAI-compatible frontend for any LLM provider", long_about = None)]
 #[command(version = "0.1.0")]
 struct Cli {
-    /// With no subcommand at all, `clank` launches the full-screen TUI on
-    /// its launch screen — the only way in; there's no `tui` subcommand or
-    /// flags to skip straight into a new or resumed session.
+    /// A one-off question or task. With no prompt and no subcommand at all,
+    /// `clank` launches the full-screen TUI on its launch screen — the only
+    /// way in; there are no flags to skip straight into a clanker.
+    ///
+    /// A subcommand wins over a prompt, so a one-word prompt that happens to
+    /// be a subcommand name (`clank status`) runs the subcommand. Quote it
+    /// after `--` to force the prompt: `clank -- status`.
+    prompt: Option<String>,
+
+    /// Let this run use tools — read and write files, run commands — under
+    /// whatever `clank tools` allows. Without it a prompt is answered with
+    /// no tools at all.
+    #[arg(long)]
+    tools: bool,
+
+    /// Model to use (overrides the persistent default for this call)
+    #[arg(short, long)]
+    model: Option<String>,
+
+    /// Sampling temperature (overrides the persistent default for this call)
+    #[arg(long)]
+    temperature: Option<f32>,
+
+    /// Reasoning effort (overrides the persistent default for this call).
+    /// Not checked against a fixed list — pass whatever your model accepts.
+    #[arg(long)]
+    effort_level: Option<String>,
+
+    /// Maximum tool-calling iterations for this run (with `--tools`)
+    #[arg(long)]
+    max_iterations: Option<usize>,
+
+    /// Show each tool call and its result as it happens
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Keep this run as a clanker, so it shows up in the picker and can be
+    /// resumed. Without it a one-off leaves nothing behind.
+    #[arg(long)]
+    save: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -93,10 +131,13 @@ enum Commands {
         action: Option<HeaderCommands>,
     },
 
-    /// Configure approval settings for agentic actions
-    Approval {
-        #[command(subcommand)]
-        action: Option<ApprovalCommands>,
+    /// Show what each tool may do, or change it
+    Tools {
+        /// `ask`, `allow`, `never` — or `on`/`off` for every tool at once.
+        /// Omit to list them.
+        state: Option<String>,
+        /// A tool's name, a category (read/write/terminal/web), or `all`.
+        target: Option<String>,
     },
 
     /// View or set the persistent default max agent iterations
@@ -185,105 +226,51 @@ enum Commands {
         secs: Option<u64>,
     },
 
-    /// Send a prompt to the LLM
-    Ask {
-        /// Your prompt/question
-        prompt: String,
-
-        /// Model to use (overrides the persistent default for this call)
-        #[arg(short, long)]
-        model: Option<String>,
-
-        /// Sampling temperature (overrides the persistent default for this call)
-        #[arg(long)]
-        temperature: Option<f32>,
-
-        /// Reasoning effort (overrides the persistent default for this
-        /// call). Not checked against a fixed list — pass whatever your
-        /// model accepts.
-        #[arg(long)]
-        effort_level: Option<String>,
-    },
-
-    /// Interactive session — starts in plain ask mode; /agent turns on
-    /// tools (read/write files, run commands) from inside it. Also /model,
-    /// /effort, and /verbose. Same experience as `tui`, minus the screen.
-    Session {
-        /// Model to use for a new session (overrides the persistent
+    /// Start or resume a clanker in a line-based conversation — the
+    /// counterpart to the full-screen UI
+    Clanker {
+        /// Model to use for a new clanker (overrides the persistent
         /// default; ignored when resuming, which keeps its saved model)
         #[arg(short, long)]
         model: Option<String>,
 
         /// Maximum number of tool-calling iterations per turn while in
-        /// agent mode (overrides the persistent default for this call)
+        /// a clanker with tools (overrides the persistent default for this call)
         #[arg(long)]
         max_iterations: Option<usize>,
 
-        /// Sampling temperature for this session (overrides the persistent
+        /// Sampling temperature for this clanker (overrides the persistent
         /// default for this call)
         #[arg(long)]
         temperature: Option<f32>,
 
-        /// Reasoning effort for a new session (overrides the persistent
+        /// Reasoning effort for a new clanker (overrides the persistent
         /// default; ignored when resuming, which keeps its saved value).
         /// Not checked against a fixed list — pass whatever your model
         /// accepts.
         #[arg(long)]
         effort_level: Option<String>,
 
-        /// Resume a saved session by id (or unique id prefix); pass with no
-        /// value to pick from a list of all your saved sessions
+        /// Resume a saved clanker by id (or unique id prefix); pass with no
+        /// value to pick from a list of all your saved clankers
         #[arg(long, num_args = 0..=1, default_missing_value = PICK_SESSION_SENTINEL)]
         resume: Option<String>,
 
-        /// Resume in the current directory instead of the one the session
+        /// Resume in the current directory instead of the one the clanker
         /// was started in, and remember it — for a project that has moved
         #[arg(long)]
         here: bool,
 
-        /// Name the session. Prompted for if omitted; ignored when resuming,
-        /// since a resumed session keeps the name it has
+        /// Name the clanker. Prompted for if omitted; ignored when resuming,
+        /// since a resumed clanker keeps the name it has
         #[arg(long)]
         title: Option<String>,
     },
 
-    /// Run an agentic task (can write/read files)
-    Agent {
-        /// The task to execute
-        task: String,
-
-        /// Model to use (overrides the persistent default for this call)
-        #[arg(short, long)]
-        model: Option<String>,
-
-        /// Show detailed agent iterations
-        #[arg(short, long)]
-        verbose: bool,
-
-        /// Maximum number of iterations (overrides the persistent default for this call)
-        #[arg(long)]
-        max_iterations: Option<usize>,
-
-        /// Sampling temperature (overrides the persistent default for this call)
-        #[arg(long)]
-        temperature: Option<f32>,
-
-        /// Reasoning effort (overrides the persistent default for this
-        /// call). Not checked against a fixed list — pass whatever your
-        /// model accepts.
-        #[arg(long)]
-        effort_level: Option<String>,
-
-        /// Save this run as a session, so it shows up in the picker and can
-        /// be resumed later. Without it a task leaves nothing behind.
-        #[arg(long)]
-        session: bool,
-    },
-
-    /// Manage saved chat sessions
-    Sessions {
+    /// List, show or delete your saved clankers
+    Clankers {
         #[command(subcommand)]
-        action: Option<SessionCommands>,
+        action: Option<ClankerCommands>,
     },
 }
 
@@ -306,44 +293,18 @@ enum HeaderCommands {
 }
 
 #[derive(Subcommand)]
-enum SessionCommands {
-    /// List saved sessions
+enum ClankerCommands {
+    /// List saved clankers
     List,
-    /// Show a session's full message history
+    /// Show a clanker's full message history
     Show {
-        /// Session id (or unique id prefix)
+        /// Clanker id (or unique id prefix)
         id: String,
     },
-    /// Delete a saved session
+    /// Delete a saved clanker
     Delete {
-        /// Session id (or unique id prefix)
+        /// Clanker id (or unique id prefix)
         id: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum ApprovalCommands {
-    /// Show current approval settings
-    Show,
-    /// Set approval for reading from disk (read_file, list_files)
-    Read {
-        /// Enable or disable approval prompts
-        enabled: String,
-    },
-    /// Set approval for writing to disk (write_file, replace_in_file)
-    Write {
-        /// Enable or disable approval prompts
-        enabled: String,
-    },
-    /// Set approval for terminal commands (run_terminal_command)
-    Terminal {
-        /// Enable or disable approval prompts
-        enabled: String,
-    },
-    /// Set all approval settings at once
-    All {
-        /// Enable or disable all approval prompts
-        enabled: String,
     },
 }
 
@@ -354,26 +315,26 @@ const PICK_SESSION_SENTINEL: &str = "pick";
 
 /// Resolves a `--resume` value (an id/prefix, or the "pick" sentinel) to the
 /// session it refers to, prompting the user to choose from a numbered list
-/// of their saved sessions of the given kind when no id was given.
+/// of their saved clankers of the given kind when no id was given.
 fn resolve_resume_target(
     conn: &rusqlite::Connection,
     id_or_prefix: &str,
 ) -> Result<store::SessionSummary> {
     if id_or_prefix != PICK_SESSION_SENTINEL {
         return store::find_session(conn, id_or_prefix)?
-            .ok_or_else(|| anyhow::anyhow!("No session found matching '{}'", id_or_prefix));
+            .ok_or_else(|| anyhow::anyhow!("No clanker found matching '{}'", id_or_prefix));
     }
 
     let sessions = store::list_sessions(conn)?;
     if sessions.is_empty() {
-        anyhow::bail!("No saved sessions to resume");
+        anyhow::bail!("No saved clankers to resume");
     }
 
-    println!("{}\n", "Select a session to resume:".blue());
+    println!("{}\n", "Select a clanker to resume:".blue());
     for (i, s) in sessions.iter().enumerate() {
         let mode = store::mode_label(s.kind == KIND_AGENT_CHAT);
         println!(
-            "  {}. {}  {:<6}{}",
+            "  {}. {}  {} {}",
             i + 1,
             (&s.id[..8]).bright_black(),
             mode,
@@ -381,7 +342,7 @@ fn resolve_resume_target(
         );
     }
 
-    print!("\n{} ", "Session number:".blue());
+    print!("\n{} ", "Clanker number:".blue());
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -427,7 +388,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => cmd_tui().await?,
+        // A prompt on its own is a one-off run; nothing at all opens the TUI.
+        None => match cli.prompt {
+            Some(prompt) => {
+                cmd_run(
+                    &prompt,
+                    cli.tools,
+                    cli.model,
+                    cli.verbose,
+                    cli.max_iterations,
+                    cli.temperature,
+                    cli.effort_level,
+                    cli.save,
+                )
+                .await?
+            }
+            None => cmd_tui().await?,
+        },
         Some(Commands::Login) => cmd_login().await?,
         Some(Commands::Logout) => cmd_logout().await?,
         Some(Commands::Status) => cmd_status().await?,
@@ -436,7 +413,7 @@ async fn main() -> Result<()> {
         Some(Commands::Endpoint { url, clear }) => cmd_endpoint(url, clear).await?,
         Some(Commands::EffortStyle { value, clear }) => cmd_effort_style(value, clear).await?,
         Some(Commands::Headers { action }) => cmd_headers(action).await?,
-        Some(Commands::Approval { action }) => cmd_approval(action).await?,
+        Some(Commands::Tools { state, target }) => cmd_tools(state, target).await?,
         Some(Commands::MaxIterations { value, clear }) => cmd_max_iterations(value, clear).await?,
         Some(Commands::Temperature { value, clear }) => cmd_temperature(value, clear).await?,
         Some(Commands::Stream { value }) => cmd_stream(value).await?,
@@ -446,13 +423,7 @@ async fn main() -> Result<()> {
         Some(Commands::Verbose { value }) => cmd_verbose(value).await?,
         Some(Commands::EffortLevel { value, clear }) => cmd_effort_level(value, clear).await?,
         Some(Commands::Timeout { name, secs }) => cmd_timeout(name, secs).await?,
-        Some(Commands::Ask {
-            prompt,
-            model,
-            temperature,
-            effort_level,
-        }) => cmd_ask(&prompt, model, temperature, effort_level).await?,
-        Some(Commands::Session {
+        Some(Commands::Clanker {
             model,
             max_iterations,
             temperature,
@@ -461,7 +432,7 @@ async fn main() -> Result<()> {
             here,
             title,
         }) => {
-            cmd_session(
+            cmd_clanker(
                 model,
                 max_iterations,
                 temperature,
@@ -472,27 +443,7 @@ async fn main() -> Result<()> {
             )
             .await?
         }
-        Some(Commands::Agent {
-            task,
-            model,
-            verbose,
-            max_iterations,
-            temperature,
-            effort_level,
-            session,
-        }) => {
-            cmd_agent(
-                &task,
-                model,
-                verbose,
-                max_iterations,
-                temperature,
-                effort_level,
-                session,
-            )
-            .await?
-        }
-        Some(Commands::Sessions { action }) => cmd_sessions(action).await?,
+        Some(Commands::Clankers { action }) => cmd_clankers(action).await?,
     }
 
     Ok(())
@@ -615,18 +566,10 @@ async fn cmd_status() -> Result<()> {
         println!("  Extra headers: {}", config.extra_headers.len());
     }
     println!("  Config file: {}", get_config_path()?.display());
-    println!("\n{}", "Approval Settings:".blue());
-    print_approval_status(&config.approval);
+    println!("\n{}", "Tools:".blue());
+    print_tools(&config.tool_access());
     println!();
     Ok(())
-}
-
-fn format_approval(enabled: bool) -> String {
-    if enabled {
-        format!("{} Ask", "✓".green())
-    } else {
-        format!("{} Auto", "✗".yellow())
-    }
 }
 
 /// A session's state as one padded, coloured word, matching the launch
@@ -644,21 +587,6 @@ fn format_state(state: store::LastState) -> colored::ColoredString {
         LastState::New => ("new", |s| s.bright_black()),
     };
     colour(&format!("{word:<8}"))
-}
-
-fn print_approval_status(approval: &ApprovalSettings) {
-    println!(
-        "  Read from disk:    {}",
-        format_approval(approval.read_disk)
-    );
-    println!(
-        "  Write to disk:     {}",
-        format_approval(approval.write_disk)
-    );
-    println!(
-        "  Terminal commands: {}",
-        format_approval(approval.terminal)
-    );
 }
 
 /// Every configurable wait, with the field each one sets.
@@ -736,64 +664,54 @@ async fn cmd_timeout(name: Option<String>, secs: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_approval(action: Option<ApprovalCommands>) -> Result<()> {
+/// `clank tools` — the listing, and the one command that changes it.
+///
+/// One verb for both the global default and a clanker's own `/tools`, and
+/// one listing for both, so what you read in one place is what you would
+/// type in the other.
+async fn cmd_tools(state: Option<String>, target: Option<String>) -> Result<()> {
     let mut config = load_config()?;
 
-    match action {
-        None | Some(ApprovalCommands::Show) => {
-            println!("{}", "Approval Settings:".blue());
-            print_approval_status(&config.approval);
+    let updated = match (state.as_deref(), target.as_deref()) {
+        (None, _) => {
+            print_tools(&config.tool_access());
             println!("\n{}", "Usage:".bright_black());
-            println!("  clank approval read <on|off>     Set read approval");
-            println!("  clank approval write <on|off>    Set write approval");
-            println!("  clank approval terminal <on|off> Set terminal approval");
-            println!("  clank approval all <on|off>      Set all approvals");
+            println!("  clank tools <ask|allow|never> <tool|category|all>");
+            println!("  clank tools on                 Every tool back to its default");
+            println!("  clank tools off                Every tool off");
+            return Ok(());
         }
-        Some(ApprovalCommands::Read { enabled }) => {
-            let value = parse_bool(&enabled).map_err(|e| anyhow::anyhow!(e))?;
-            config.approval.read_disk = value;
-            save_config(&config)?;
-            println!(
-                "{} Read approval set to {}",
-                "✓".green(),
-                format_approval(value)
-            );
+        // Back to the defaults, which is not "ask for everything": the web
+        // tool reads a page and changes nothing, and its default is to get
+        // on with it.
+        (Some("on"), None) => ToolAccessSettings::defaults(),
+        (Some("off"), None) => ToolAccessSettings::none(),
+        (Some(state), Some(target)) => {
+            let access = ToolAccess::parse(state).ok_or_else(|| {
+                anyhow::anyhow!("Unknown state '{state}'. Use ask, allow or never.")
+            })?;
+            config
+                .tool_access()
+                .with(target, access)
+                .ok_or_else(|| anyhow::anyhow!("No tool or category called '{target}'."))?
         }
-        Some(ApprovalCommands::Write { enabled }) => {
-            let value = parse_bool(&enabled).map_err(|e| anyhow::anyhow!(e))?;
-            config.approval.write_disk = value;
-            save_config(&config)?;
-            println!(
-                "{} Write approval set to {}",
-                "✓".green(),
-                format_approval(value)
-            );
+        (Some(state), None) => {
+            anyhow::bail!("'{state}' needs something to act on: a tool, a category, or all.")
         }
-        Some(ApprovalCommands::Terminal { enabled }) => {
-            let value = parse_bool(&enabled).map_err(|e| anyhow::anyhow!(e))?;
-            config.approval.terminal = value;
-            save_config(&config)?;
-            println!(
-                "{} Terminal approval set to {}",
-                "✓".green(),
-                format_approval(value)
-            );
-        }
-        Some(ApprovalCommands::All { enabled }) => {
-            let value = parse_bool(&enabled).map_err(|e| anyhow::anyhow!(e))?;
-            config.approval.read_disk = value;
-            config.approval.write_disk = value;
-            config.approval.terminal = value;
-            save_config(&config)?;
-            println!(
-                "{} All approvals set to {}",
-                "✓".green(),
-                format_approval(value)
-            );
-        }
-    }
+    };
 
+    config.tools = Some(updated);
+    save_config(&config)?;
+    println!("{} Tools:", "✓".green());
+    print_tools(&config.tool_access());
     Ok(())
+}
+
+/// The tool listing, shared by `clank tools` and `clank status`.
+fn print_tools(access: &ToolAccessSettings) {
+    for (name, value) in ui::tool_rows(access) {
+        println!("  {:<22} {}", name, value.bright_black());
+    }
 }
 
 async fn cmd_model(name: Option<String>, clear: bool) -> Result<()> {
@@ -1072,7 +990,7 @@ async fn cmd_max_iterations(value: Option<usize>, clear: bool) -> Result<()> {
         config.max_iterations = None;
         save_config(&config)?;
         println!(
-            "{} Default max iterations cleared — agent mode now needs one set per call \
+            "{} Default max iterations cleared — a run with tools now needs one set per call \
              (--max-iterations) or per session (/max-iterations) to run at all",
             "✓".green()
         );
@@ -1204,6 +1122,54 @@ async fn cmd_models() -> Result<()> {
     Ok(())
 }
 
+/// The `kind` a clanker is created with, derived from what its tools add up
+/// to. Only a cache — see `ChatSession::is_agentic` — but it has to start
+/// right, since the launch screen and `clank clankers list` read the row
+/// without opening it.
+fn kind_for(access: &ToolAccessSettings) -> &'static str {
+    if access.any_tools() {
+        KIND_AGENT_CHAT
+    } else {
+        KIND_CHAT
+    }
+}
+
+/// A one-off run: `clank "..."`, with or without tools.
+///
+/// The two used to be separate commands — `ask` and `agent` — which made the
+/// difference between them a thing to learn rather than a flag. It is the
+/// same question either way: what may this run use? Without `--tools` the
+/// answer is nothing, and a run with nothing to call is a plain reply.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_run(
+    prompt: &str,
+    tools: bool,
+    model: Option<String>,
+    verbose: bool,
+    max_iterations: Option<usize>,
+    temperature: Option<f32>,
+    effort_level: Option<String>,
+    save: bool,
+) -> Result<()> {
+    // A run that is kept goes through the path that has a clanker to keep it
+    // in, tools or not — the only thing tools change is what it may call.
+    // A one-off with neither takes the shorter path: one request, printed.
+    if !tools && !save {
+        return cmd_ask(prompt, model, temperature, effort_level).await;
+    }
+    cmd_agent(
+        prompt,
+        tools,
+        model,
+        verbose,
+        max_iterations,
+        temperature,
+        effort_level,
+        save,
+    )
+    .await
+}
+
 async fn cmd_ask(
     prompt: &str,
     model: Option<String>,
@@ -1284,8 +1250,8 @@ fn user_prompts(messages: &[store::StoredMessage]) -> Vec<String> {
         .collect()
 }
 
-/// Handles one non-message line — a `/model`, `/agent`, `/ask`, `/effort`,
-/// `/verbose`, `/max-iterations`, `/temperature`, or `/approval` command — updating the session (and
+/// Handles one non-message line — a `/model`, `/tools`, `/effort`,
+/// `/verbose`, `/max-iterations`, or `/temperature` command — updating the session (and
 /// `ui`'s live verbosity, which isn't session state) and printing a
 /// confirmation in the same "set to X" / "already X" style the TUI's status
 /// notices use, so the two front ends read the same way.
@@ -1333,20 +1299,6 @@ fn apply_submission(
             println!(
                 "Model: {}",
                 response_label(session.model(), &session.effort_level().map(String::from))
-            );
-        }
-        ui::Submission::SetAgentic(agentic) => {
-            let changed = agentic != session.is_agentic();
-            session.set_agentic(agentic)?;
-            let label = if agentic {
-                "agent mode (tools enabled)"
-            } else {
-                "ask mode (no tools)"
-            };
-            println!(
-                "{} {} {label}",
-                "✓".green(),
-                if changed { "Switched to" } else { "Already in" }
             );
         }
         ui::Submission::SetEffort(effort_level) => {
@@ -1453,23 +1405,29 @@ fn apply_submission(
                 if changed { "set to" } else { "is" }
             );
         }
-        ui::Submission::SetApproval { category, enabled } => {
-            let updated = session.approval().with_category(&category, enabled);
-            let changed = updated != *session.approval();
-            session.set_approval(updated)?;
-            // All three, not just the one that moved: "Approval set to ✗
-            // Auto" named neither the gate it changed nor what the others
-            // were left at. The TUI has always shown the full set here.
-            println!(
-                "{} Approval {}:",
-                "✓".green(),
-                if changed { "set to" } else { "is" }
-            );
-            print_approval_status(session.approval());
+        ui::Submission::SetToolAccess { target, access } => {
+            let Some(updated) = session.tool_access().with(&target, access) else {
+                println!("{} No tool or category called '{target}'.", "✗".red());
+                return Ok(());
+            };
+            let changed = updated != *session.tool_access();
+            session.set_tool_access(updated)?;
+            // The whole list, not just the row that moved: naming one state
+            // tells you neither what else is set nor what it was set from,
+            // and this is the readout people check before walking away.
+            println!("{} Tools {}:", "✓".green(), if changed { "set to" } else { "are" });
+            print_tools(session.tool_access());
         }
-        ui::Submission::ShowApproval => {
-            println!("{}", "Approval Settings:".blue());
-            print_approval_status(session.approval());
+        ui::Submission::ResetToolAccess => {
+            // The configured access, not the built-in defaults: `clank
+            // tools` is the policy for tools once they are on.
+            session.set_tool_access(load_config()?.tool_access())?;
+            println!("{} Tools set to:", "✓".green());
+            print_tools(session.tool_access());
+        }
+        ui::Submission::ShowTools => {
+            println!("{}", "Tools:".blue());
+            print_tools(session.tool_access());
         }
         ui::Submission::SetSandbox(sandbox) => {
             session.set_sandbox(sandbox)?;
@@ -1500,12 +1458,11 @@ fn apply_submission(
             );
         }
         ui::Submission::ShowStatus => {
-            let approval = session.approval().clone();
+            let tool_access = session.tool_access().clone();
             let rows = ui::session_settings_rows(&ui::SessionSettings {
                 id: session.short_id(),
                 title: session.title(),
                 model: session.model(),
-                agentic: session.is_agentic(),
                 effort_level: session.effort_level(),
                 temperature: session.temperature(),
                 max_iterations: session.max_iterations(),
@@ -1514,10 +1471,10 @@ fn apply_submission(
                 sandbox: session.sandbox(),
                 stream: session.stream(),
                 working_dir: session.working_dir(),
-                approval: &approval,
+                tool_access: &tool_access,
             });
             let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
-            println!("\n{}", "Session:".blue());
+            println!("\n{}", "Clanker:".blue());
             for (label, value) in rows {
                 // Padded before colouring: the escape codes count toward a
                 // format width, so colouring first misaligns the column.
@@ -1555,7 +1512,7 @@ fn prompt_for_title() -> Result<String> {
     }
 }
 
-async fn cmd_session(
+async fn cmd_clanker(
     model: Option<String>,
     max_iterations: Option<usize>,
     temperature: Option<f32>,
@@ -1634,8 +1591,8 @@ async fn cmd_session(
             prior_prompts = user_prompts(&history);
             session
         }
-        // Every new session starts in plain ask mode, same as the TUI's
-        // "New session" — `/agent` turns tools on from inside it.
+        // A new clanker starts with no tools, same as the TUI's "Spawn
+        // clanker" — `/tools on` gives it the ones `clank tools` allows.
         None => {
             let model = resolve_model(&config, model);
             // Naming it is the deliberate act of starting one, so there's no
@@ -1653,7 +1610,7 @@ async fn cmd_session(
                 default_effort_level.clone(),
                 default_max_iterations,
                 default_temperature,
-                config.approval.clone(),
+                ToolAccessSettings::none(),
                 config.sandbox,
                 config.verbose,
                 config.highlight,
@@ -1669,7 +1626,7 @@ async fn cmd_session(
 
     let client = Client::new(config)?;
 
-    println!("{}\n", "Starting session (type 'exit' to quit)".blue());
+    println!("{}\n", "Starting clanker (type 'exit' to quit)".blue());
 
     let mut rl = DefaultEditor::new()?;
     // So Up/Down can recall prompts from before this resume, not just what's
@@ -1699,7 +1656,7 @@ async fn cmd_session(
              died expires on its own within half a minute.",
             session.short_id()
         ),
-        Err(e) => anyhow::bail!("Could not claim session {}: {e}", session.short_id()),
+        Err(e) => anyhow::bail!("Could not claim clanker {}: {e}", session.short_id()),
     }
 
     loop {
@@ -1747,7 +1704,7 @@ async fn cmd_session(
                 let turn = if session.is_agentic() {
                     let max_iterations = session.max_iterations();
                     let gates = SessionGates::new(
-                        session.approval().clone(),
+                        session.tool_access().clone(),
                         session.sandbox(),
                         client.command_timeout(),
                     );
@@ -1813,7 +1770,7 @@ async fn cmd_session(
     }
 
     println!(
-        "{} Session saved. Resume with: clank session --resume {}",
+        "{} Clanker saved. Resume with: clank clanker --resume {}",
         "✓".green(),
         session.short_id()
     );
@@ -1835,6 +1792,7 @@ fn open_agent_session(
     temperature: Option<f32>,
     effort_level: Option<String>,
     session: bool,
+    access: &ToolAccessSettings,
 ) -> Result<Option<(ChatSession, terminal_ui::ActivityWriter)>> {
     if !session {
         return Ok(None);
@@ -1846,11 +1804,11 @@ fn open_agent_session(
         conn,
         session::new_id(),
         resolve_model(config, model),
-        store::KIND_AGENT_CHAT,
+        kind_for(access),
         resolve_effort_level(config, effort_level),
         resolve_max_iterations(config, max_iterations),
         resolve_temperature(config, temperature),
-        config.approval.clone(),
+        access.clone(),
         config.sandbox,
         config.verbose,
         config.highlight,
@@ -1862,13 +1820,13 @@ fn open_agent_session(
     // Nothing else can be holding a session created a line ago, but it goes
     // through the same claim so that every path out of here owns one.
     let Some(activity) = terminal_ui::ActivityWriter::claim(session.id().to_string())? else {
-        anyhow::bail!("Could not claim the session just created");
+        anyhow::bail!("Could not claim the clanker just created");
     };
     // No title is set, which leaves it eligible for the usual
     // derive-from-first-message step — and the first message is the task, so
     // the picker names the session after the work rather than "Untitled".
     println!(
-        "{} Session {} — resume it with `clank session --resume {}`\n",
+        "{} Clanker {} — resume it with `clank clanker --resume {}`\n",
         "✓".green(),
         session.short_id(),
         session.short_id()
@@ -1879,6 +1837,7 @@ fn open_agent_session(
 #[allow(clippy::too_many_arguments)]
 async fn cmd_agent(
     task: &str,
+    tools: bool,
     model: Option<String>,
     verbose: bool,
     max_iterations: Option<usize>,
@@ -1888,6 +1847,11 @@ async fn cmd_agent(
 ) -> Result<()> {
     let config = load_config()?;
 
+    let access = if tools {
+        config.tool_access()
+    } else {
+        ToolAccessSettings::none()
+    };
     let stored = open_agent_session(
         &config,
         model.clone(),
@@ -1895,18 +1859,19 @@ async fn cmd_agent(
         temperature,
         effort_level.clone(),
         session,
+        &access,
     )?;
 
     // A session's own settings are the ones it runs with; the flag-plus-config
     // merge only applies to a run that has no session to remember anything.
-    let (model, max_iterations, temperature, effort_level, approval, sandbox, stream) =
+    let (model, max_iterations, temperature, effort_level, tool_access, sandbox, stream) =
         match &stored {
             Some((session, _)) => (
                 session.model().to_string(),
                 session.max_iterations(),
                 session.temperature(),
                 session.effort_level().map(str::to_string),
-                session.approval().clone(),
+                session.tool_access().clone(),
                 session.sandbox(),
                 session.stream(),
             ),
@@ -1915,21 +1880,31 @@ async fn cmd_agent(
                 resolve_max_iterations(&config, max_iterations),
                 resolve_temperature(&config, temperature),
                 resolve_effort_level(&config, effort_level),
-                config.approval.clone(),
+                access,
                 config.sandbox,
                 config.stream,
             ),
         };
 
+    // Nothing to call means nothing to loop over: one iteration is the whole
+    // of the turn, so a nullified cap is no reason to refuse the run.
+    let max_iterations = if tool_access.any_tools() {
+        max_iterations
+    } else {
+        max_iterations.or(Some(1))
+    };
+
     let client = Client::new(config)?;
 
-    println!("{}\n", "Starting agent task...".blue());
+    if tool_access.any_tools() {
+        println!("{}\n", "Starting task...".blue());
+    }
 
     // Unlike `session`, a one-shot task has no other way to show which
     // model answered, so it keeps the label `session`/`tui` dropped.
     let mut ui = TerminalAgentUi::new(verbose, true);
 
-    let gates = SessionGates::new(approval, sandbox, client.command_timeout());
+    let gates = SessionGates::new(tool_access, sandbox, client.command_timeout());
 
     let Some((mut session, activity)) = stored else {
         agent::run_agent(
@@ -1998,7 +1973,7 @@ async fn cmd_tui() -> Result<()> {
         effort_level: config.effort_level.clone(),
         max_iterations: config.max_iterations,
         temperature: config.temperature,
-        approval: config.approval.clone(),
+        tool_access: config.tool_access(),
         sandbox: config.sandbox,
         verbose: config.verbose,
         highlight: config.highlight,
@@ -2010,14 +1985,14 @@ async fn cmd_tui() -> Result<()> {
     tui::run(context).await
 }
 
-async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
+async fn cmd_clankers(action: Option<ClankerCommands>) -> Result<()> {
     let conn = store::open_db()?;
 
-    match action.unwrap_or(SessionCommands::List) {
-        SessionCommands::List => {
+    match action.unwrap_or(ClankerCommands::List) {
+        ClankerCommands::List => {
             let sessions = store::list_sessions(&conn)?;
             if sessions.is_empty() {
-                println!("No saved sessions.");
+                println!("No saved clankers.");
                 return Ok(());
             }
 
@@ -2026,7 +2001,7 @@ async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
             // session that is running in another terminal.
             let last = store::last_messages(&conn).unwrap_or_default();
 
-            println!("{}\n", "Saved sessions:".blue());
+            println!("{}\n", "Saved clankers:".blue());
             for s in &sessions {
                 let state = store::last_state(s.activity, s.heartbeat, last.get(&s.id));
                 println!(
@@ -2049,9 +2024,9 @@ async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
                 }
             }
         }
-        SessionCommands::Show { id } => {
+        ClankerCommands::Show { id } => {
             let summary = store::find_session(&conn, &id)?
-                .ok_or_else(|| anyhow::anyhow!("No session found matching '{}'", id))?;
+                .ok_or_else(|| anyhow::anyhow!("No clanker found matching '{}'", id))?;
             let messages = store::load_messages(&conn, &summary.id)?;
 
             println!(
@@ -2063,9 +2038,9 @@ async fn cmd_sessions(action: Option<SessionCommands>) -> Result<()> {
             );
             print_transcript(&messages);
         }
-        SessionCommands::Delete { id } => {
+        ClankerCommands::Delete { id } => {
             let summary = store::find_session(&conn, &id)?
-                .ok_or_else(|| anyhow::anyhow!("No session found matching '{}'", id))?;
+                .ok_or_else(|| anyhow::anyhow!("No clanker found matching '{}'", id))?;
             store::delete_session(&conn, &summary.id)?;
             println!(
                 "{} Deleted session {} ({})",
@@ -2130,7 +2105,7 @@ mod tests {
 
     #[test]
     fn a_cleared_max_iterations_stays_cleared() {
-        // Same rule, and the one with teeth: agent mode refuses to run
+        // Same rule, and the one with teeth: a run with tools refuses to start
         // without a cap rather than inventing one — see
         // `agent::run_agent_turn`.
         let cleared = config_with(None, None, None, None);

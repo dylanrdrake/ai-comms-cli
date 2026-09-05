@@ -7,19 +7,19 @@ list is no longer five commits long.
 Rebuild first — `cargo install --path .`, or run `./target/release/clank`.
 Ordered by how likely each is to be broken, not by how new it is.
 
-## 1. Every in-session command — highest risk
+## 1. Every in-clanker command — highest risk
 
 `204b418` moved the TUI's submission dispatch out of the key handler: 416
 lines of `src/tui/mod.rs`, touching the wiring of *every* slash command.
 Five paths have tests. The rest are held up by the compiler and nothing
 else, so this is where a silent breakage would be.
 
-In a TUI session (`clank`, open or start one), run each and check it does
+In a TUI clanker (`clank`, open or start one), run each and check it does
 what it claims:
 
 ```
 /help                 lists every command
-/status               shows the session's settings
+/status               shows the clanker's settings
 /model                reports the current model
 /model <name>         switches it; settings bar updates
 /effort               reports the level
@@ -30,11 +30,11 @@ what it claims:
 /highlight off        the band behind your messages goes
 /sandbox              reports whether writes are confined
 /stream               reports streaming
-/approval             shows the three gates
-/approval write off   changes one; takes effect immediately
-/session title Foo    renames; the header updates
-/agent                tools on
-/ask                  tools off
+/tools                lists every tool and what it may do
+/tools allow write    changes both write tools; takes effect immediately
+/tools never run_terminal_command   refused on the spot mid-turn
+/tools on             every tool back to its default
+/clanker title Foo    renames; the header updates
 /max-iterations 5     sets the cap
 /back                 returns to the launch screen
 ```
@@ -70,16 +70,16 @@ Edge cases:
 - A filter matching nothing → "nothing matches", not an empty box.
 - `/models` then `Esc` before the list arrives → stays closed, does not
   reopen when the fetch lands.
-- `/models` in the line-based `clank session` → says it is a TUI command.
+- `/models` in the line-based `clank clanker` → says it is a TUI command.
 - `/models` with an argument (`/models claude`) → a usage error, not prose.
 
-## 3. Session list, now flat
+## 3. Clanker list, now flat
 
 `8adb1a6` removed the "In this directory" / "Elsewhere" split.
 
 - `clank` → one list, newest first, no section headings.
 - Directory column: `.` for the directory you are in, `~/…` under home, a
-  full path above home, `dir not recorded` for sessions saved before it was
+  full path above home, `dir not recorded` for clankers saved before it was
   tracked.
 - Arrow top to bottom — the cursor should never skip a row or land
   somewhere that cannot be opened.
@@ -99,13 +99,13 @@ The rotating dot circle is now two braille cells of scattered dots,
 regenerated each tick. It should look like noise, not a clock.
 
 - A running turn in the TUI — the `working` indicator in the settings bar.
-- The same session watched from the launch screen in another terminal — the
+- The same clanker watched from the launch screen in another terminal — the
   badge should animate identically, and the badge column is one cell wider
   than it was, so check nothing in the list sits ragged.
-- `clank ask "..."` — the CLI spinner uses the same frames.
+- `clank "..."` — the CLI spinner uses the same frames.
 - `/models` while it fetches.
 
-## 6. A session surviving being reopened
+## 6. A clanker surviving being reopened
 
 Fixed after this plan was written; the exact sequence that lost one:
 
@@ -117,7 +117,7 @@ Fixed after this plan was written; the exact sequence that lost one:
 It should still be listed. Before the fix it was deleted here, because
 reopening rebuilt "was this named?" from whether anyone had spoken in it.
 
-The same root caused a second one worth checking: name a session, back out,
+The same root caused a second one worth checking: name a clanker, back out,
 resume it, and *then* type something. The name you gave it should survive —
 it used to be replaced by one derived from that first message.
 
@@ -158,8 +158,8 @@ Tab                   back round to /models
 /                     lists as many as fit, then a "+N" count
 Tab × 25              steps through all 21 and round again; the row
                       should slide so the marked one is always visible
-/approval             the row becomes the command's form
-/approval read on     the form stays up while you type the arguments
+/tools                the row becomes the command's form
+/tools allow read     the form stays up while you type the arguments
 hello                 no row at all
 /etc/hosts            no row at all
 ```
@@ -169,25 +169,25 @@ hello                 no row at all
 - Tab in the middle of an ordinary message must do nothing at all.
 - Tab with the `/models` browser open must do nothing (the browser owns the
   keyboard; the box is its filter).
-- The line-based `clank session` does none of this, by design.
+- The line-based `clank clanker` does none of this, by design.
 
-## 8. Backing out of a working session, and going back in
+## 8. Backing out of a working clanker, and going back in
 
 New, and the part with no automated coverage — it needs a live model call,
 and there is no fake client to run a worker against, so this section is the
 test.
 
-Start an **agent** session (`/agent`) with a task that takes a while and
+Start a clanker with tools (the default) and give it a task that takes a while and
 writes something, then:
 
 1. `Ctrl-B` while it is working.
-2. The launch screen should show that session `working`, animating, with the
+2. The launch screen should show that clanker `working`, animating, with the
    tool it is running on the line beneath.
 3. Watch it change on its own — the detail line should follow what it is
    doing, without you touching anything.
 4. When it wants to write or run something, the badge should become `?` with
    what it is asking about. It must **wait** there, not deny itself.
-5. Press Enter on that row. You should land back in the session — the whole
+5. Press Enter on that row. You should land back in the clanker — the whole
    transcript, including everything it did while you were away — with the
    approval box up and answerable (`Ctrl-Y` / `Ctrl-N`).
 6. Answer it. The turn should carry on from where it paused.
@@ -196,32 +196,32 @@ writes something, then:
 
 Then the things that must not have broken:
 
-- **Two at once.** Back out of a working session, start a second one, set it
+- **Two at once.** Back out of a working clanker, start a second one, set it
   working, back out of that too. Both should show as working and both should
   be resumable. A third, opened and left idle, should not disturb them.
-- **Another terminal still cannot touch them.** With a session parked here,
-  open `clank` in a second terminal: that session must be refused, saying it
-  is in use. This is the point — parking does not make a claimed session
+- **Another terminal still cannot touch them.** With a clanker parked here,
+  open `clank` in a second terminal: that clanker must be refused, saying it
+  is in use. This is the point — parking does not make a claimed clanker
   shareable, it makes *this* clank able to hand its own screen back.
-- **Renaming a parked session** from the picker (`r`) should stick. Go back
+- **Renaming a parked clanker** from the picker (`r`) should stick. Go back
   into it afterwards and the header should show the new name, not the old.
-- **Deleting a parked session** (`d`) should be refused while it works, and
+- **Deleting a parked clanker** (`d`) should be refused while it works, and
   allowed once it has finished.
 - **Type at it after resuming.** Steering a resumed turn should work exactly
   as it does in one you never left.
 - `Esc` mid-turn still cancels. `Ctrl-C` still quits promptly — it must not
-  hang waiting for parked sessions, and a tool subprocess (`sleep 60`) must
+  hang waiting for parked clankers, and a tool subprocess (`sleep 60`) must
   not be left behind. Check with `ps` after.
-- Back out of an *idle* session — instant, and an empty unnamed one is still
+- Back out of an *idle* clanker — instant, and an empty unnamed one is still
   discarded rather than left in the list.
 
 ## 9. Two smaller ones
 
-- **`? waiting` in the settings row.** In a session, get an approval to come
-  up (agent mode, ask it to write a file). The row above the key hints should
+- **`? waiting` in the settings row.** In a clanker, get an approval to come
+  up (ask a clanker with tools to write a file). The row above the key hints should
   stop animating `working` and read `? waiting` for as long as the box is up,
   then go back to `working` when you answer. The launch screen's badge for
-  the same session should agree.
+  the same clanker should agree.
 - **Discarded output is dimmed.** Run `$ ls`, press `Ctrl-D` to discard. The
   output should stay in the transcript, dimmed to the same grey as a `default`
   value in `/status`. Then run `$ ls` again and press `Ctrl-S` — that one
@@ -230,26 +230,107 @@ Then the things that must not have broken:
 
 ## 10. Spawning a clanker
 
-- `clank` → the first row reads **Spawn clanker**, not "New session".
+- `clank` → the first row reads **Spawn clanker**, not "New clanker".
 - Enter on it → the naming screen shows a mark above the name field, with
   `Tab for another` beside it.
 - `Tab` repeatedly → the mark should change every press, shape and colour,
   and whatever you have typed must stay put.
-- Type a name, `Tab` some more, then Enter → the session that opens should
+- Type a name, `Tab` some more, then Enter → the clanker that opens should
   carry **the mark that was on screen when you pressed Enter**, both in the
   reply gutter and on its row back in the list. A different one means the id
   being shown is not the id being created.
 - `Esc` from the naming screen → nothing is created; the list is unchanged.
-- `clank sessions` → the same mark again, drawn by the CLI.
+- `clank clankers list` → the same mark again, drawn by the CLI.
+- Inside the clanker, the top row reads `<mark> <name>  <directory>`, with
+  the same mark as its row and its reply gutter. Spawn two clankers with the
+  same name and check the top rows still tell them apart.
 
-## 11. From the round before, worth a glance
+## 11. Tools, three ways
 
-- **Picker scrolls.** Accumulate more sessions than fit, or shrink the
+New: approvals are per tool, with three states, and `approval` is gone.
+
+```
+clank tools                          six listed: web_fetch "allow",
+                                     run_terminal_command "never",
+                                     the rest "ask"
+clank tools never run_terminal_command
+clank tools                          it now reads "never"
+clank tools on                       back to defaults, web_fetch "allow" again
+clank tools allow read               both read tools, nothing else
+clank tools bogus off                refused, naming the word it did not know
+clank status                         the same listing at the bottom
+```
+
+In a clanker (`/tools` takes the same arguments):
+
+1. `/tools` → the listing, with `✓ ask` / `! allow` / `✗ never` marks.
+2. Ask a fresh clanker to run a shell command *without* touching `/tools`.
+   It should say it cannot — the shell is `never` out of the box, so it is
+   not in the request at all and a verbose turn shows the model never
+   trying. Then `/tools ask run_terminal_command` and try again: now it
+   prompts.
+3. Start a turn that will write a file, and while it is running set
+   `/tools never write_file` from the box. The call in flight should be
+   **refused**, not prompted — the list was sent before you changed it, so
+   the refusal has to happen at the call.
+4. `/tools off` → the clanker becomes a plain chat: ask it to read a file
+   and it should say it has no way to.
+5. `/tools on` → tools return, and `web_fetch` is back to `allow` rather
+   than `ask`.
+6. `/status` → a `Tools` row saying on/off, and an `Each tool` row naming
+   every one.
+
+**The upgrade path, worth checking once against your real database:** open a
+clanker created before this change. Its read and write tools should read as
+whatever its approval gates were — a category you had turned off comes back
+as `allow`, not `ask`. The shell is the exception: it reads `never` whatever
+the old gate said. Same for `clank tools` against your existing
+`~/.clank/config.json`, which has no `tools` key in it yet.
+
+## 12. One noun, and no modes
+
+New: `ask`, `agent`, `session` and `sessions` are gone from the CLI, and
+`/agent` and `/ask` are gone from inside a clanker.
+
+```bash
+clank "what is a monad"                    a plain answer, no tools
+clank "create a test.txt file" --tools     it writes the file
+clank "create a test.txt file"             it says it cannot
+clank -- status                            the prompt, not the subcommand
+clank status                               the subcommand
+clank "..." --save                         kept, with no tools
+clank clanker --title "Parser work"        the line-based conversation
+clank clankers list                        the saved ones
+clank ask "..."                            unknown command now
+```
+
+- The list column shows 🔨 or 💬 where it used to say `agent` / `ask`, in
+  both `clank clankers list` and the launch screen. Check the columns after
+  it still line up — those glyphs are two cells wide.
+- **A new clanker starts with no tools** (💬), same as ask mode used to.
+  Ask it to read a file and it should say it cannot. `/tools on` → 🔨, and
+  the same request works.
+- `/tools on` gives it what `clank tools` allows, not the built-in
+  defaults: set `clank tools allow read`, then `/tools on` in a fresh
+  clanker should show `read_file allow`.
+- `/agent` and `/ask` are ordinary messages now — type one and it goes to
+  the model rather than being caught as a command.
+- `/clanker title Foo` renames; `/clanker` shows the name.
+- `/status` has no "Mode" row; it has `Tools` (on/off) and `Each tool`.
+- **The old `kind` column is still written**, so check that a clanker shows
+  💬 in the list without being opened, then 🔨 after `/tools on` and backing
+  out.
+- `clank "explain this repo" --save` — saved with no tools, resumable, and
+  it reads 💬 in the list.
+
+## 13. From the round before, worth a glance
+
+- **Picker scrolls.** Accumulate more clankers than fit, or shrink the
   terminal. The list should follow the cursor, and the rule above it should
   say `N more below` / `N above · N below`.
 - **`clank timeout`** — shows four values; `clank timeout stream-idle 180`
   sets one; `clank timeout bogus` and `clank timeout connect 0` are refused.
-- **Held sessions** show `⎚` in the list. Open a session in one terminal,
+- **Held clankers** show `⎚` in the list. Open a clanker in one terminal,
   look at the launch screen in another; opening it there should be refused
   with a one-line notice, and the notice should clear on the next keypress.
 - **Bare `/effort`** reports the level instead of erroring.

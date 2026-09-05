@@ -171,7 +171,11 @@ fn state_badge(state: LastState, held: bool, tick: usize) -> (String, Style) {
 
 // Fixed columns, so the preview can be given whatever the line has left.
 const MARKER_WIDTH: usize = 2 + ICON_WIDTH + 1 + BADGE_WIDTH + 1; // marker, mark, badge, gaps
-const KIND_WIDTH: usize = 7;
+                                                                  // One glyph and a gutter. `mode_label` returns a two-column emoji that
+                                                                  // `column` pads as one `char`, so the cell draws a column wider than this
+                                                                  // says — harmlessly, since every row carries one and they stay aligned with
+                                                                  // each other.
+const KIND_WIDTH: usize = 3;
 const TITLE_WIDTH: usize = 24;
 const DIR_WIDTH: usize = 24;
 const WHEN_WIDTH: usize = 8;
@@ -438,7 +442,7 @@ pub fn draw(
     .split(frame.area());
 
     let mut lines: Vec<Line> = Vec::new();
-    // Set by a row that wants a blank line after it. Only "New session"
+    // Set by a row that wants a blank line after it. Only "Spawn clanker"
     // does, to keep it off the top of the list proper.
     let mut trailing_blank = false;
     // Which built line the cursor is on, which is what the list has to keep
@@ -536,7 +540,7 @@ pub fn draw(
 
     if picker.items.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  no saved sessions yet",
+            "  no saved clankers yet",
             Style::new().dark_gray().italic(),
         )));
     }
@@ -553,7 +557,7 @@ pub fn draw(
         Line::from(vec![
             Span::styled(
                 format!(
-                    " delete session {} ({})? ",
+                    " delete clanker {} ({})? ",
                     row.short_id(),
                     truncate(&row.title, 30)
                 ),
@@ -733,18 +737,20 @@ fn relative_time(timestamp: i64) -> String {
 mod tests {
 
     #[test]
-    fn the_kind_column_says_ask_not_chat() {
-        // The stored kind is "chat"; the word everywhere a user reads it is
-        // "ask", matching /ask and /agent.
-        let ask = row("00000001", crate::store::KIND_CHAT, "t");
-        let agent = row("00000002", KIND_AGENT_CHAT, "t");
+    fn the_kind_column_says_what_it_can_do_not_what_it_is_stored_as() {
+        // The stored kind is still "chat"/"agent_chat" — a cache of what
+        // the tools add up to, for rows read without being opened — but
+        // there are no modes any more, so what a reader sees is whether it
+        // has tools.
+        let without = row("00000001", crate::store::KIND_CHAT, "t");
+        let with = row("00000002", KIND_AGENT_CHAT, "t");
         assert_eq!(
-            column(mode_label(ask.is_agentic()), KIND_WIDTH).trim_end(),
-            "ask"
+            column(mode_label(without.is_agentic()), KIND_WIDTH).trim_end(),
+            "💬"
         );
         assert_eq!(
-            column(mode_label(agent.is_agentic()), KIND_WIDTH).trim_end(),
-            "agent"
+            column(mode_label(with.is_agentic()), KIND_WIDTH).trim_end(),
+            "🔨"
         );
     }
 

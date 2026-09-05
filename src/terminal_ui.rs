@@ -73,18 +73,18 @@ impl ActivityWriter {
 pub struct TerminalAgentUi {
     /// Mirrors the `-v` flag: gates the full argument/result dump. The
     /// marker-and-name notice below it — matching what the TUI always shows
-    /// — is not gated, so plain `agent`/`agent-chat` isn't silent about
+    /// — is not gated, so a run with tools isn't silent about
     /// tool calls the way it used to be.
     verbose: bool,
     /// Whether a reply is prefixed with `model (effort):`. On for one-shot
-    /// `agent` calls, where there's no other way to see what answered; off
-    /// for `session`, matching the TUI transcript, which dropped the same
+    /// one-off runs, where there's no other way to see what answered; off
+    /// for `clanker`, matching the TUI transcript, which dropped the same
     /// label — current model there is `/model`'s job, not every reply's.
     show_model_label: bool,
     /// Live only between `RequestStarted` and `RequestFinished`.
     spinner: Option<Spinner>,
-    /// Set for a `session`, which is watchable from the picker; `None` for a
-    /// one-shot `agent`, which nobody is monitoring.
+    /// Set for a clanker, which is watchable from the picker; `None` for a
+    /// one-off run, which nobody is monitoring.
     activity: Option<ActivityWriter>,
     /// The call's arguments, held from `ToolCallStarted` to whichever event
     /// settles it, so the notice that settles it can still name the file
@@ -107,7 +107,7 @@ pub struct TerminalAgentUi {
     /// `ToolCallCompleted`/`ToolCallDenied` draw no further marker for it.
     approval_shown: bool,
     /// This session's braille mark, the same one the TUI's gutter and the
-    /// picker's rows draw. `None` for a one-shot `agent`, which has no
+    /// picker's rows draw. `None` for a one-off run, which has no
     /// session to be identified by; that falls back to a plain marker.
     mark: Option<String>,
 }
@@ -136,7 +136,7 @@ impl TerminalAgentUi {
     }
 
     /// Flips the `-v`-equivalent detail level live, for `/verbose` in a
-    /// `session` loop. Takes effect from the next event on.
+    /// `clanker` loop. Takes effect from the next event on.
     pub fn set_verbose(&mut self, verbose: bool) {
         self.verbose = verbose;
     }
@@ -147,8 +147,8 @@ impl TerminalAgentUi {
     ///
     /// Inherent rather than only reachable through [`AgentUi`], because the
     /// two ways this front end is driven arrive by different routes: the
-    /// one-shot `agent` command calls the loop inline and gets events
-    /// through the trait, while a `session` running on a
+    /// one-off run calls the loop inline and gets events
+    /// through the trait, while a `clanker` running on a
     /// [`crate::conversation::Conversation`] sees them re-emitted as
     /// `Event::Agent(..)` and never touches the trait at all. Both render
     /// identically because both land here.

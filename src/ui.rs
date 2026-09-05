@@ -9,7 +9,7 @@
 //! having to fork the loop just to render it differently: it implements this
 //! trait instead. [`crate::terminal_ui`] is the CLI's implementation.
 
-use crate::config::ApprovalSettings;
+use crate::config::{ToolAccess, ToolAccessSettings};
 use anyhow::Result;
 use std::future::Future;
 
@@ -99,7 +99,7 @@ pub fn parse_yes_no(input: &str) -> bool {
 }
 
 /// What a submitted line turned out to be. Shared between the TUI's input
-/// box and the CLI's `session` loop, so `/model`, `/agent`, etc. behave
+/// box and the CLI's `clanker` loop, so `/model`, `/tools`, etc. behave
 /// identically in both.
 ///
 /// Recognized commands are intercepted, and so is a line that names one of
@@ -136,7 +136,6 @@ pub enum Submission {
     Back,
     SetModel(String),
     ShowModel,
-    SetAgentic(bool),
     /// `None` nullifies the override (`/effort clear`) — no effort field is
     /// sent, regardless of the configured default, until set again.
     SetEffort(Option<String>),
@@ -178,15 +177,17 @@ pub enum Submission {
     SetTemperature(Option<f32>),
     /// `/temperature default` — same deal as [`Submission::ResetMaxIterations`].
     ResetTemperature,
-    /// `category` is one of "read", "write", "terminal", "all" — already
-    /// validated by [`classify`], so a consumer can match on it directly.
-    SetApproval {
-        category: String,
-        enabled: bool,
+    /// `target` is a tool's name, a category, or "all" — checked against
+    /// the tool table by whoever applies it, since a typo there deserves a
+    /// message rather than a silent no-op.
+    SetToolAccess {
+        target: String,
+        access: ToolAccess,
     },
-    /// Prints/shows this session's current tool-approval gates without
-    /// changing them.
-    ShowApproval,
+    /// `/tools on` — every tool back to what it does by default.
+    ResetToolAccess,
+    /// Prints/shows what each tool may do, without changing anything.
+    ShowTools,
     /// Confines the agent's file writes to the working directory, or lets
     /// them go anywhere. The read tools are unaffected either way.
     SetSandbox(bool),
@@ -197,7 +198,7 @@ pub enum Submission {
     /// changing any of them. Named for `clank status`, which does the same
     /// job one scope out: global configuration there, this session here.
     ShowStatus,
-    /// Renames this session. `/session` is the namespace for acting on the
+    /// Renames this clanker. `/clanker` is the namespace for acting on the
     /// session itself, as opposed to the settings it runs with.
     SetTitle(String),
     /// Prints/shows this session's name without changing it.
@@ -205,9 +206,9 @@ pub enum Submission {
     /// Prints/shows every in-session command and what it does.
     ShowHelp,
     /// A line that named a known command (`/effort`, `/max-iterations`,
-    /// `/temperature`/`/temp`, `/approval`, `/sandbox`) but wasn't a valid
+    /// `/temperature`/`/temp`, `/tools`, `/sandbox`) but wasn't a valid
     /// invocation of
-    /// it — a missing/invalid argument, an unrecognized approval category,
+    /// it — a missing/invalid argument, a tool or category that is not one,
     /// too many or too few words, and so on. Unlike a `/<word>` that isn't a
     /// recognized command at all (kept as an ordinary [`Submission::Message`],
     /// since paths like `/etc/hosts` are common in a coding tool), this is
@@ -225,7 +226,6 @@ pub struct SessionSettings<'a> {
     pub id: &'a str,
     pub title: &'a str,
     pub model: &'a str,
-    pub agentic: bool,
     pub effort_level: Option<&'a str>,
     pub temperature: Option<f32>,
     pub max_iterations: Option<usize>,
@@ -234,7 +234,7 @@ pub struct SessionSettings<'a> {
     pub sandbox: bool,
     pub stream: bool,
     pub working_dir: Option<&'a str>,
-    pub approval: &'a ApprovalSettings,
+    pub tool_access: &'a ToolAccessSettings,
 }
 
 /// `/status` as label/value rows, ready for either front end to draw.
@@ -244,17 +244,19 @@ pub struct SessionSettings<'a> {
 /// different thing from one that happens to equal the default.
 pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)> {
     let on_off = |value: bool| if value { "on" } else { "off" }.to_string();
-    let gate = |enabled: bool| if enabled { "Ask" } else { "Auto" };
 
     vec![
         ("ID".to_string(), settings.id.to_string()),
         ("Title".to_string(), settings.title.to_string()),
         (
-            "Mode".to_string(),
-            if settings.agentic {
-                "agent — tools enabled".to_string()
+            "Tools".to_string(),
+            // Read from the tool states rather than from a mode flag beside
+            // them: having tools *is* having at least one tool that is not
+            // `never`, and two places to look would eventually disagree.
+            if settings.tool_access.any_tools() {
+                "on".to_string()
             } else {
-                "ask — no tools".to_string()
+                "off — nothing is offered to the model".to_string()
             },
         ),
         ("Model".to_string(), settings.model.to_string()),
@@ -293,15 +295,42 @@ pub fn session_settings_rows(settings: &SessionSettings) -> Vec<(String, String)
                 .unwrap_or_else(|| "not recorded".to_string()),
         ),
         (
-            "Approval".to_string(),
-            format!(
-                "read {} · write {} · terminal {}",
-                gate(settings.approval.read_disk),
-                gate(settings.approval.write_disk),
-                gate(settings.approval.terminal),
-            ),
+            "Each tool".to_string(),
+            // Named individually rather than by category: the categories are
+            // a way to set several at once, not a thing a session is in, and
+            // a row that said "write: ask" would not tell you *what* asks.
+            // `/tools` on its own is the fuller listing.
+            settings
+                .tool_access
+                .rows()
+                .iter()
+                .map(|(name, _, access)| format!("{name} {}", access.label()))
+                .collect::<Vec<_>>()
+                .join(" · "),
         ),
     ]
+}
+
+/// What each tool may do, as label/value rows — the body of `clank tools`
+/// and of `/tools`, so the two cannot describe the same state differently.
+///
+/// Ordered as [`crate::tools::TOOLS`] is: what only reads first, what
+/// changes your machine last, so the dangerous end is where the eye lands.
+pub fn tool_rows(access: &ToolAccessSettings) -> Vec<(String, String)> {
+    crate::tools::TOOLS
+        .iter()
+        .map(|tool| {
+            (
+                tool.name.to_string(),
+                format!(
+                    "{:<6} {:<8} · {}",
+                    access.access(tool.name).label(),
+                    tool.category,
+                    tool.summary
+                ),
+            )
+        })
+        .collect()
 }
 
 /// One line naming what an approval is asking about, for a list that has a
@@ -323,7 +352,7 @@ pub fn approval_summary(request: &ApprovalRequest) -> String {
 /// How this session's name reads back to the user.
 pub fn title_notice(title: &str, changed: bool) -> String {
     let verb = if changed { "renamed to" } else { "is" };
-    format!("Session {verb} {title}")
+    format!("Clanker {verb} {title}")
 }
 
 /// How the streaming setting reads back to the user.
@@ -446,12 +475,6 @@ pub fn classify(text: &str) -> Submission {
     if bare_command(trimmed, "/discard") {
         return Submission::DiscardShell;
     }
-    if bare_command(trimmed, "/agent") {
-        return Submission::SetAgentic(true);
-    }
-    if bare_command(trimmed, "/ask") {
-        return Submission::SetAgentic(false);
-    }
     if let Some(rest) = trimmed.strip_prefix("/verbose") {
         if rest.trim().is_empty() {
             return Submission::ShowVerbose;
@@ -534,9 +557,9 @@ pub fn classify(text: &str) -> Submission {
         }
     }
 
-    if let Some(rest) = trimmed.strip_prefix("/approval") {
+    if let Some(rest) = trimmed.strip_prefix("/tools") {
         if rest.trim().is_empty() {
-            return Submission::ShowApproval;
+            return Submission::ShowTools;
         }
     }
 
@@ -559,14 +582,14 @@ pub fn classify(text: &str) -> Submission {
     }
 
     // Compared exactly rather than with `bare_command`, which treats any
-    // trailing text as ignorable — fine for `/agent`, wrong for a namespace
+    // trailing text as ignorable — fine for `/back`, wrong for a namespace
     // where the trailing text is the subcommand.
-    if trimmed == "/session" {
+    if trimmed == "/clanker" {
         return Submission::ShowTitle;
     }
 
-    if let Some(rest) = argument(trimmed, "/session") {
-        // `/session title` reads the name; anything after it sets one. A
+    if let Some(rest) = argument(trimmed, "/clanker") {
+        // `/clanker title` reads the name; anything after it sets one. A
         // blank title is refused the same way the naming screen refuses it —
         // a session always has a name.
         if rest.trim() == "title" {
@@ -597,17 +620,28 @@ pub fn classify(text: &str) -> Submission {
         }
     }
 
-    if let Some(rest) = argument(trimmed, "/approval") {
+    if let Some(rest) = argument(trimmed, "/tools") {
         let mut words = rest.split_whitespace();
-        if let (Some(category), Some(value), None) = (words.next(), words.next(), words.next()) {
-            if matches!(category, "read" | "write" | "terminal" | "all") {
-                if let Ok(enabled) = parse_bool(value) {
-                    return Submission::SetApproval {
-                        category: category.to_string(),
-                        enabled,
+        match (words.next(), words.next(), words.next()) {
+            // Every tool back to its default, which is not the same as
+            // setting them all to one state: the web tool's default is to
+            // run without asking, and "on" has to keep meaning that.
+            (Some("on"), None, None) => return Submission::ResetToolAccess,
+            (Some("off"), None, None) => {
+                return Submission::SetToolAccess {
+                    target: "all".to_string(),
+                    access: ToolAccess::Never,
+                }
+            }
+            (Some(state), Some(target), None) => {
+                if let Some(access) = ToolAccess::parse(state) {
+                    return Submission::SetToolAccess {
+                        target: target.to_string(),
+                        access,
                     };
                 }
             }
+            _ => {}
         }
     }
 
@@ -703,7 +737,7 @@ struct Command {
     usage: Option<&'static str>,
 }
 
-const COMMANDS: [Command; 21] = [
+const COMMANDS: [Command; 19] = [
     Command {
         word: "help",
         syntax: "/help",
@@ -719,19 +753,7 @@ const COMMANDS: [Command; 21] = [
     Command {
         word: "model",
         syntax: "/model [name]",
-        blurb: "Show the model, or switch it for this session",
-        usage: None,
-    },
-    Command {
-        word: "agent",
-        syntax: "/agent",
-        blurb: "Turn tools on — read and write files, run commands",
-        usage: None,
-    },
-    Command {
-        word: "ask",
-        syntax: "/ask",
-        blurb: "Turn tools off, back to plain chat",
+        blurb: "Show the model, or switch it for this clanker",
         usage: None,
     },
     Command {
@@ -743,7 +765,7 @@ const COMMANDS: [Command; 21] = [
     Command {
         word: "max-iterations",
         syntax: "/max-iterations <n> | clear | default",
-        blurb: "Cap the tool-calling loop per turn (agent mode)",
+        blurb: "Cap the tool-calling loop per turn, when it has tools",
         usage: Some("/max-iterations <n> | clear | default (n must be a positive integer)"),
     },
     Command {
@@ -759,10 +781,10 @@ const COMMANDS: [Command; 21] = [
         usage: Some("/temp <n> | clear | default (n must be 0 or greater)"),
     },
     Command {
-        word: "approval",
-        syntax: "/approval [<read|write|terminal|all> <on|off>]",
-        blurb: "Show or switch the tool-approval gates",
-        usage: Some("/approval <read|write|terminal|all> <on|off>"),
+        word: "tools",
+        syntax: "/tools [on|off | <ask|allow|never> <target>]",
+        blurb: "Show what each tool may do, or change it",
+        usage: Some("/tools on|off | <ask|allow|never> <tool|category|all>"),
     },
     Command {
         word: "sandbox",
@@ -791,14 +813,14 @@ const COMMANDS: [Command; 21] = [
     Command {
         word: "status",
         syntax: "/status",
-        blurb: "Show every setting this session runs with",
+        blurb: "Show every setting this clanker runs with",
         usage: Some("/status"),
     },
     Command {
-        word: "session",
-        syntax: "/session [title <new title>]",
-        blurb: "Show or change this session's name",
-        usage: Some("/session title <new title>"),
+        word: "clanker",
+        syntax: "/clanker [title <new title>]",
+        blurb: "Show or change this clanker's name",
+        usage: Some("/clanker title <new title>"),
     },
     Command {
         word: "send",
@@ -875,7 +897,7 @@ pub fn help_rows() -> Vec<(String, String)> {
 /// How far a word may stray from a command name and still be read as a
 /// misspelling of it, given its length. Two edits covers the ordinary slips
 /// — a dropped letter, a doubled one, a transposition (`/mdoel`,
-/// `/aprpoval`) — but on a short word two edits is most of the word, which
+/// `/tolos`) — but on a short word two edits is most of the word, which
 /// is how `/usr` ends up two from `ask`. Short words get one edit only.
 fn max_distance_for(word_length: usize) -> usize {
     if word_length >= 5 {
@@ -943,7 +965,7 @@ fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// The usage hint for a known command word, if invoking it wrong is even
-/// possible. `/model`, `/agent`, `/ask`, and `/verbose` accept every
+/// possible. `/model` and `/verbose` accept every
 /// invocation they can be given (bare, or with any trailing text at all),
 /// so they have nothing invalid to report and aren't listed here — by the
 /// time [`classify`] reaches this check, any of those words would already
@@ -963,8 +985,8 @@ fn command_usage(word: &str) -> Option<String> {
 
 /// "clear" (case-insensitive) resets an override; anything else is the new
 /// value to set.
-/// Accepts the same words the CLI's own `clank approval`/`clank stream`
-/// flags do, so `/approval` in a session reads the same way.
+/// Accepts the same words the CLI's own `clank stream`/`clank sandbox`
+/// flags do, so `/sandbox` in a clanker reads the same way.
 pub fn parse_bool(s: &str) -> Result<bool, String> {
     match s.to_lowercase().as_str() {
         "true" | "on" | "yes" | "1" => Ok(true),
@@ -981,7 +1003,7 @@ pub fn parse_bool(s: &str) -> Result<bool, String> {
 /// sensible to do without a value) or for text that isn't this command at
 /// all. The caller decides what `None` means from there — a bare `/model`
 /// still shows the current model, while a bare `/effort`/`/max-iterations`/
-/// `/temperature`/`/approval` falls through to [`command_usage`] and is
+/// `/temperature`/`/tools` falls through to [`command_usage`] and is
 /// reported as a failed command rather than reaching the model as text.
 fn argument<'a>(trimmed: &'a str, name: &str) -> Option<&'a str> {
     let rest = trimmed.strip_prefix(name)?;
@@ -1282,23 +1304,18 @@ mod tests {
     }
 
     #[test]
-    fn classify_recognizes_agent_and_ask() {
-        assert_eq!(classify("/agent"), Submission::SetAgentic(true));
-        assert_eq!(classify("  /agent  "), Submission::SetAgentic(true));
-        // Trailing text is ignored rather than rejected — neither command
-        // takes an argument.
-        assert_eq!(classify("/agent please"), Submission::SetAgentic(true));
-        assert_eq!(classify("/ask"), Submission::SetAgentic(false));
-        assert_eq!(classify("/ask nicely"), Submission::SetAgentic(false));
-
-        // Not the command, just a word starting with it.
+    fn agent_and_ask_are_no_longer_commands() {
+        // There is no mode to switch any more — `/tools on|off` is the
+        // whole of it — so these are ordinary messages again. `/ask` is
+        // short enough that the typo-catcher leaves it alone too.
+        assert_eq!(
+            classify("/agent"),
+            Submission::Message("/agent".to_string())
+        );
+        assert_eq!(classify("/ask"), Submission::Message("/ask".to_string()));
         assert_eq!(
             classify("/agentic-issue"),
             Submission::Message("/agentic-issue".to_string())
-        );
-        assert_eq!(
-            classify("/asking for a friend"),
-            Submission::Message("/asking for a friend".to_string())
         );
     }
 
@@ -1337,8 +1354,8 @@ mod tests {
             "/highlight",
             "/sandbox",
             "/stream",
-            "/approval",
-            "/session",
+            "/tools",
+            "/clanker",
         ] {
             let shown = classify(command);
             assert!(
@@ -1504,62 +1521,52 @@ mod tests {
     }
 
     #[test]
-    fn classify_recognizes_approval() {
+    fn classify_recognizes_tools() {
+        let set = |target: &str, access| Submission::SetToolAccess {
+            target: target.to_string(),
+            access,
+        };
         assert_eq!(
-            classify("/approval read off"),
-            Submission::SetApproval {
-                category: "read".to_string(),
-                enabled: false
-            }
+            classify("/tools allow read"),
+            set("read", ToolAccess::Allow)
         );
         assert_eq!(
-            classify("/approval write on"),
-            Submission::SetApproval {
-                category: "write".to_string(),
-                enabled: true
-            }
+            classify("/tools never run_terminal_command"),
+            set("run_terminal_command", ToolAccess::Never)
+        );
+        assert_eq!(classify("/tools ask all"), set("all", ToolAccess::Ask));
+
+        // `off` is every tool at once; `on` is every tool back to its own
+        // default, which is a different thing — the web tool's default is
+        // to get on with it, and turning tools back on must not start
+        // prompting for that.
+        assert_eq!(classify("/tools off"), set("all", ToolAccess::Never));
+        assert_eq!(classify("/tools on"), Submission::ResetToolAccess);
+
+        // A target that names nothing is still a command — it is reported
+        // by whoever applies it, which is where the tool table lives.
+        assert_eq!(classify("/tools ask bogus"), set("bogus", ToolAccess::Ask));
+
+        // An unknown state, or the wrong number of words, is a failed
+        // command rather than text sent to the model.
+        let usage = "Unrecognized /tools usage. Usage: \
+            /tools on|off | <ask|allow|never> <tool|category|all>";
+        assert_eq!(
+            classify("/tools maybe read"),
+            Submission::UnknownCommand(usage.to_string())
         );
         assert_eq!(
-            classify("/approval terminal yes"),
-            Submission::SetApproval {
-                category: "terminal".to_string(),
-                enabled: true
-            }
+            classify("/tools ask"),
+            Submission::UnknownCommand(usage.to_string())
         );
         assert_eq!(
-            classify("/approval all off"),
-            Submission::SetApproval {
-                category: "all".to_string(),
-                enabled: false
-            }
+            classify("/tools ask read too"),
+            Submission::UnknownCommand(usage.to_string())
         );
 
-        // Not a recognized category, not a recognized boolean, or too many
-        // (or too few) words are all a failed command, not text sent to
-        // the model.
-        let approval_usage = "Unrecognized /approval usage. Usage: \
-            /approval <read|write|terminal|all> <on|off>";
-        assert_eq!(
-            classify("/approval bogus off"),
-            Submission::UnknownCommand(approval_usage.to_string())
-        );
-        assert_eq!(
-            classify("/approval read maybe"),
-            Submission::UnknownCommand(approval_usage.to_string())
-        );
-        assert_eq!(
-            classify("/approval read"),
-            Submission::UnknownCommand(approval_usage.to_string())
-        );
-        assert_eq!(
-            classify("/approval read off now"),
-            Submission::UnknownCommand(approval_usage.to_string())
-        );
-
-        // Bare — with or without trailing whitespace — shows the current
-        // settings instead of falling through, matching `/model`.
-        assert_eq!(classify("/approval"), Submission::ShowApproval);
-        assert_eq!(classify("  /approval   "), Submission::ShowApproval);
+        // Bare — with or without trailing whitespace — lists them.
+        assert_eq!(classify("/tools"), Submission::ShowTools);
+        assert_eq!(classify("  /tools   "), Submission::ShowTools);
     }
 
     #[test]
@@ -1625,39 +1632,39 @@ mod tests {
     }
 
     #[test]
-    fn classify_recognizes_the_session_command() {
+    fn classify_recognizes_the_clanker_command() {
         assert_eq!(
-            classify("/session title Fix the parser"),
+            classify("/clanker title Fix the parser"),
             Submission::SetTitle("Fix the parser".to_string())
         );
         // Bare, either way round, reads the name.
-        assert_eq!(classify("/session"), Submission::ShowTitle);
-        assert_eq!(classify("  /session   "), Submission::ShowTitle);
-        assert_eq!(classify("/session title"), Submission::ShowTitle);
-        assert_eq!(classify("/session title   "), Submission::ShowTitle);
+        assert_eq!(classify("/clanker"), Submission::ShowTitle);
+        assert_eq!(classify("  /clanker   "), Submission::ShowTitle);
+        assert_eq!(classify("/clanker title"), Submission::ShowTitle);
+        assert_eq!(classify("/clanker title   "), Submission::ShowTitle);
 
         // An unknown subcommand is a failed command, not a message.
         assert_eq!(
-            classify("/session rename x"),
+            classify("/clanker rename x"),
             Submission::UnknownCommand(
-                "Unrecognized /session usage. Usage: /session title <new title>".to_string()
+                "Unrecognized /clanker usage. Usage: /clanker title <new title>".to_string()
             )
         );
         // "titles" is not "title".
         assert_eq!(
-            classify("/session titles"),
+            classify("/clanker titles"),
             Submission::UnknownCommand(
-                "Unrecognized /session usage. Usage: /session title <new title>".to_string()
+                "Unrecognized /clanker usage. Usage: /clanker title <new title>".to_string()
             )
         );
-        assert_eq!(nearest_command("sesion"), Some("session"));
+        assert_eq!(nearest_command("clankr"), Some("clanker"));
     }
 
     #[test]
     fn a_title_keeps_the_spacing_inside_it() {
         // Only the ends are trimmed: the name is whatever was typed.
         assert_eq!(
-            classify("/session title  Fix  the   parser  "),
+            classify("/clanker title  Fix  the   parser  "),
             Submission::SetTitle("Fix  the   parser".to_string())
         );
     }
@@ -1696,11 +1703,11 @@ mod tests {
     fn title_notice_distinguishes_a_rename_from_a_read() {
         assert_eq!(
             title_notice("Fix the parser", false),
-            "Session is Fix the parser"
+            "Clanker is Fix the parser"
         );
         assert_eq!(
             title_notice("Fix the parser", true),
-            "Session renamed to Fix the parser"
+            "Clanker renamed to Fix the parser"
         );
     }
 
@@ -1722,12 +1729,11 @@ mod tests {
         // A nullified setting isn't blank — it does something specific, and
         // the readout has to distinguish "sends nothing" from "happens to
         // match the default".
-        let approval = ApprovalSettings::default();
+        let tool_access = ToolAccessSettings::default();
         let rows = session_settings_rows(&SessionSettings {
             id: "abc123",
             title: "Untitled",
             model: "openrouter/auto",
-            agentic: false,
             effort_level: None,
             temperature: None,
             max_iterations: None,
@@ -1736,7 +1742,7 @@ mod tests {
             sandbox: true,
             stream: true,
             working_dir: None,
-            approval: &approval,
+            tool_access: &tool_access,
         });
         let value = |label: &str| {
             rows.iter()
@@ -1746,27 +1752,28 @@ mod tests {
         };
 
         assert_eq!(value("ID"), "abc123");
-        assert_eq!(value("Mode"), "ask — no tools");
+        assert_eq!(value("Tools"), "on");
         assert_eq!(value("Effort"), "none sent");
         assert_eq!(value("Temperature"), "none sent");
         assert_eq!(value("Max iterations"), "not set");
         assert_eq!(value("Sandbox"), "on");
-        assert_eq!(value("Approval"), "read Ask · write Ask · terminal Ask");
+        assert_eq!(
+            value("Each tool"),
+            "read_file ask · list_files ask · web_fetch allow · write_file ask \
+             · replace_in_file ask · run_terminal_command never"
+        );
         assert_eq!(value("Directory"), "not recorded");
     }
 
     #[test]
     fn session_settings_rows_report_a_configured_session() {
-        let approval = ApprovalSettings {
-            read_disk: false,
-            write_disk: true,
-            terminal: true,
-        };
+        let tool_access = ToolAccessSettings::default()
+            .with("read", ToolAccess::Allow)
+            .unwrap();
         let rows = session_settings_rows(&SessionSettings {
             id: "abc123",
             title: "Fix the parser",
             model: "anthropic/claude-sonnet-5",
-            agentic: true,
             effort_level: Some("high"),
             temperature: Some(0.7),
             max_iterations: Some(20),
@@ -1775,7 +1782,7 @@ mod tests {
             sandbox: false,
             stream: false,
             working_dir: Some("/home/dev/project"),
-            approval: &approval,
+            tool_access: &tool_access,
         });
         let value = |label: &str| {
             rows.iter()
@@ -1784,12 +1791,18 @@ mod tests {
                 .unwrap()
         };
 
-        assert_eq!(value("Mode"), "agent — tools enabled");
+        assert_eq!(value("Tools"), "on");
         assert_eq!(value("Effort"), "high");
         assert_eq!(value("Sandbox"), "off");
         assert_eq!(value("Verbose"), "on");
-        // An auto-approved category reads differently from a gated one.
-        assert_eq!(value("Approval"), "read Auto · write Ask · terminal Ask");
+        // A tool waved through reads differently from one that still asks,
+        // and each is named — which category it fell in is not the question
+        // anyone is asking here.
+        assert_eq!(
+            value("Each tool"),
+            "read_file allow · list_files allow · web_fetch allow · write_file ask \
+             · replace_in_file ask · run_terminal_command never"
+        );
         assert_eq!(value("Directory"), "/home/dev/project");
     }
 
@@ -1800,7 +1813,7 @@ mod tests {
         // Same boolean words every other on/off setting takes.
         assert_eq!(classify("/sandbox false"), Submission::SetSandbox(false));
         assert_eq!(classify("/sandbox 1"), Submission::SetSandbox(true));
-        // Bare shows the current setting, matching `/approval`.
+        // Bare shows the current setting, matching `/tools`.
         assert_eq!(classify("/sandbox"), Submission::ShowSandbox);
         assert_eq!(classify("  /sandbox   "), Submission::ShowSandbox);
         // A value that isn't a boolean is a failed command, not a message.
@@ -1895,10 +1908,10 @@ mod tests {
         // A transposition is two edits, still within reach, and a command
         // that *can* be misused carries its usage along with the guess.
         assert_eq!(
-            classify("/aprpoval read off"),
+            classify("/tolos allow read"),
             Submission::UnknownCommand(
-                "Unrecognized command /aprpoval. Did you mean /approval? \
-                 Usage: /approval <read|write|terminal|all> <on|off>"
+                "Unrecognized command /tolos. Did you mean /tools? \
+                 Usage: /tools on|off | <ask|allow|never> <tool|category|all>"
                     .to_string()
             )
         );

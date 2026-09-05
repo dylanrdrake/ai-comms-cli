@@ -1,6 +1,7 @@
 //! Drawing the TUI. Pure presentation over [`App`] — no state changes here.
 
 use super::app::{App, CommandHint, ModelBrowser, ShellState, ToolStatus, TranscriptItem};
+use crate::config::ToolAccess;
 use crate::ui::{json_fields, summarize, tool_call_fields, ApprovalRequest};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -333,14 +334,15 @@ fn draw_shell(frame: &mut Frame, area: Rect, shell: &ShellState, tick: usize) {
 /// The messages typed while a turn is running, in the order they will be
 /// taken.
 ///
-/// The title says where they are headed, which differs by mode: in agent
-/// mode the next iteration takes them into the turn already running, and in
-/// ask mode they wait for it to finish. It reads the session's current mode,
-/// so switching with `/agent` mid-turn makes the title disagree with where a
-/// message will actually go until that turn ends — rare, and cheaper to live
-/// with than threading the turn's own captured mode out to the front end.
+/// The title says where they are headed, which differs by whether there are
+/// tools: with them the next iteration takes the message into the turn
+/// already running, without them it waits for the turn to finish. It reads
+/// what the clanker has *now*, so `/tools` mid-turn makes the title disagree
+/// with where a message will actually go until that turn ends — rare, and
+/// cheaper to live with than threading the turn's own captured answer out to
+/// the front end.
 fn draw_pending(frame: &mut Frame, area: Rect, app: &App) {
-    let title = if app.agentic {
+    let title = if app.agentic() {
         " joining this turn "
     } else {
         " next turn "
@@ -395,7 +397,16 @@ fn clip(text: &str, width: usize) -> String {
 
 /// The session's title, plain — no border, no "clank -" prefix.
 fn draw_title(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![Span::styled(app.title.clone(), Style::new().bold())];
+    // The clanker's own mark, first: the same one its row carries on the
+    // launch screen and its replies carry in the gutter below. Names repeat
+    // and directories are shared, so the mark is the thing that says *which*
+    // of them you are looking at — and it should say so at the top, not only
+    // once a reply has arrived.
+    let (mark, mark_style) = identicon(&app.session_id);
+    let mut spans = vec![
+        Span::styled(mark, mark_style),
+        Span::styled(format!(" {}", app.title), Style::new().bold()),
+    ];
     // Where this session runs, beside its name: it is the directory the
     // agent's tools act in and the sandbox bounds, so it is worth being able
     // to see without asking for `/status`.
@@ -619,14 +630,13 @@ fn item_key(item: &TranscriptItem, app: &App, area_width: u16, content_width: us
         TranscriptItem::Notice(message) => (6u8, message).hash(&mut hasher),
         TranscriptItem::SessionStatus(rows) => (7u8, rows).hash(&mut hasher),
         TranscriptItem::Help(rows) => (9u8, rows).hash(&mut hasher),
-        TranscriptItem::ApprovalStatus { approval, changed } => (
-            8u8,
-            approval.read_disk,
-            approval.write_disk,
-            approval.terminal,
-            changed,
-        )
-            .hash(&mut hasher),
+        TranscriptItem::ToolStatus { access, changed } => {
+            8u8.hash(&mut hasher);
+            for (name, _, state) in access.rows() {
+                (name, state.label()).hash(&mut hasher);
+            }
+            changed.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -1020,34 +1030,32 @@ fn render_item(
             lines.push(Line::raw(""));
         }
         TranscriptItem::SessionStatus(rows) => {
-            push_row_block(&mut lines, "Session:", rows, content_width);
+            push_row_block(&mut lines, "Clanker:", rows, content_width);
             lines.push(Line::raw(""));
         }
         TranscriptItem::Help(rows) => {
             push_row_block(&mut lines, "Commands:", rows, content_width);
             lines.push(Line::raw(""));
         }
-        TranscriptItem::ApprovalStatus { approval, changed } => {
+        TranscriptItem::ToolStatus { access, changed } => {
             lines.push(Line::from(vec![
                 Span::styled("— ", Style::new().dark_gray().italic()),
                 Span::styled(
-                    format!("Approval {}:", if *changed { "set to" } else { "is" }),
+                    format!("Tools {}:", if *changed { "set to" } else { "are" }),
                     Style::new().dark_gray().italic(),
                 ),
             ]));
-            for (label, enabled) in [
-                ("Read from disk:    ", approval.read_disk),
-                ("Write to disk:     ", approval.write_disk),
-                ("Terminal commands: ", approval.terminal),
-            ] {
-                let (mark, word, style) = if enabled {
-                    ("✓", "Ask", Style::new().green())
-                } else {
-                    ("✗", "Auto", Style::new().yellow())
+            for (name, _, state) in access.rows() {
+                // Coloured by how much is being taken on trust: green stops
+                // and asks, yellow runs unwatched, grey is not there at all.
+                let (mark, style) = match state {
+                    ToolAccess::Ask => ("✓", Style::new().green()),
+                    ToolAccess::Allow => ("!", Style::new().yellow()),
+                    ToolAccess::Never => ("✗", Style::new().dark_gray()),
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("      {label}"), Style::new().dark_gray()),
-                    Span::styled(format!("{mark} {word}"), style),
+                    Span::styled(format!("      {name:<22}"), Style::new().dark_gray()),
+                    Span::styled(format!("{mark} {}", state.label()), style),
                 ]));
             }
             lines.push(Line::raw(""));
@@ -1334,8 +1342,8 @@ fn temperature_style(temperature: Option<f32>) -> Style {
 }
 
 /// Every controllable setting in one row below the message prompt: ready/
-/// busy, ask/agent mode, model, effort, temperature and verbose — everything
-/// `/model`, `/agent`, `/effort`, `/temperature`, `/verbose`, etc. can
+/// busy, whether it has tools, model, effort, temperature and verbose —
+/// everything `/model`, `/tools`, `/effort`, `/temperature`, `/verbose` can
 /// change. What is waiting to be sent is its own box above the prompt, since
 /// a count can't say which message is about to land.
 fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
@@ -1362,8 +1370,8 @@ fn draw_settings(frame: &mut Frame, area: Rect, app: &App, tick: usize) {
         Style::new().dark_gray(),
     ));
     spans.push(Span::styled(
-        format!("· {} ", crate::store::mode_label(app.agentic)),
-        if app.agentic {
+        format!("· {} ", crate::store::mode_label(app.agentic())),
+        if app.agentic() {
             Style::new().yellow()
         } else {
             Style::new().cyan()
@@ -2087,9 +2095,9 @@ mod tests {
     #[test]
     fn a_command_name_is_marked_off_from_its_argument() {
         assert_eq!(
-            marked("/session title Notes", 40),
+            marked("/clanker title Notes", 40),
             vec![vec![
-                ("/session".to_string(), true),
+                ("/clanker".to_string(), true),
                 (" title Notes".to_string(), false),
             ]]
         );
@@ -2112,10 +2120,10 @@ mod tests {
         // to break where the row breaks and pick up again, or it lands on
         // whatever text happens to sit at those columns on the next row.
         assert_eq!(
-            marked("/session title", 5),
+            marked("/clanker title", 5),
             vec![
-                vec![("/sess".to_string(), true)],
-                vec![("ion".to_string(), true), (" t".to_string(), false)],
+                vec![("/clan".to_string(), true)],
+                vec![("ker".to_string(), true), (" t".to_string(), false)],
                 vec![("itle".to_string(), false)],
             ]
         );
@@ -2282,13 +2290,10 @@ mod tests {
         assert!(out.contains("Tab complete"), "{out}");
 
         // Once the name is settled the row turns into the command's form...
-        app.input = "/approval ".to_string();
+        app.input = "/tools ".to_string();
         app.cursor = app.input.len();
         let out = render_to_string(&app, 74, 16);
-        assert!(
-            out.contains("/approval [<read|write|terminal|all>"),
-            "{out}"
-        );
+        assert!(out.contains("/tools [on|off | <ask|allow|never>"), "{out}");
         assert!(!out.contains("Tab complete"), "{out}");
 
         // ...and an ordinary message gets no row at all.
@@ -2498,8 +2503,8 @@ mod tests {
                 ("Working dir".into(), format!("/very/long/path/{prose}")),
                 ("Model".into(), wide.clone()),
             ]),
-            TranscriptItem::ApprovalStatus {
-                approval: crate::config::ApprovalSettings::default(),
+            TranscriptItem::ToolStatus {
+                access: crate::config::ToolAccessSettings::default(),
                 changed: true,
             },
         ]
@@ -2846,25 +2851,52 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_labels_the_mode_ask_or_agent() {
+    fn the_status_bar_says_whether_it_has_tools() {
+        // Derived from the tool states, not from a flag beside them: every
+        // tool on `never` is a clanker that can only talk.
         let mut app = sample_app();
-        assert!(!app.agentic);
+        app.tool_access = crate::config::ToolAccessSettings::none();
+        assert!(!app.agentic());
         let out = render_to_string(&app, 60, 20);
-        assert!(out.contains("ask"), "{out}");
-        assert!(!out.contains("chat"), "{out}");
+        assert!(out.contains("💬"), "{out}");
+        assert!(!out.contains("🔨"), "{out}");
 
-        app.agentic = true;
+        app.tool_access = crate::config::ToolAccessSettings::defaults();
+        assert!(app.agentic());
         let out = render_to_string(&app, 60, 20);
-        assert!(out.contains("agent"), "{out}");
+        assert!(out.contains("🔨"), "{out}");
     }
 
     #[test]
-    fn title_row_shows_the_session_title_alone() {
+    fn the_title_row_is_the_mark_the_name_and_where_it_runs() {
         let mut app = sample_app();
         app.title = "Write me a snake game".to_string();
+        app.working_dir = Some("/tmp/snake".to_string());
         let out = render_to_string(&app, 60, 20);
         let title_row = out.lines().next().unwrap();
-        assert_eq!(title_row.trim_end(), "Write me a snake game");
+
+        // The same mark the gutter and the launch screen draw for it — not a
+        // second one derived from something else.
+        let (mark, _) = identicon(&app.session_id);
+        assert_eq!(
+            title_row.trim_end(),
+            format!("{mark} Write me a snake game  /tmp/snake")
+        );
+    }
+
+    #[test]
+    fn the_title_row_leaves_out_a_directory_it_does_not_have() {
+        // Sessions saved before the directory was recorded have none, and an
+        // empty gap after the name says nothing.
+        let mut app = sample_app();
+        app.title = "Older clanker".to_string();
+        app.working_dir = None;
+        let out = render_to_string(&app, 60, 20);
+        let (mark, _) = identicon(&app.session_id);
+        assert_eq!(
+            out.lines().next().unwrap().trim_end(),
+            format!("{mark} Older clanker")
+        );
     }
 
     #[test]
@@ -3080,7 +3112,7 @@ mod tests {
     fn waiting_messages_are_listed_above_the_prompt() {
         let mut app = sample_app();
         app.busy = true;
-        app.agentic = true;
+        app.tool_access = crate::config::ToolAccessSettings::defaults();
         app.pending
             .push_back("check the Windows path too".to_string());
         app.pending.push_back("and skip the slow tests".to_string());
@@ -3096,7 +3128,7 @@ mod tests {
     #[test]
     fn the_title_says_where_a_waiting_message_is_headed() {
         let mut app = sample_app();
-        app.agentic = false;
+        app.tool_access = crate::config::ToolAccessSettings::none();
         app.pending.push_back("run it again".to_string());
         let out = render_to_string(&app, 80, 18);
         assert!(out.contains("next turn"), "{out}");
@@ -3344,23 +3376,26 @@ mod tests {
     }
 
     #[test]
-    fn approval_status_pretty_prints_each_gate_like_the_cli_does() {
+    fn tool_status_names_every_tool_and_what_it_may_do() {
         let mut app = App::new("m".to_string(), None, "id".to_string());
-        app.transcript.push(TranscriptItem::ApprovalStatus {
-            approval: crate::config::ApprovalSettings {
-                read_disk: false,
-                write_disk: true,
-                terminal: true,
-            },
+        app.transcript.push(TranscriptItem::ToolStatus {
+            access: crate::config::ToolAccessSettings::default()
+                .with("read", crate::config::ToolAccess::Allow)
+                .unwrap()
+                .with("run_terminal_command", crate::config::ToolAccess::Never)
+                .unwrap(),
             changed: false,
         });
-        let out = render_to_string(&app, 70, 12);
-        assert!(out.contains("Approval is:"), "{out}");
-        assert!(out.contains("Read from disk:"), "{out}");
-        assert!(out.contains("Write to disk:"), "{out}");
-        assert!(out.contains("Terminal commands:"), "{out}");
-        assert!(out.contains("✗ Auto"), "{out}");
-        assert!(out.contains("✓ Ask"), "{out}");
+        let out = render_to_string(&app, 70, 16);
+        assert!(out.contains("Tools are:"), "{out}");
+        // Named individually: which tools a category holds is exactly what
+        // the old per-category readout could not tell you.
+        assert!(out.contains("read_file"), "{out}");
+        assert!(out.contains("write_file"), "{out}");
+        assert!(out.contains("run_terminal_command"), "{out}");
+        assert!(out.contains("! allow"), "{out}");
+        assert!(out.contains("✓ ask"), "{out}");
+        assert!(out.contains("✗ never"), "{out}");
     }
 
     #[test]
@@ -3372,7 +3407,7 @@ mod tests {
         ]));
 
         let out = render_to_string(&app, 70, 14);
-        assert!(out.contains("Session:"), "{out}");
+        assert!(out.contains("Clanker:"), "{out}");
         assert!(out.contains("Model"), "{out}");
         assert!(out.contains("openrouter/auto"), "{out}");
         assert!(out.contains("none sent"), "{out}");

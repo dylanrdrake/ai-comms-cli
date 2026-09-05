@@ -2,24 +2,26 @@
 
 ## The big picture
 
-Everything hangs off one idea: **a conversation is just a `Vec<ChatMessage>` that you POST to an OpenAI-compatible server, get a reply back, and maybe loop on.** The three "modes" are just different front ends over that same loop:
+Everything hangs off one idea: **a conversation is just a `Vec<ChatMessage>` that you POST to an OpenAI-compatible server, get a reply back, and maybe loop on.** The shapes over that same loop:
 
-- `ask` — send once, print, done.
-- `agent` — send, and if the reply contains `tool_calls`, execute them, append the results, send again (up to `max_iterations`).
-- `session`/`tui` — the same, but the message list lives in a `ChatSession` that persists every turn to SQLite so you can resume later.
+- a prompt with no tools — send once, print, done.
+- a prompt with tools — send, and if the reply contains `tool_calls`, execute them, append the results, send again (up to `max_iterations`).
+- `clanker`/`tui` — the same, but the message list lives in a `ChatSession` that persists every turn to SQLite so you can resume later.
+
+There is no mode to be in: whether the loop runs at all follows from whether any tool is set to something other than `never`. A new clanker starts with none, so it talks until `/tools on` gives it what `clank tools` allows.
 
 One vocabulary note that pays off everywhere below, because the words nest and are easy to conflate:
 
 - a **request** is one POST — stateless, so it carries the *entire* message array every time
 - an **iteration** is one request plus running whatever tools it asked for
-- a **turn** is one thing you typed through to a final answer: one request in ask mode, one to `max_iterations` iterations in agent mode
-- a **session** is the saved conversation those turns accumulate into
+- a **turn** is one thing you typed through to a final answer: one request with no tools, one to `max_iterations` iterations with them
+- a **clanker** is the saved conversation those turns accumulate into. The code calls it a session — `ChatSession`, the `sessions` table — and that boundary is deliberate: users learn one noun, the storage keeps the one it was written with
 
 ## The modules, what they actually do
 
 **`main.rs`** — entry point. `Cli` is a `clap` derive struct: each subcommand (`Ask`, `Agent`, `Session`, `Login`, …) is a variant of the `Commands` enum with its flags. `main` is `#[tokio::main] async fn main()`; it parses, then `match cli.command` dispatches to a `cmd_*` function. Note the pattern every command follows at the top: `load_config()?` → resolve overrides → `Client::new(config)?`.
 
-**`config.rs`** — `Config` is a plain `serde` struct with `#[serde(default = ...)]` on every field, so a config file with one key (`{"temperature": 1.5}`) is valid and the rest come from seeds. The API key is *not* in the file — `get_api_key()`/`set_api_key()` go through the `keyring` crate to the OS keychain. Also defines `SessionGates`, an `Arc<Mutex<ApprovalSettings>>` + `Arc<AtomicBool>` pair that lets a mid-turn `/approval` or `/sandbox` change reach the running agent loop.
+**`config.rs`** — `Config` is a plain `serde` struct with `#[serde(default = ...)]` on every field, so a config file with one key (`{"temperature": 1.5}`) is valid and the rest come from seeds. The API key is *not* in the file — `get_api_key()`/`set_api_key()` go through the `keyring` crate to the OS keychain. Also defines the tool-access model — `ToolAccess` (`ask`/`allow`/`never`) and `ToolAccessSettings`, which holds only the tools that differ from their default so a tool added later arrives with its own default already in force — and `SessionGates`, an `Arc<Mutex<ToolAccessSettings>>` + `Arc<AtomicBool>` pair that lets a mid-turn `/tools` or `/sandbox` change reach the running agent loop.
 
 **`crypto.rs`** — AES-256-GCM over message content, titles and tool calls, with the key in the OS keychain. Metadata (roles, model names, timestamps) stays in the clear so the store can query on it. Lose that keychain entry and the database is unreadable — it is the one piece of state with no recovery path.
 
@@ -49,15 +51,15 @@ The drain at the top is **steering**: a message typed while a turn runs joins *t
 
 `request_turn` takes streaming as a per-turn parameter rather than asking the client for it: streaming shapes how the *next request* is made, so a turn snapshots it at the start, the same way it snapshots model, effort and temperature. Approval and sandbox are the deliberate exceptions — those are read from `SessionGates` before every tool call, because revoking a permission is no use if it waits politely for the current work to finish.
 
-`normalize_system_prompt` prepends the system prompt fresh each turn, because Anthropic requires `system` to sit at position 0 and `/agent` can be flipped on mid-conversation.
+`normalize_system_prompt` prepends the system prompt fresh each turn, because Anthropic requires `system` to sit at position 0 and `/tools` can turn tools on mid-conversation.
 
 **`tools.rs`** — the six tools the model can call, defined as JSON schemas (`get_tool_definitions`) and executed in `execute_tool`: `write_file`, `read_file`, `list_files`, `replace_in_file`, `run_terminal_command`, and `web_fetch`. Results are returned as `serde_json::Value` objects and fed back to the model.
 
 The sandbox lives here: `sandbox_bound` canonicalizes the current directory, `resolve_for_sandbox` canonicalizes the target's nearest *existing* ancestor (so `..` and symlinks resolve without creating anything on the way), and `sandbox_refusal` rejects writes outside it. Reads are deliberately unbounded — they mutate nothing, and confining them would break reading a file under `/etc`.
 
-`web_fetch` exists for one reason: the agent could already reach the web through `run_terminal_command`, but a page is mostly markup, and converting it to text first costs two to four times fewer tokens for the same content. It never prompts, and `requires_approval` exempts it *by name* rather than by a missing category, so that reads as a decision rather than an oversight.
+`web_fetch` exists for one reason: the agent could already reach the web through `run_terminal_command`, but a page is mostly markup, and converting it to text first costs two to four times fewer tokens for the same content. It does not prompt, and that is now a *default* (`default_access` gives the `web` category `allow`) rather than a name checked inside the gate — so it shows up as a row in `clank tools` you can change, instead of being invisibly exempt. The same function gives `terminal` `never`: the shell is the one tool bounded by nothing but what the user can do, so it is not offered until asked for.
 
-**`session.rs`** — `ChatSession` owns the message history *and* the SQLite `Connection`, plus per-session settings (model, kind, effort, temperature, approval, sandbox, verbose, highlight, streaming, working directory). `persist_pending()` writes only messages added since `saved_len` — that watermark is how resume doesn't duplicate history. Settings are snapshots: written to the DB at creation, then `/model` etc. mutate that row.
+**`session.rs`** — `ChatSession` owns the message history *and* the SQLite `Connection`, plus per-session settings (model, kind, effort, temperature, tool access, sandbox, verbose, highlight, streaming, working directory). `persist_pending()` writes only messages added since `saved_len` — that watermark is how resume doesn't duplicate history. Settings are snapshots: written to the DB at creation, then `/model` etc. mutate that row.
 
 **`store.rs`** — raw SQL: `sessions` and `messages` tables, `create_session`, `append_message`, `load_messages`, `list_sessions`, prefix lookup for `--resume`. Message content, tool calls, and reasoning are encrypted via `crypto::encrypt_opt` before insert; metadata (model, roles, timestamps) is in the clear. `ensure_column` migrates old DBs by `ALTER TABLE ADD COLUMN`.
 
@@ -79,7 +81,7 @@ Only cancelling (`Esc`) and quitting abort a turn, and quitting has to, since a 
 
 **`tui/`** — `mod.rs` is the event loop and key handling, `app.rs` the state a screen renders from, `render.rs` the conversation view, `picker.rs` the launch screen. That launch screen lists every session grouped by directory, re-reading every couple of seconds so one running in another terminal stays current, and gives each a small braille square hashed from its id — the left half of which is the mark in the reply gutter once you are inside that session.
 
-## Trace `clank ask "hi"` end to end
+## Trace `clank "hi"` end to end
 
 1. `Cli::parse()` → `Commands::Ask { prompt: "hi", .. }` → `cmd_ask`.
 2. `load_config()` → `Config` from `~/.clank/config.json` (or defaults).
@@ -90,11 +92,11 @@ Only cancelling (`Esc`) and quitting abort a turn, and quitting has to, since a 
 7. The stream yields `StreamEvent::Content` deltas → printed as they arrive, then `Done`.
 8. `cmd_ask` prints the wrapped reply.
 
-## Trace `clank agent "write fib to fib.rs"` — the delta
+## Trace `clank "write fib to fib.rs" --tools` — the delta
 
 Same start, but `cmd_agent` calls `agent::run_agent` → `run_agent_turn`, and now `tools` are included in the request. The reply likely comes back with `tool_calls` instead of text. Then:
 
-- each call goes through `requires_approval` → maybe `ui.approve(...)` → `execute_tool("write_file", r#"{"filepath":"fib.rs",...}"#, true)`
+- the turn is offered only the tools that are not `never` (`offered_tools`), and each call then goes through the gate — `allow` runs, `ask` calls `ui.approve(...)`, `never` is refused where it stands — → `execute_tool("write_file", r#"{"filepath":"fib.rs",...}"#, true)`
 - the result JSON is appended as `role: "tool"` with the matching `tool_call_id`
 - loop repeats until the model replies with text and no tool calls, or the cap hits → `"Agent exceeded max iterations"`.
 

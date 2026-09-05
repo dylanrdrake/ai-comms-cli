@@ -26,12 +26,11 @@ mod render;
 /// The session mark, so the CLI can draw the same one the TUI does.
 pub(crate) use render::{busy_frame, identicon_mark};
 
-use crate::agent::AGENT_CHAT_SYSTEM_PROMPT;
-use crate::client::{ChatMessage, Client};
-use crate::config::ApprovalSettings;
+use crate::client::Client;
+use crate::config::ToolAccessSettings;
 use crate::conversation::{command_for, Command, Conversation};
 use crate::session::{self, ChatSession};
-use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
+use crate::store::{self, SessionSummary, StoredMessage, KIND_CHAT};
 use crate::ui::response_label;
 use anyhow::Result;
 use app::{App, ShellState, TranscriptItem};
@@ -67,7 +66,7 @@ pub struct Context {
     pub effort_level: Option<String>,
     pub max_iterations: Option<usize>,
     pub temperature: Option<f32>,
-    pub approval: ApprovalSettings,
+    pub tool_access: ToolAccessSettings,
     /// The configured default for confining the agent's file writes, taken
     /// as this session's starting value.
     pub sandbox: bool,
@@ -169,8 +168,12 @@ fn current_dir() -> Option<String> {
         .map(|dir| dir.display().to_string())
 }
 
-fn open_new(context: &Context, agentic: bool, title: String, id: String) -> Result<Chat> {
-    let kind = if agentic { KIND_AGENT_CHAT } else { KIND_CHAT };
+fn open_new(context: &Context, title: String, id: String) -> Result<Chat> {
+    // A new clanker starts with no tools, and `/tools on` gives it the ones
+    // `clank tools` allows. Starting able to write to disk is not something
+    // to inherit from a config file you set months ago — the configured
+    // access says what tools may do *once they are on*, not that they are.
+    let kind = KIND_CHAT;
 
     let mut session = ChatSession::create(
         store::open_db()?,
@@ -180,7 +183,7 @@ fn open_new(context: &Context, agentic: bool, title: String, id: String) -> Resu
         context.effort_level.clone(),
         context.max_iterations,
         context.temperature,
-        context.approval.clone(),
+        ToolAccessSettings::none(),
         context.sandbox,
         context.verbose,
         context.highlight,
@@ -190,31 +193,24 @@ fn open_new(context: &Context, agentic: bool, title: String, id: String) -> Resu
             .map(|dir| dir.display().to_string()),
     )?;
     session.set_title(title)?;
-    if agentic {
-        session.push_and_persist(ChatMessage {
-            role: "system".to_string(),
-            content: Some(AGENT_CHAT_SYSTEM_PROMPT.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            ..Default::default()
-        })?;
-    }
-
-    start_chat(context, session, Vec::new(), agentic)
+    // The agent system prompt is not written into history: `agent.rs`'s
+    // `normalize_system_prompt` strips any stored copy and prepends a fresh
+    // one on every turn that has tools, which is what lets tools be turned
+    // on and off part-way through without leaving a stale instruction
+    // behind.
+    start_chat(context, session, Vec::new())
 }
 
 fn open_resumed(context: &Context, summary: &SessionSummary) -> Result<Chat> {
     let (session, history) =
         ChatSession::resume(store::open_db()?, summary, summary.model.clone())?;
-    let agentic = summary.kind == KIND_AGENT_CHAT;
-
     // The session's directory is its sandbox boundary, so opening one moves
     // the process into it. Unlike the CLI there's nowhere to refuse to: the
     // TUI can open any session from its picker, so a directory that's gone
     // is reported in the transcript and the session opens where it is —
     // loudly, because its bound is now the wrong one.
     let entered = session::enter_working_dir(&session)?;
-    let mut chat = start_chat(context, session, history, agentic)?;
+    let mut chat = start_chat(context, session, history)?;
     match entered {
         session::EnteredDir::Moved(dir) => chat
             .app
@@ -223,7 +219,7 @@ fn open_resumed(context: &Context, summary: &SessionSummary) -> Result<Chat> {
         session::EnteredDir::Unchanged => {}
         session::EnteredDir::Missing(dir) => {
             chat.app.transcript.push(TranscriptItem::Error(format!(
-                "This session was started in {dir}, which no longer exists — \
+                "This clanker was started in {dir}, which no longer exists — \
                  it is running in the current directory instead, so its sandbox \
                  and relative paths point somewhere else than when it was saved."
             )))
@@ -244,7 +240,7 @@ fn open_row(context: &Context, row: &SessionRow) -> std::result::Result<Chat, Op
     let summary = (|| {
         let conn = store::open_db()?;
         store::find_session(&conn, &row.id)?
-            .ok_or_else(|| anyhow::anyhow!("Session {} no longer exists", row.short_id()))
+            .ok_or_else(|| anyhow::anyhow!("Clanker {} no longer exists", row.short_id()))
     })()
     .map_err(OpenFailure::Other)?;
 
@@ -260,7 +256,7 @@ fn open_row(context: &Context, row: &SessionRow) -> std::result::Result<Chat, Op
 fn open_row_here(context: &Context, row: &SessionRow) -> Result<Chat> {
     let conn = store::open_db()?;
     let summary = store::find_session(&conn, &row.id)?
-        .ok_or_else(|| anyhow::anyhow!("Session {} no longer exists", row.short_id()))?;
+        .ok_or_else(|| anyhow::anyhow!("Clanker {} no longer exists", row.short_id()))?;
     let (mut session, history) = ChatSession::resume(conn, &summary, summary.model.clone())?;
     if let Some(cwd) = std::env::current_dir()
         .ok()
@@ -268,8 +264,7 @@ fn open_row_here(context: &Context, row: &SessionRow) -> Result<Chat> {
     {
         session.set_working_dir(cwd)?;
     }
-    let agentic = summary.kind == KIND_AGENT_CHAT;
-    start_chat(context, session, history, agentic)
+    start_chat(context, session, history)
 }
 
 /// Builds the chat screen for a session this process has taken.
@@ -283,7 +278,6 @@ fn start_chat(
     context: &Context,
     session: ChatSession,
     history: Vec<StoredMessage>,
-    agentic: bool,
 ) -> Result<Chat> {
     let Some(claim) = crate::session::Heartbeat::claim(session.id().to_string())? else {
         // One line, no paragraph breaks, and short: this surfaces as the
@@ -295,7 +289,7 @@ fn start_chat(
         // reason. Both causes are named because they read as different
         // problems: someone else has it, or you left a turn running in it.
         anyhow::bail!(
-            "Session {} is in use — another terminal, or a turn still finishing",
+            "Clanker {} is in use — another terminal, or a turn still finishing",
             &session.id()[..8]
         );
     };
@@ -306,12 +300,11 @@ fn start_chat(
         // picker hashes the same to draw this session's row.
         session.id().to_string(),
     );
-    app.agentic = agentic;
     app.verbose = session.verbose();
     app.highlight = session.highlight();
     app.max_iterations = session.max_iterations();
     app.temperature = session.temperature();
-    app.approval = session.approval().clone();
+    app.tool_access = session.tool_access().clone();
     app.sandbox = session.sandbox();
     app.stream = session.stream();
     app.working_dir = session.working_dir().map(str::to_string);
@@ -324,7 +317,7 @@ fn start_chat(
         context.max_iterations,
         context.temperature,
         context.effort_level.clone(),
-        agentic,
+        context.tool_access.clone(),
         claim,
     );
     Ok(Chat {
@@ -765,7 +758,7 @@ async fn handle_picker_key(
             // under one leaves it writing into nothing.
             if parked.iter().any(|chat| chat.app.session_id == row.id) {
                 p.notice = Some(format!(
-                    "Session {} is still working — it can be deleted once it stops",
+                    "Clanker {} is still working — it can be deleted once it stops",
                     &row.id[..8]
                 ));
             } else {
@@ -851,7 +844,7 @@ fn handle_naming_key(context: &Context, screen: &mut Screen, key: KeyEvent) -> R
             if !title.is_empty() {
                 let title = title.to_string();
                 let id = id.clone();
-                *screen = Screen::Chat(Box::new(open_new(context, false, title, id)?));
+                *screen = Screen::Chat(Box::new(open_new(context, title, id)?));
             }
         }
         // Another id, which means another mark: the one thing about a
@@ -988,12 +981,11 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                         )));
                 }
                 app::Submission::ShowStatus => {
-                    let approval = app.approval.clone();
+                    let tool_access = app.tool_access.clone();
                     let rows = crate::ui::session_settings_rows(&crate::ui::SessionSettings {
                         id: app.short_id(),
                         title: &app.title,
                         model: &app.model,
-                        agentic: app.agentic,
                         effort_level: app.effort_level.as_deref(),
                         temperature: app.temperature,
                         max_iterations: app.max_iterations,
@@ -1002,7 +994,7 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                         sandbox: app.sandbox,
                         stream: app.stream,
                         working_dir: app.working_dir.as_deref(),
-                        approval: &approval,
+                        tool_access: &tool_access,
                     });
                     app.transcript.push(TranscriptItem::SessionStatus(rows));
                 }
@@ -1046,9 +1038,9 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                             false,
                         )));
                 }
-                app::Submission::ShowApproval => {
-                    app.transcript.push(TranscriptItem::ApprovalStatus {
-                        approval: app.approval.clone(),
+                app::Submission::ShowTools => {
+                    app.transcript.push(TranscriptItem::ToolStatus {
+                        access: app.tool_access.clone(),
                         changed: false,
                     });
                 }
@@ -1068,7 +1060,6 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                 // new read-only one.
                 app::Submission::Message(_)
                 | app::Submission::SetModel(_)
-                | app::Submission::SetAgentic(_)
                 | app::Submission::SetEffort(_)
                 | app::Submission::ResetEffort
                 | app::Submission::SetVerbose(_)
@@ -1081,7 +1072,8 @@ fn dispatch_submission(app: &mut App, text: &str, send: &mut impl FnMut(Command)
                 | app::Submission::SetTemperature(_)
                 | app::Submission::ResetTemperature
                 | app::Submission::Shell(_)
-                | app::Submission::SetApproval { .. } => {
+                | app::Submission::SetToolAccess { .. }
+                | app::Submission::ResetToolAccess => {
                     unreachable!("command_for routes these to the worker")
                 }
             }
@@ -1231,7 +1223,7 @@ mod tests {
             effort_level: None,
             max_iterations: Some(20),
             temperature: None,
-            approval: ApprovalSettings::default(),
+            tool_access: ToolAccessSettings::default(),
             sandbox: true,
             verbose: false,
             highlight: true,

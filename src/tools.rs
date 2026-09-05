@@ -3,6 +3,68 @@ use serde_json::json;
 use std::fs;
 use std::path::Path;
 
+/// One tool, as everything that isn't the model needs to see it: what it is
+/// called, which bucket it falls in for bulk settings, and a line a person
+/// can read.
+///
+/// The schemas below are written for the model and say far too much to list
+/// on a terminal row; this is the same set said briefly. A test holds the
+/// two together, so a tool added to one and forgotten in the other fails
+/// rather than quietly becoming ungovernable.
+pub struct ToolInfo {
+    pub name: &'static str,
+    /// `read`, `write` or `terminal` — the bulk targets `tools allow read`
+    /// and friends act on. `web` is its own bucket precisely because it is
+    /// the one tool that touches nothing local.
+    pub category: &'static str,
+    pub summary: &'static str,
+}
+
+/// Every tool the agent has, in the order a listing should show them:
+/// the harmless first, the ones that change your machine last.
+pub const TOOLS: [ToolInfo; 6] = [
+    ToolInfo {
+        name: "read_file",
+        category: "read",
+        summary: "Read a file from disk",
+    },
+    ToolInfo {
+        name: "list_files",
+        category: "read",
+        summary: "List a directory",
+    },
+    ToolInfo {
+        name: "web_fetch",
+        category: "web",
+        summary: "Fetch a web page as text",
+    },
+    ToolInfo {
+        name: "write_file",
+        category: "write",
+        summary: "Write or overwrite a file",
+    },
+    ToolInfo {
+        name: "replace_in_file",
+        category: "write",
+        summary: "Replace a string inside a file",
+    },
+    ToolInfo {
+        name: "run_terminal_command",
+        category: "terminal",
+        summary: "Run a shell command",
+    },
+];
+
+/// The bucket a tool falls in, or `"unknown"` for a name that is not one of
+/// ours — which the gates treat as the most restricted thing there is.
+pub fn category_of(tool_name: &str) -> &'static str {
+    TOOLS
+        .iter()
+        .find(|tool| tool.name == tool_name)
+        .map(|tool| tool.category)
+        .unwrap_or("unknown")
+}
+
 pub fn get_tool_definitions() -> Vec<serde_json::Value> {
     vec![
         json!({
@@ -162,8 +224,10 @@ const FETCH_WRAP_COLUMNS: usize = 100;
 /// (measured: 4.0x on docs.rs, 3.8x on MDN, 2.0x on the Rust book) — for the
 /// rest of the turn, since what is fetched stays in the history.
 ///
-/// Never prompts. `requires_approval` exempts it by name, so that saving
-/// stays worth reaching for; see the reasoning there.
+/// Its default access is `allow` rather than `ask` — see
+/// `config::default_access` — so that the saving stays worth reaching for
+/// instead of being paid back in prompts. A default rather than an
+/// exemption, so `clank tools ask web_fetch` can turn it on.
 async fn web_fetch(url: &str) -> Result<serde_json::Value> {
     // Refused by scheme rather than left to the HTTP client: `file:` would
     // read the disk, sidestepping the sandbox the file tools respect.
@@ -759,6 +823,43 @@ async fn run_terminal_command(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_tool_is_in_both_lists() {
+        // The schemas are written for the model; `TOOLS` is the same set
+        // written for people and for the gates. A tool in one and not the
+        // other is either invisible to `clank tools` — and so ungovernable —
+        // or listed and settable but never actually offered.
+        let defined: Vec<String> = get_tool_definitions()
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        let known: Vec<String> = TOOLS.iter().map(|t| t.name.to_string()).collect();
+
+        for name in &defined {
+            assert!(known.contains(name), "{name} has a schema but no entry");
+        }
+        for name in &known {
+            assert!(defined.contains(name), "{name} has an entry but no schema");
+        }
+        assert_eq!(defined.len(), known.len());
+    }
+
+    #[test]
+    fn every_tool_has_a_category_the_bulk_targets_reach() {
+        // A tool in no category can only be set by its own name, which is a
+        // surprise waiting to happen: `tools never all` would leave it on.
+        for tool in TOOLS {
+            assert!(
+                ["read", "write", "terminal", "web"].contains(&tool.category),
+                "{} is in {:?}, which nothing targets",
+                tool.name,
+                tool.category
+            );
+            assert_eq!(category_of(tool.name), tool.category);
+        }
+        assert_eq!(category_of("not_a_tool"), "unknown");
+    }
 
     #[tokio::test]
     async fn a_command_that_wants_input_fails_instead_of_hanging() {

@@ -10,6 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 const KEYRING_SERVICE: &str = "clanker-command-center";
 const KEYRING_USERNAME: &str = "api_key";
 
+/// The three category gates, as configs and session rows written before
+/// tools had states of their own hold them. Read to work out what those
+/// meant — see `ToolAccessSettings::from_legacy` — and never written again.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct ApprovalSettings {
     #[serde(default = "default_true")]
@@ -34,25 +37,179 @@ impl Default for ApprovalSettings {
     }
 }
 
-impl ApprovalSettings {
-    /// Returns a copy with `category` (`"read"`/`"write"`/`"terminal"`/`"all"`)
-    /// switched to `enabled`. Shared by `clank approval`'s global-default
-    /// commands and a session's `/approval` override, so both parse the
-    /// same category words the same way.
-    pub fn with_category(&self, category: &str, enabled: bool) -> Self {
-        let mut updated = self.clone();
-        match category {
-            "read" => updated.read_disk = enabled,
-            "write" => updated.write_disk = enabled,
-            "terminal" => updated.terminal = enabled,
-            "all" => {
-                updated.read_disk = enabled;
-                updated.write_disk = enabled;
-                updated.terminal = enabled;
-            }
-            _ => {}
+/// What a tool may do without being asked about.
+///
+/// Three states rather than a yes/no, because "may this run unattended" and
+/// "may this run at all" are different questions and only the second one can
+/// be answered by not offering the tool. A clanker with everything on
+/// `Never` is a plain chat with no tools, which is what "ask mode" used to
+/// be — so the mode is not a separate thing to store any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolAccess {
+    /// Stops and asks before every call.
+    Ask,
+    /// Runs without asking.
+    Allow,
+    /// Not offered to the model at all, and refused if it somehow asks.
+    Never,
+}
+
+impl ToolAccess {
+    /// The word used to set it and the word shown when listing it — one
+    /// spelling, so what you read back is what you would type.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ToolAccess::Ask => "ask",
+            ToolAccess::Allow => "allow",
+            ToolAccess::Never => "never",
         }
-        updated
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "ask" => Some(ToolAccess::Ask),
+            "allow" => Some(ToolAccess::Allow),
+            "never" => Some(ToolAccess::Never),
+            _ => None,
+        }
+    }
+}
+
+/// What every tool may do, held as only the tools that differ from their
+/// default.
+///
+/// Storing the exceptions rather than the whole set is what lets a tool
+/// added later arrive with its own default already in force, in sessions
+/// that were created before it existed — no migration, no row that has to be
+/// rewritten to learn about it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ToolAccessSettings {
+    overrides: std::collections::BTreeMap<String, ToolAccess>,
+}
+
+/// What a tool does when nothing has been said about it.
+///
+/// The shell is off. It is the one tool whose blast radius is everything the
+/// user can do — every other tool is bounded by what it is *for*, and the
+/// sandbox bounds the writes on top of that — so it starts not offered at
+/// all rather than merely gated. `clank tools ask run_terminal_command`
+/// turns it on for anyone who wants it, per clanker or globally.
+///
+/// The web is the opposite case: it reads a page and changes nothing, and a
+/// prompt per page is the friction that would send the model back to
+/// `curl`ing through the shell, which is the call worth being careful about.
+/// That used to be a name checked at the top of the gate; as a default it is
+/// a row you can see in `clank tools`, and change.
+///
+/// Everything else asks.
+pub fn default_access(tool_name: &str) -> ToolAccess {
+    match crate::tools::category_of(tool_name) {
+        "web" => ToolAccess::Allow,
+        "terminal" => ToolAccess::Never,
+        // Including "unknown": a name we do not recognise is the last thing
+        // that should run unattended.
+        _ => ToolAccess::Ask,
+    }
+}
+
+impl ToolAccessSettings {
+    pub fn access(&self, tool_name: &str) -> ToolAccess {
+        self.overrides
+            .get(tool_name)
+            .copied()
+            .unwrap_or_else(|| default_access(tool_name))
+    }
+
+    /// Whether this clanker has any tools at all — the thing that used to be
+    /// stored as "agent mode".
+    pub fn any_tools(&self) -> bool {
+        crate::tools::TOOLS
+            .iter()
+            .any(|tool| self.access(tool.name) != ToolAccess::Never)
+    }
+
+    /// Every tool with its access, in listing order.
+    pub fn rows(&self) -> Vec<(&'static str, &'static str, ToolAccess)> {
+        crate::tools::TOOLS
+            .iter()
+            .map(|tool| (tool.name, tool.category, self.access(tool.name)))
+            .collect()
+    }
+
+    /// A copy with `target` set to `access`. `target` is a tool's name, a
+    /// category (`read`/`write`/`terminal`/`web`), or `all`. `None` for a
+    /// word that names none of those, so a caller can report the typo rather
+    /// than silently changing nothing.
+    pub fn with(&self, target: &str, access: ToolAccess) -> Option<Self> {
+        let matched: Vec<&'static str> = crate::tools::TOOLS
+            .iter()
+            .filter(|tool| target == "all" || tool.name == target || tool.category == target)
+            .map(|tool| tool.name)
+            .collect();
+        if matched.is_empty() {
+            return None;
+        }
+        let mut updated = self.clone();
+        for name in matched {
+            // Held only while it differs from the default, so "set it back
+            // to what it would have been" and "never mentioned it" store the
+            // same thing — and a later change of default reaches both.
+            if access == default_access(name) {
+                updated.overrides.remove(name);
+            } else {
+                updated.overrides.insert(name.to_string(), access);
+            }
+        }
+        Some(updated)
+    }
+
+    /// Every tool back to its default: what `tools on` means.
+    pub fn defaults() -> Self {
+        Self::default()
+    }
+
+    /// Every tool off: what `tools off` means, and what a clanker with no
+    /// tools is.
+    pub fn none() -> Self {
+        Self::default()
+            .with("all", ToolAccess::Never)
+            .expect("\"all\" always matches")
+    }
+
+    /// What the three old category booleans meant, for a session or a config
+    /// written before tools had their own states. `true` was "ask first".
+    ///
+    /// The terminal is deliberately not among them: the old model had no way
+    /// to say a tool is not offered at all, so there is nothing there worth
+    /// preserving, and reading `terminal: true` as "ask" would leave anyone
+    /// who upgrades with a shell a fresh install does not have. It keeps its
+    /// new default, which is `never`.
+    pub fn from_legacy(legacy: &ApprovalSettings) -> Self {
+        let mut settings = Self::default();
+        for (category, asks) in [("read", legacy.read_disk), ("write", legacy.write_disk)] {
+            let access = if asks {
+                ToolAccess::Ask
+            } else {
+                ToolAccess::Allow
+            };
+            settings = settings.with(category, access).unwrap_or(settings);
+        }
+        settings
+    }
+}
+
+impl Config {
+    /// What each tool may do in a clanker created now.
+    ///
+    /// Derived from the old category gates when this config predates tools
+    /// having states of their own, so an upgrade keeps whatever was
+    /// configured rather than silently resetting to the defaults.
+    pub fn tool_access(&self) -> ToolAccessSettings {
+        self.tools
+            .clone()
+            .unwrap_or_else(|| ToolAccessSettings::from_legacy(&self.approval))
     }
 }
 
@@ -80,12 +237,20 @@ pub struct Config {
     pub base_url: String,
     #[serde(default = "default_model")]
     pub default_model: Option<String>,
-    #[serde(default)]
+    /// Legacy: the three category gates, as configs written before tools had
+    /// their own states hold them. Read so those keep meaning what they
+    /// meant, never written again — it disappears from the file the next
+    /// time anything saves. `tool_access()` is what to read.
+    #[serde(default, skip_serializing)]
     pub approval: ApprovalSettings,
+    /// What each tool may do by default in a new clanker. `None` in a config
+    /// written before this existed, which then derives from `approval`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolAccessSettings>,
     /// `None` means no persistent default is configured at all — `ask`/
     /// `agent`/a new `session` then run with no iteration cap unless
     /// `--max-iterations` is passed for that call, which errors immediately
-    /// in agent mode rather than guessing a number.
+    /// with tools rather than guessing a number.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: Option<usize>,
     /// `None` means no persistent default is configured at all — a request
@@ -220,6 +385,12 @@ impl Default for Config {
             base_url: default_base_url(),
             default_model: default_model(),
             approval: ApprovalSettings::default(),
+            // Explicitly the defaults, not `None`: `None` means "this config
+            // predates tools having states" and derives from the three old
+            // booleans, which have no way to say the shell is off. A config
+            // seeded here is a new one, and a new one starts with
+            // `run_terminal_command` never offered.
+            tools: Some(ToolAccessSettings::default()),
             max_iterations: default_max_iterations(),
             temperature: default_temperature(),
             sandbox: true,
@@ -332,7 +503,7 @@ pub fn clear_api_key() -> Result<()> {
 /// A live view of a session's safety controls, rather than a copy of them.
 ///
 /// The agent loop runs on its own task, so it used to be handed a snapshot
-/// taken when the turn was spawned — which meant a `/approval write off`
+/// taken when the turn was spawned — which meant a `/tools allow write`
 /// typed while a turn was running had no effect until the *next* turn, even
 /// though the settings row updated immediately and said otherwise. Sharing
 /// the settings instead lets each tool call read what they say right now,
@@ -347,18 +518,18 @@ pub fn clear_api_key() -> Result<()> {
 /// Cheap to clone: every clone reads and writes the same state.
 #[derive(Clone, Debug, Default)]
 pub struct SessionGates {
-    approval: Arc<Mutex<ApprovalSettings>>,
+    access: Arc<Mutex<ToolAccessSettings>>,
     sandbox: Arc<AtomicBool>,
     /// The fallback timeout for a terminal command, for calls where the
     /// model names none. Fixed for the run, unlike the two above, which
-    /// `/approval` and `/sandbox` can change partway through a turn.
+    /// `/tools` and `/sandbox` can change partway through a turn.
     command_timeout: u64,
 }
 
 impl SessionGates {
-    pub fn new(approval: ApprovalSettings, sandbox: bool, command_timeout: u64) -> Self {
+    pub fn new(access: ToolAccessSettings, sandbox: bool, command_timeout: u64) -> Self {
         Self {
-            approval: Arc::new(Mutex::new(approval)),
+            access: Arc::new(Mutex::new(access)),
             sandbox: Arc::new(AtomicBool::new(sandbox)),
             command_timeout,
         }
@@ -369,14 +540,14 @@ impl SessionGates {
         self.command_timeout
     }
 
-    /// The approval gates as they stand. Cloned out rather than handing back
-    /// a guard, so a caller can't hold the lock across an await.
-    pub fn approval(&self) -> ApprovalSettings {
+    /// What each tool may do as things stand. Cloned out rather than handing
+    /// back a guard, so a caller can't hold the lock across an await.
+    pub fn access(&self) -> ToolAccessSettings {
         self.lock().clone()
     }
 
-    pub fn set_approval(&self, approval: ApprovalSettings) {
-        *self.lock() = approval;
+    pub fn set_access(&self, access: ToolAccessSettings) {
+        *self.lock() = access;
     }
 
     /// Whether the agent's file writes are confined to the working directory.
@@ -390,9 +561,9 @@ impl SessionGates {
 
     /// A poisoned lock still holds perfectly good settings — the panic that
     /// poisoned it happened elsewhere — and refusing to read them would turn
-    /// an unrelated panic into a dead approval gate.
-    fn lock(&self) -> MutexGuard<'_, ApprovalSettings> {
-        self.approval.lock().unwrap_or_else(|e| e.into_inner())
+    /// an unrelated panic into a dead gate.
+    fn lock(&self) -> MutexGuard<'_, ToolAccessSettings> {
+        self.access.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -432,8 +603,48 @@ mod tests {
     fn the_gates_carry_the_command_timeout_to_the_tool() {
         // `execute_tool` has no config; the gates are how the run's fallback
         // reaches it.
-        let gates = SessionGates::new(ApprovalSettings::default(), true, 45);
+        let gates = SessionGates::new(ToolAccessSettings::default(), true, 45);
         assert_eq!(gates.command_timeout(), 45);
+    }
+
+    #[test]
+    fn a_fresh_config_has_the_shell_off_and_says_so() {
+        // Seeded explicitly rather than left `None`, which would fall back
+        // to the three old booleans — and those have no way to say a tool is
+        // not offered at all, so a new config would come out with the shell
+        // merely gated.
+        let fresh = Config::default();
+        assert_eq!(
+            fresh.tool_access().access("run_terminal_command"),
+            ToolAccess::Never
+        );
+        assert_eq!(fresh.tool_access().access("write_file"), ToolAccess::Ask);
+        assert!(fresh.tools.is_some(), "the seed is explicit");
+    }
+
+    #[test]
+    fn a_config_from_before_tools_had_states_keeps_what_it_configured() {
+        // The old shape: three category booleans under `approval`, and no
+        // `tools` key at all. Upgrading must not quietly re-arm gates the
+        // user had turned off.
+        let old = r#"{"base_url":"https://x","approval":{"read_disk":false,"write_disk":true,"terminal":false}}"#;
+        let config: Config = serde_json::from_str(old).unwrap();
+        let access = config.tool_access();
+        assert_eq!(access.access("read_file"), ToolAccess::Allow);
+        assert_eq!(access.access("write_file"), ToolAccess::Ask);
+        // Not `allow`, whatever the old boolean said: the shell starts off.
+        assert_eq!(access.access("run_terminal_command"), ToolAccess::Never);
+
+        // And once saved, it is written in the new shape and the old key is
+        // gone — read for one upgrade, then never again.
+        let saved = serde_json::to_string(&config).unwrap();
+        assert!(!saved.contains("approval"), "{saved}");
+
+        // A config that already has the new key ignores the old one.
+        let both = r#"{"base_url":"https://x","approval":{"read_disk":false,"write_disk":false,"terminal":false},"tools":{"write_file":"never"}}"#;
+        let config: Config = serde_json::from_str(both).unwrap();
+        assert_eq!(config.tool_access().access("write_file"), ToolAccess::Never);
+        assert_eq!(config.tool_access().access("read_file"), ToolAccess::Ask);
     }
 
     #[test]
@@ -487,30 +698,37 @@ mod tests {
     #[test]
     fn a_gate_flipped_on_one_handle_is_seen_through_another() {
         // The whole point: the running turn holds a clone, and the worker
-        // that answers `/approval` or `/sandbox` holds the original. A write
+        // that answers `/tools` or `/sandbox` holds the original. A write
         // through one has to be visible through the other, or the turn keeps
         // running on the gates it started with.
-        let worker = SessionGates::new(ApprovalSettings::default(), true, 30);
+        let worker = SessionGates::new(ToolAccessSettings::default(), true, 30);
         let running_turn = worker.clone();
-        assert!(running_turn.approval().write_disk);
+        assert_eq!(running_turn.access().access("write_file"), ToolAccess::Ask);
         assert!(running_turn.sandbox());
 
-        worker.set_approval(worker.approval().with_category("write", false));
+        worker.set_access(worker.access().with("write", ToolAccess::Allow).unwrap());
         worker.set_sandbox(false);
 
-        assert!(!running_turn.approval().write_disk);
+        assert_eq!(
+            running_turn.access().access("write_file"),
+            ToolAccess::Allow
+        );
         assert!(!running_turn.sandbox());
-        // Only the category asked for moves.
-        assert!(running_turn.approval().read_disk);
-        assert!(running_turn.approval().terminal);
+        // Only the category asked for moves; the shell keeps the default it
+        // starts with, which is off.
+        assert_eq!(running_turn.access().access("read_file"), ToolAccess::Ask);
+        assert_eq!(
+            running_turn.access().access("run_terminal_command"),
+            ToolAccess::Never
+        );
     }
 
     #[test]
     fn gates_survive_a_poisoned_lock() {
         // A panic somewhere else must not leave the gates unreadable — the
         // settings behind the lock are still perfectly good, and failing
-        // here would turn an unrelated panic into a dead approval gate.
-        let gates = SessionGates::new(ApprovalSettings::default(), true, 30);
+        // here would turn an unrelated panic into a dead gate.
+        let gates = SessionGates::new(ToolAccessSettings::default(), true, 30);
         let poisoner = gates.clone();
         let _ = std::thread::spawn(move || {
             let _guard = poisoner.lock();
@@ -518,8 +736,8 @@ mod tests {
         })
         .join();
 
-        assert!(gates.approval().read_disk);
-        gates.set_approval(gates.approval().with_category("read", false));
-        assert!(!gates.approval().read_disk);
+        assert_eq!(gates.access().access("read_file"), ToolAccess::Ask);
+        gates.set_access(gates.access().with("read", ToolAccess::Allow).unwrap());
+        assert_eq!(gates.access().access("read_file"), ToolAccess::Allow);
     }
 }

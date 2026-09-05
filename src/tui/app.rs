@@ -4,7 +4,7 @@
 //! transition, so the interesting behavior (how a stream becomes a transcript
 //! block, what happens to input while busy) is testable without a terminal.
 
-use crate::config::ApprovalSettings;
+use crate::config::ToolAccessSettings;
 use crate::conversation::Event;
 pub use crate::ui::{classify, Submission};
 use crate::ui::{AgentEvent, ApprovalRequest};
@@ -54,7 +54,7 @@ pub enum TranscriptItem {
     },
     Error(String),
     Notice(String),
-    /// Every setting this session is running with, from `/session`. Held as
+    /// Every setting this clanker is running with, from `/status`. Held as
     /// rendered rows rather than as the settings themselves: the values are
     /// a snapshot of the moment it was asked for, and shouldn't quietly
     /// change under the reader when a later `/effort` scrolls past.
@@ -63,12 +63,12 @@ pub enum TranscriptItem {
     /// rendered rows for the same reason `SessionStatus` is: the list is
     /// what it was when you asked for it.
     Help(Vec<(String, String)>),
-    /// This session's approval gates, pretty-printed the same way `clank
-    /// approval` shows them in the CLI rather than packed into one
-    /// `Notice` line. Shown both after `/approval <category> <on|off>`
-    /// changes something and after a bare `/approval` query.
-    ApprovalStatus {
-        approval: ApprovalSettings,
+    /// What each tool may do, listed the same way `clank tools` shows it in
+    /// the CLI rather than packed into one `Notice` line. Shown both after
+    /// `/tools <state> <target>` changes something and after a bare
+    /// `/tools` query.
+    ToolStatus {
+        access: ToolAccessSettings,
         /// Whether this reflects a just-made change, so the header reads
         /// "set to" instead of "is" — the same distinction every other
         /// setting's `Notice` makes.
@@ -193,9 +193,6 @@ pub struct App {
     /// The session's current title, shown in the header. "Untitled" until
     /// the first user message names it.
     pub title: String,
-    /// Whether this conversation runs the tool loop, shown in the status bar
-    /// so the mode is never ambiguous once you're inside a session.
-    pub agentic: bool,
     /// Mirrors the plain CLI's `-v`: gates whether tool call arguments and
     /// results are shown, not just that a tool ran. Toggled with `/verbose`.
     pub verbose: bool,
@@ -211,16 +208,16 @@ pub struct App {
     pub working_dir: Option<String>,
     /// This session's `/max-iterations` override, changed with
     /// `/max-iterations`/`/max-iterations default`. `None` means nullified —
-    /// turns fall back to the configured default. Only takes effect in
-    /// agent mode.
+    /// turns fall back to the configured default. Only takes effect when
+    /// the clanker has tools.
     pub max_iterations: Option<usize>,
     /// This session's `/temperature` override, changed with
     /// `/temperature`/`/temperature default`. `None` means nullified, same
     /// deal as `max_iterations`.
     pub temperature: Option<f32>,
-    /// Changes with `/approval`. Not shown in the status bar, but folded
-    /// here so a `Notice` can report what it actually ended up as.
-    pub approval: ApprovalSettings,
+    /// Changes with `/tools`. Also what says whether this clanker has tools
+    /// at all — the thing that used to be a separate mode.
+    pub tool_access: ToolAccessSettings,
     /// Previously submitted lines, oldest first, that Up/Down recall into
     /// the input box — the TUI's equivalent of the plain CLI's readline
     /// history. Seeded from a resumed session's past turns.
@@ -301,7 +298,6 @@ impl App {
             effort_level,
             session_id,
             title: "Untitled".to_string(),
-            agentic: false,
             verbose: false,
             highlight: true,
             sandbox: true,
@@ -309,12 +305,19 @@ impl App {
             working_dir: None,
             max_iterations: None,
             temperature: None,
-            approval: ApprovalSettings::default(),
+            tool_access: ToolAccessSettings::default(),
             input_history: Vec::new(),
             history_cursor: None,
             draft: String::new(),
             completion: None,
         }
+    }
+
+    /// Whether this clanker has tools — at least one that is not `never`.
+    /// Derived rather than held, for the same reason the session derives it:
+    /// a flag beside the tool states is a second answer to one question.
+    pub fn agentic(&self) -> bool {
+        self.tool_access.any_tools()
     }
 
     /// How the current model is displayed, e.g. "orcarouter/auto (high)".
@@ -418,20 +421,6 @@ impl App {
                     format!("Model is {label}")
                 }));
             }
-            Event::AgenticChanged { agentic } => {
-                let changed = agentic != self.agentic;
-                self.agentic = agentic;
-                let label = if agentic {
-                    "agent mode (tools enabled)"
-                } else {
-                    "ask mode (no tools)"
-                };
-                self.transcript.push(TranscriptItem::Notice(if changed {
-                    format!("Switched to {label}")
-                } else {
-                    format!("Already in {label}")
-                }));
-            }
             Event::EffortChanged { effort_level } => {
                 let changed = effort_level != self.effort_level;
                 self.effort_level = effort_level;
@@ -506,11 +495,11 @@ impl App {
                     format!("Temperature is {label}")
                 }));
             }
-            Event::ApprovalSettingsChanged { approval } => {
-                let changed = approval != self.approval;
-                self.approval = approval.clone();
+            Event::ToolAccessChanged { access } => {
+                let changed = access != self.tool_access;
+                self.tool_access = access.clone();
                 self.transcript
-                    .push(TranscriptItem::ApprovalStatus { approval, changed });
+                    .push(TranscriptItem::ToolStatus { access, changed });
             }
             // Purely cosmetic — the header re-renders with whatever this
             // is next frame, with no need to call it out in the transcript.
@@ -1504,39 +1493,6 @@ mod tests {
     }
 
     #[test]
-    fn agentic_changed_updates_the_flag_and_notes_it() {
-        let mut a = app();
-        assert!(!a.agentic);
-
-        a.apply(Event::AgenticChanged { agentic: true });
-        assert!(a.agentic);
-        assert_eq!(
-            a.transcript.last(),
-            Some(&TranscriptItem::Notice(
-                "Switched to agent mode (tools enabled)".to_string()
-            ))
-        );
-
-        // Repeating the same mode reports rather than claiming a change.
-        a.apply(Event::AgenticChanged { agentic: true });
-        assert_eq!(
-            a.transcript.last(),
-            Some(&TranscriptItem::Notice(
-                "Already in agent mode (tools enabled)".to_string()
-            ))
-        );
-
-        a.apply(Event::AgenticChanged { agentic: false });
-        assert!(!a.agentic);
-        assert_eq!(
-            a.transcript.last(),
-            Some(&TranscriptItem::Notice(
-                "Switched to ask mode (no tools)".to_string()
-            ))
-        );
-    }
-
-    #[test]
     fn effort_changed_updates_the_field_and_notes_it() {
         let mut a = app();
         assert_eq!(a.effort_level, None);
@@ -1660,35 +1616,33 @@ mod tests {
     }
 
     #[test]
-    fn approval_changed_updates_the_field_and_notes_it() {
+    fn tool_access_changed_updates_the_field_and_notes_it() {
         let mut a = app();
-        assert_eq!(a.approval, ApprovalSettings::default());
+        assert_eq!(a.tool_access, ToolAccessSettings::default());
 
-        let updated = ApprovalSettings {
-            read_disk: false,
-            write_disk: true,
-            terminal: true,
-        };
-        a.apply(Event::ApprovalSettingsChanged {
-            approval: updated.clone(),
+        let updated = ToolAccessSettings::default()
+            .with("read", crate::config::ToolAccess::Allow)
+            .unwrap();
+        a.apply(Event::ToolAccessChanged {
+            access: updated.clone(),
         });
-        assert_eq!(a.approval, updated);
+        assert_eq!(a.tool_access, updated);
         assert_eq!(
             a.transcript.last(),
-            Some(&TranscriptItem::ApprovalStatus {
-                approval: updated.clone(),
+            Some(&TranscriptItem::ToolStatus {
+                access: updated.clone(),
                 changed: true,
             })
         );
 
         // Repeating the same settings reports rather than claiming a change.
-        a.apply(Event::ApprovalSettingsChanged {
-            approval: updated.clone(),
+        a.apply(Event::ToolAccessChanged {
+            access: updated.clone(),
         });
         assert_eq!(
             a.transcript.last(),
-            Some(&TranscriptItem::ApprovalStatus {
-                approval: updated,
+            Some(&TranscriptItem::ToolStatus {
+                access: updated,
                 changed: false,
             })
         );
@@ -1953,12 +1907,12 @@ mod tests {
         assert_eq!(syntax("/help"), "/help");
         // Past the name, while the argument is typed.
         assert_eq!(
-            syntax("/approval read "),
-            "/approval [<read|write|terminal|all> <on|off>]"
+            syntax("/tools allow "),
+            "/tools [on|off | <ask|allow|never> <target>]"
         );
         assert_eq!(
-            syntax("/session title Notes"),
-            "/session [title <new title>]"
+            syntax("/clanker title Notes"),
+            "/clanker [title <new title>]"
         );
     }
 

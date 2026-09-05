@@ -8,7 +8,7 @@
 //! reimplementing "append, persist, name the session".
 
 use crate::client::ChatMessage;
-use crate::config::ApprovalSettings;
+use crate::config::ToolAccessSettings;
 use crate::store::{self, SessionSummary, StoredMessage, KIND_AGENT_CHAT, KIND_CHAT};
 use anyhow::Result;
 use rusqlite::Connection;
@@ -149,9 +149,10 @@ pub struct ChatSession {
     /// derives a real one from the first user message.
     title: String,
     model: String,
-    /// `KIND_CHAT` or `KIND_AGENT_CHAT` — mutable via [`Self::set_agentic`],
-    /// unlike `store::create_session`'s `kind` param, which only sets the
-    /// starting mode.
+    /// `KIND_CHAT` or `KIND_AGENT_CHAT`, kept in step with the tools by
+    /// [`Self::sync_kind`]. A cache of what [`Self::is_agentic`] derives, so
+    /// a row read without being opened — the launch screen, `clank clankers
+    /// list` — can say the same thing.
     kind: String,
     effort_level: Option<String>,
     /// Whether this session's TUI view currently shows verbose tool detail.
@@ -171,12 +172,12 @@ pub struct ChatSession {
     max_iterations: Option<usize>,
     /// This session's sampling temperature — same deal as `max_iterations`.
     temperature: Option<f32>,
-    /// This session's current tool-approval gates, always concrete (unlike
+    /// What each tool may do in this session, always concrete (unlike
     /// `effort_level`/`max_iterations`/`temperature` there's no "unset,
     /// defer to config" state once a turn actually needs to check them).
-    approval: ApprovalSettings,
+    tool_access: ToolAccessSettings,
     /// Whether this session confines the agent's file writes to the working
-    /// directory. Always concrete, like `approval` — a tool about to write
+    /// directory. Always concrete, like `tool_access` — a tool about to write
     /// needs a yes or no, not "defer to config".
     sandbox: bool,
     /// Whether this session streams replies token-by-token. Snapshotted from
@@ -209,7 +210,7 @@ pub enum EnteredDir {
     Missing(String),
 }
 
-/// Moves the process into `session`'s recorded working directory.
+/// Moves the process into the session's recorded working directory.
 ///
 /// The directory is the sandbox's boundary and what the session's relative
 /// paths resolve against, so a session resumed somewhere else is bounded by
@@ -235,7 +236,7 @@ impl ChatSession {
     /// Starts a new session, registering it in the database. `effort_level`,
     /// `max_iterations`, and `temperature` are each a snapshot of the
     /// configured default at creation time (already merged with any
-    /// `--flag` the caller was given) — like `approval`, they're written
+    /// `--flag` the caller was given) — like `tool_access`, they're written
     /// immediately rather than re-resolved on every resume. Any of the three
     /// can already be `None` here, if nothing is configured anywhere; that's
     /// still a real snapshot, not "unset by omission".
@@ -250,7 +251,7 @@ impl ChatSession {
         effort_level: Option<String>,
         max_iterations: Option<usize>,
         temperature: Option<f32>,
-        approval: ApprovalSettings,
+        tool_access: ToolAccessSettings,
         sandbox: bool,
         verbose: bool,
         highlight: bool,
@@ -265,7 +266,7 @@ impl ChatSession {
             effort_level.as_deref(),
             max_iterations.map(|n| n as i64),
             temperature.map(|n| n as f64),
-            &approval,
+            &tool_access,
             sandbox,
             verbose,
             highlight,
@@ -283,7 +284,7 @@ impl ChatSession {
             highlight,
             max_iterations,
             temperature,
-            approval,
+            tool_access,
             sandbox,
             stream,
             working_dir,
@@ -342,7 +343,7 @@ impl ChatSession {
                 stream: summary.stream,
                 working_dir: summary.working_dir.clone(),
                 temperature: summary.temperature.map(|n| n as f32),
-                approval: summary.approval.clone(),
+                tool_access: summary.tool_access.clone(),
                 messages,
                 title_set,
                 saved_len,
@@ -368,24 +369,37 @@ impl ChatSession {
     /// so the switch sticks on resume and in `sessions list`. Doesn't touch
     /// message history either way: the agent system prompt isn't stored —
     /// some providers (Anthropic among them) require a `system`-role
-    /// message to sit at the very start of the conversation, and `/agent`
+    /// message to sit at the very start of the conversation, and `/tools`
     /// can flip this on at any point mid-conversation, so there's no
     /// position here that's guaranteed to stay valid as the conversation
     /// grows around it. `agent::request_turn` prepends it fresh on every
     /// turn that actually needs it instead.
-    pub fn set_agentic(&mut self, agentic: bool) -> Result<()> {
-        let kind = if agentic { KIND_AGENT_CHAT } else { KIND_CHAT };
+    /// Whether this session has tools at all.
+    ///
+    /// Derived rather than stored: having tools *is* having at least one
+    /// tool that is not `never`, and a flag beside that would be a second
+    /// answer to the same question, free to disagree with it. The `kind`
+    /// column is kept in step by [`Self::set_tool_access`] as a cache, for
+    /// the listings that read a row without opening it.
+    pub fn is_agentic(&self) -> bool {
+        self.tool_access.any_tools()
+    }
+
+    /// Writes `kind` to match the tools, so a row read without being opened
+    /// — the launch screen, `clank clankers list` — says the same thing the
+    /// session would.
+    fn sync_kind(&mut self) -> Result<()> {
+        let kind = if self.is_agentic() {
+            KIND_AGENT_CHAT
+        } else {
+            KIND_CHAT
+        };
         if self.kind == kind {
             return Ok(());
         }
         store::set_session_kind(&self.conn, &self.id, kind)?;
         self.kind = kind.to_string();
         Ok(())
-    }
-
-    /// Whether this session is currently in agent (tool-calling) mode.
-    pub fn is_agentic(&self) -> bool {
-        self.kind == KIND_AGENT_CHAT
     }
 
     /// Switches the reasoning effort for subsequent turns and records it.
@@ -431,7 +445,8 @@ impl ChatSession {
         self.verbose
     }
 
-    /// Switches the tool-calling iteration cap per turn (agent mode only)
+    /// Switches the tool-calling iteration cap per turn (only used when it
+    /// has tools)
     /// and records it. `None` nullifies it (`/max-iterations clear`) — a
     /// turn then falls back to whatever the configured default is when it
     /// actually runs, not to anything frozen here.
@@ -470,19 +485,20 @@ impl ChatSession {
         self.claim_owner = Some(owner);
     }
 
-    /// Switches this session's tool-approval gates and records them.
-    pub fn set_approval(&mut self, approval: ApprovalSettings) -> Result<()> {
-        if self.approval == approval {
+    /// Switches what this session's tools may do, and records it.
+    pub fn set_tool_access(&mut self, tool_access: ToolAccessSettings) -> Result<()> {
+        if self.tool_access == tool_access {
             return Ok(());
         }
-        store::set_session_approval(&self.conn, &self.id, &approval)?;
-        self.approval = approval;
+        store::set_session_tool_access(&self.conn, &self.id, &tool_access)?;
+        self.tool_access = tool_access;
+        self.sync_kind()?;
         Ok(())
     }
 
-    /// This session's current tool-approval gates.
-    pub fn approval(&self) -> &ApprovalSettings {
-        &self.approval
+    /// What each of this session's tools may do.
+    pub fn tool_access(&self) -> &ToolAccessSettings {
+        &self.tool_access
     }
 
     /// Switches whether the agent's file writes are confined to the working
@@ -685,13 +701,6 @@ impl ChatSession {
         Ok(())
     }
 
-    /// Appends one message and writes it (plus anything else pending)
-    /// immediately.
-    pub fn push_and_persist(&mut self, message: ChatMessage) -> Result<()> {
-        self.push(message);
-        self.persist_pending()
-    }
-
     /// Deletes the session if it was never named and nothing was ever said
     /// in it, reporting whether it did.
     ///
@@ -756,6 +765,7 @@ mod tests {
                 approval_read      INTEGER NOT NULL DEFAULT 1,
                 approval_write     INTEGER NOT NULL DEFAULT 1,
                 approval_terminal  INTEGER NOT NULL DEFAULT 1,
+                tool_access        TEXT,
                 sandbox            INTEGER NOT NULL DEFAULT 1,
                 stream             INTEGER NOT NULL DEFAULT 1,
                 working_dir        TEXT,
@@ -794,7 +804,7 @@ mod tests {
             Some("high".to_string()),
             Some(20),
             Some(0.7),
-            ApprovalSettings::default(),
+            ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -889,42 +899,38 @@ mod tests {
     }
 
     #[test]
-    fn set_agentic_persists_the_kind_without_touching_history() {
+    fn having_tools_follows_from_the_tools_and_the_kind_column_follows_that() {
+        // `memory_session` starts from the built-in defaults, where every
+        // tool asks — so it has tools.
         let mut session = memory_session();
-        assert!(!session.is_agentic());
-        session.push_user("hello".to_string());
-        session.persist_pending().unwrap();
-        let messages_before = session.messages().len();
-
-        session.set_agentic(true).unwrap();
         assert!(session.is_agentic());
-        let summary = store::find_session(&session.conn, session.id())
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary.kind, crate::store::KIND_AGENT_CHAT);
-        // No system prompt gets stored — a provider-valid position for one
-        // can't be guaranteed here, since `/agent` can flip this on at any
-        // point mid-conversation; `agent::request_turn` prepends it fresh
-        // on each turn that actually needs it instead.
-        assert_eq!(session.messages().len(), messages_before);
-    }
-
-    #[test]
-    fn set_agentic_off_leaves_prior_history_alone() {
-        let mut session = memory_session();
-        session.set_agentic(true).unwrap();
         session.push_user("hello".to_string());
         session.persist_pending().unwrap();
         let messages_before = session.messages().len();
 
-        session.set_agentic(false).unwrap();
-        assert!(!session.is_agentic());
-        assert_eq!(session.messages().len(), messages_before);
+        session.set_tool_access(ToolAccessSettings::none()).unwrap();
+        assert!(!session.is_agentic(), "every tool never means no tools");
 
+        // The column follows, so a row read without being opened — the
+        // launch screen, `clank clankers list` — agrees with the session.
         let summary = store::find_session(&session.conn, session.id())
             .unwrap()
             .unwrap();
         assert_eq!(summary.kind, crate::store::KIND_CHAT);
+
+        // And back again, without touching history either way: no system
+        // prompt is stored, because a provider-valid position for one cannot
+        // be guaranteed when tools can come and go mid-conversation.
+        // `agent::normalize_system_prompt` prepends it per turn instead.
+        session
+            .set_tool_access(ToolAccessSettings::defaults())
+            .unwrap();
+        assert!(session.is_agentic());
+        assert_eq!(session.messages().len(), messages_before);
+        let summary = store::find_session(&session.conn, session.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.kind, crate::store::KIND_AGENT_CHAT);
     }
 
     #[test]
@@ -1013,7 +1019,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            ApprovalSettings::default(),
+            ToolAccessSettings::default(),
             true,
             false,
             true,
@@ -1090,7 +1096,7 @@ mod tests {
             None,
             Some(20),
             Some(0.7),
-            ApprovalSettings::default(),
+            ToolAccessSettings::default(),
             true,
             true,
             true,
@@ -1232,21 +1238,19 @@ mod tests {
     }
 
     #[test]
-    fn set_approval_persists_and_updates_the_summary() {
+    fn set_tool_access_persists_and_updates_the_summary() {
         let mut session = memory_session();
-        assert_eq!(*session.approval(), ApprovalSettings::default());
+        assert_eq!(*session.tool_access(), ToolAccessSettings::default());
 
-        let custom = ApprovalSettings {
-            read_disk: true,
-            write_disk: false,
-            terminal: false,
-        };
-        session.set_approval(custom.clone()).unwrap();
-        assert_eq!(*session.approval(), custom);
+        let custom = ToolAccessSettings::default()
+            .with("run_terminal_command", crate::config::ToolAccess::Never)
+            .unwrap();
+        session.set_tool_access(custom.clone()).unwrap();
+        assert_eq!(*session.tool_access(), custom);
         let summary = store::find_session(&session.conn, session.id())
             .unwrap()
             .unwrap();
-        assert_eq!(summary.approval, custom);
+        assert_eq!(summary.tool_access, custom);
     }
 
     #[test]
@@ -1394,16 +1398,19 @@ mod tests {
 
     #[test]
     fn a_session_with_only_a_system_prompt_still_counts_as_unused() {
+        // Nothing writes a system prompt into history any more — the agent
+        // one is prepended per request — but sessions created before that
+        // have one sitting in theirs, and opening one of those and leaving
+        // must still discard it.
         let mut session = memory_session();
-        session
-            .push_and_persist(ChatMessage {
-                role: "system".to_string(),
-                content: Some("system prompt".to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-                ..Default::default()
-            })
-            .unwrap();
+        session.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            ..Default::default()
+        });
+        session.persist_pending().unwrap();
         assert!(session.discard_if_unused().unwrap());
     }
 
